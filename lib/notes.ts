@@ -5,6 +5,7 @@
 // ============================================================
 
 import { supabaseBrowser } from "./supabase/client";
+import { formatShortDate } from "./dates";
 
 export interface UserNote {
   id: string;
@@ -109,5 +110,5 @@ export function relativeTime(iso: string): string {
   if (h < 24) return `${h} hour${h === 1 ? "" : "s"} ago`;
   const d = Math.floor(h / 24);
   if (d < 30) return `${d} day${d === 1 ? "" : "s"} ago`;
-  return new Date(iso).toLocaleDateString();
+  return formatShortDate(new Date(iso));
 }

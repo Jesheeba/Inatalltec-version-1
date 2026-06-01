@@ -42,6 +42,12 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: "Workspace", items: [
       { id: "dashboard", label: "Dashboard", icon: "dashboard", roles: "*" },
+      // Growth Plan — 3-month calendar/planner aggregating projects,
+      // AMC visits, and WOs. Visible to every operational role (super_admin
+      // sits in its own Platform group and doesn't need it).
+      { id: "growth-plan", label: "Growth Plan", icon: "calendar",
+        roles: ["admin", "md", "manager", "lead_worker", "worker", "driver",
+                "subcontractor", "accounts", "sales", "service_support", "estimator"] },
       { id: "notes", label: "Notes", icon: "fileText", roles: "*" },
     ]
   },
@@ -68,6 +74,10 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "customers", label: "Customers", icon: "building", roles: ["admin", "md", "manager", "sales", "service_support"] },
       { id: "sites", label: "Sites", icon: "mapPin", roles: ["admin", "md", "manager", "lead_worker"] },
       { id: "team", label: "Team", icon: "users", roles: ["admin", "md", "manager", "lead_worker"] },
+      // Sub-contractors directory (migration 0023) — external profiles
+      // with HR/compliance fields + per-WO hours. Managed by Ops only;
+      // workers see them on the WO detail page, not via a sidebar entry.
+      { id: "sub-contractors", label: "Sub-contractors", icon: "users", roles: ["admin", "md", "manager"] },
       { id: "reports", label: "Reports", icon: "chartBar", roles: ["admin", "md", "manager", "accounts"] },
     ]
   },
@@ -167,6 +177,8 @@ const TITLE_MAP: Record<RouteName, string> = {
   customers: "Customers",
   sites: "Sites",
   replacements: "Replacements",
+  "growth-plan": "Growth Plan",
+  "sub-contractors": "Sub-contractors",
   team: "Team",
   reports: "Reports",
   admin: "Admin · Users",

@@ -15,11 +15,26 @@ import {
   ApprovalCard, CardHead, EmptyState, FeedItem, KPI, PageHeader,
   SignOutButton, StatusBadge, WoCard,
 } from "../shared";
-import type { Project, RepairTicket, WoStatus, WorkOrder } from "@/lib/types";
+import type { CalendarEvent, Project, RepairTicket, WoStatus, WorkOrder } from "@/lib/types";
+import {
+  activeProjectsForUser, calendarAlertsForUser, getCalendarEvents,
+  rangeForDays, rangeForWeek,
+  type CalendarAlert,
+} from "@/lib/calendar";
+import { formatConflictLabel, getWorkerConflictsFor } from "@/lib/conflicts";
+import { PhaseBadge } from "../PhaseTracker";
+import { AmcPauseAlert } from "../AmcPauseAlert";
+import { autoPauseExpiredAmcs } from "@/lib/create";
+import {
+  formatShortDate as fmtShortDate,
+  formatMonthDay as fmtMonthDay,
+  formatDateTime as fmtDateTime,
+} from "@/lib/dates";
 import { navigateTo } from "@/lib/maps";
 import {
   updateWorkOrder, WO_STATUS_LABEL,
   REPLACEMENT_STATUS_LABEL, REPLACEMENT_STATUS_BADGE, REPLACEMENT_CONTEXT_LABEL,
+  startWorkOrder, completeWorkOrder,
 } from "@/lib/create";
 import type { ReplacementRequest } from "@/lib/types";
 import {
@@ -144,6 +159,7 @@ function MyOpenWorkOrders({
   onOpen: (id: string) => void;
   onQuickAction: (wo: WorkOrder, next: WoStatus) => void;
 }) {
+  const { me } = useApp();
   if (openWOs.length === 0) return null;
   const ordered = [...openWOs].sort((a, b) =>
     (a.scheduledStart || "").localeCompare(b.scheduledStart || "")
@@ -156,11 +172,18 @@ function MyOpenWorkOrders({
       <div className="col" style={{ gap: 8 }}>
         {ordered.map(wo => {
           const action = quickAction(wo.status);
+          // Fix 3 — surface schedule conflicts where this worker has
+          // another active WO overlapping THIS one's window. We pass
+          // wo.id as the exclude so the WO doesn't conflict with itself.
+          const conflicts = getWorkerConflictsFor(
+            me.id, wo.scheduledStart, wo.scheduledEnd, wo.id,
+          );
           return (
             <div key={wo.id} className="row gap-3"
               style={{
                 padding: 12, borderRadius: "var(--r-md)",
-                background: "var(--bg-muted)", border: "1px solid var(--border)",
+                background: "var(--bg-muted)",
+                border: conflicts.length > 0 ? "1px solid var(--warn-100)" : "1px solid var(--border)",
                 alignItems: "center",
               }}>
               <div onClick={() => onOpen(wo.id)} role="button" tabIndex={0}
@@ -169,11 +192,22 @@ function MyOpenWorkOrders({
                 <div className="row gap-2" style={{ alignItems: "center" }}>
                   <span className="numeric" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>{wo.code}</span>
                   <StatusBadge state={wo.status} />
+                  {conflicts.length > 0 && (
+                    <span className="badge badge-warning"
+                      title={conflicts.map(formatConflictLabel).join("\n")}>
+                      <Icon name="alertTriangle" size={11} /> Time conflict
+                    </span>
+                  )}
                 </div>
                 <div className="truncate" style={{ font: "var(--t-body-md)", marginTop: 4 }}>{wo.title}</div>
                 <div className="truncate" style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 2 }}>
                   {(db.cust(wo.customer)?.name ?? "—")} · {(db.site(wo.site)?.name ?? "—")}
                 </div>
+                {conflicts.length > 0 && (
+                  <div style={{ font: "var(--t-micro)", color: "var(--warn-700)", marginTop: 4 }}>
+                    Overlaps with {conflicts.map(c => c.code).join(", ")}
+                  </div>
+                )}
               </div>
               {action && (
                 <button className="btn btn-primary btn-sm" style={{ flexShrink: 0 }}
@@ -315,6 +349,333 @@ function RrCompactRow({ r, onClick }: { r: ReplacementRequest; onClick: () => vo
   );
 }
 
+/* ─── Growth Plan widgets ──────────────────────────────────
+   Four small widgets that surface Growth Plan signals on every
+   operational dashboard. Each is role-scoped via lib/calendar.ts
+   helpers so the same component renders correctly for an admin,
+   a lead tech, or a field worker without per-dashboard branches.
+
+   - CriticalAlertsWidget: red banner; renders nothing when empty.
+   - ActiveProjectsWidget: horizontal scrollable strip at the top.
+   - UpcomingThisWeekWidget: this-week event list (manager/admin).
+   - Next3DaysWidget: next-72h event list (field).
+============================================================ */
+
+/**
+ * Fires the autoPauseExpiredAmcs() sweep once on dashboard mount for
+ * any role with write access to AMC contracts. The DB enforces the
+ * actual gate (amc_write RLS, md/admin/manager) — this client check
+ * just avoids an obviously-going-to-fail RPC for other roles.
+ *
+ * Silent operation: only logs to console if anything was paused, so
+ * field users (worker / driver / lead_worker) see no toast noise.
+ */
+function useAutoPauseExpiredAmcs(role: string) {
+  useEffect(() => {
+    const canRun = role === "md" || role === "admin" || role === "manager";
+    if (!canRun) return;
+    let cancelled = false;
+    (async () => {
+      const res = await autoPauseExpiredAmcs();
+      if (cancelled) return;
+      if (res.ok && res.paused > 0) {
+        // eslint-disable-next-line no-console
+        console.info(`[auto-pause] flipped ${res.paused} AMC contract(s) to paused (payment overdue)`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [role]);
+}
+
+function CriticalAlertsWidget() {
+  const { me, role, openProject, openAmc, openWO, dataVersion } = useApp();
+  void dataVersion;
+  const alerts = useMemo(() => calendarAlertsForUser(role, me.id), [role, me.id, dataVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (alerts.length === 0) return null;
+  const followAlert = (a: CalendarAlert) => {
+    if (a.target.kind === "project") openProject(a.target.id);
+    else if (a.target.kind === "amc") openAmc(a.target.id);
+    else openWO(a.target.id);
+  };
+  const KIND_ICON: Record<CalendarAlert["kind"], "alertTriangle" | "shieldCheck" | "clock"> = {
+    project_overdue: "alertTriangle",
+    amc_no_wo:       "shieldCheck",
+    wo_stale:        "clock",
+  };
+  return (
+    <section style={{
+      marginBottom: 20,
+      background: "var(--dan-50)",
+      border: "1px solid var(--dan-100)",
+      borderRadius: "var(--r-md)",
+      padding: 14,
+    }}>
+      <div className="row gap-2" style={{ marginBottom: 10, alignItems: "center" }}>
+        <Icon name="alertTriangle" size={16} style={{ color: "var(--dan-700)" }} />
+        <span style={{ font: "var(--t-body-md)", fontWeight: 600, color: "var(--dan-700)" }}>
+          Critical alerts · {alerts.length}
+        </span>
+      </div>
+      <div className="col" style={{ gap: 6 }}>
+        {alerts.slice(0, 5).map(a => (
+          <button key={a.id} onClick={() => followAlert(a)}
+            style={{
+              all: "unset", cursor: "pointer", display: "flex", gap: 10, alignItems: "center",
+              padding: "8px 10px", borderRadius: "var(--r-sm)",
+              background: "rgba(255,255,255,0.7)", minHeight: 44,
+            }}>
+            <Icon name={KIND_ICON[a.kind]} size={14} style={{ color: "var(--dan-700)", flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="truncate" style={{ font: "var(--t-small)", fontWeight: 600, color: "var(--ink)" }}>
+                {a.title}
+              </div>
+              <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                {a.detail}
+              </div>
+            </div>
+            <Icon name="chevronRight" size={12} style={{ color: "var(--ink-quiet)", flexShrink: 0 }} />
+          </button>
+        ))}
+        {alerts.length > 5 && (
+          <div style={{ font: "var(--t-micro)", color: "var(--dan-700)", padding: "4px 10px" }}>
+            +{alerts.length - 5} more
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ActiveProjectsWidget() {
+  const { me, role, openProject, openGrowthPlan, dataVersion } = useApp();
+  void dataVersion;
+  const projects = useMemo(() => activeProjectsForUser(role, me.id), [role, me.id, dataVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <section className="card card-pad" style={{ marginBottom: 20 }}>
+      <CardHead
+        title={`Active projects · ${projects.length}`}
+        sub={projects.length > 0 ? "Tap a card to open" : undefined}
+        right={projects.length > 0 ? (
+          <button className="btn btn-ghost btn-sm" onClick={() => openGrowthPlan("3months")}>
+            Open Growth Plan <Icon name="arrowRight" size={12} />
+          </button>
+        ) : undefined}
+      />
+      {projects.length === 0 ? (
+        <EmptyState icon="briefcase" title="No active projects"
+          sub="Start one from + Create." />
+      ) : (
+        <div style={{
+          display: "flex", gap: 12, overflowX: "auto", paddingBottom: 6,
+          scrollSnapType: "x mandatory",
+        }}>
+          {projects.map(p => (
+            <ActiveProjectCard key={p.id} p={p} onClick={() => openProject(p.id)} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ActiveProjectCard({ p, onClick }: { p: Project; onClick: () => void }) {
+  const cust = db.cust(p.customer);
+  const lead = p.leadTechId ? db.user(p.leadTechId) : null;
+  return (
+    <button onClick={onClick}
+      style={{
+        all: "unset", cursor: "pointer",
+        flex: "0 0 240px", scrollSnapAlign: "start",
+        padding: 14, borderRadius: "var(--r-md)",
+        background: "var(--bg-muted)", border: "1px solid var(--border)",
+        display: "flex", flexDirection: "column", gap: 8, minHeight: 110,
+      }}>
+      <div className="row between">
+        <span className="numeric" style={{ font: "var(--t-micro)", color: "var(--ink-mute)", fontFamily: "var(--font-mono)" }}>
+          {p.code}
+        </span>
+        <StatusBadge state={p.status} />
+      </div>
+      <div className="truncate" style={{ font: "var(--t-body-md)", fontWeight: 500 }}>
+        {p.name}
+      </div>
+      <div className="truncate" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+        {cust?.name ?? "Unknown"}
+      </div>
+      {p.currentPhase && (
+        <div><PhaseBadge phase={p.currentPhase} size="sm" /></div>
+      )}
+      {lead && (
+        <div className="row gap-2" style={{ alignItems: "center", marginTop: "auto" }}>
+          <span className={"avatar avatar-sm avatar-" + (lead.tint || "primary")}>{lead.initials}</span>
+          <span style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }} className="truncate">
+            {lead.name}
+          </span>
+        </div>
+      )}
+    </button>
+  );
+}
+
+function UpcomingEventRow({ e, onClick }: { e: CalendarEvent; onClick: () => void }) {
+  // Stable English formatter — avoids SSR/CSR locale drift that causes
+  // React hydration mismatches (Node defaults en-US, browser uses the
+  // user's locale). See lib/dates.ts for rationale.
+  const date = fmtShortDate(e.startsAt);
+  return (
+    <button onClick={onClick}
+      style={{
+        all: "unset", cursor: "pointer", display: "flex", gap: 10, alignItems: "center",
+        padding: "8px 10px", borderRadius: "var(--r-sm)", minHeight: 44,
+      }}
+      onMouseEnter={ev => (ev.currentTarget as HTMLButtonElement).style.background = "var(--bg-muted)"}
+      onMouseLeave={ev => (ev.currentTarget as HTMLButtonElement).style.background = "transparent"}>
+      <span style={{
+        width: 8, height: 8, borderRadius: 999, background: e.color, flexShrink: 0,
+      }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="truncate" style={{ font: "var(--t-small)", fontWeight: 500 }}>
+          {e.title}
+        </div>
+        <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+          {date}{e.customerName ? ` · ${e.customerName}` : ""}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function UpcomingThisWeekWidget() {
+  const { me, role, openProject, openAmc, openWO, openGrowthPlan, dataVersion } = useApp();
+  void dataVersion;
+  const events = useMemo(() => {
+    const r = rangeForWeek(new Date());
+    return getCalendarEvents({ role, userId: me.id, rangeStart: r.start, rangeEnd: r.end, filter: "all" });
+  }, [role, me.id, dataVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+  const visible = events.slice(0, 5);
+  const followEvent = (e: CalendarEvent) => {
+    if (e.source.table === "projects")       openProject(e.source.id);
+    else if (e.source.table === "amc_contracts") openAmc(e.source.id);
+    else                                          openWO(e.source.id);
+  };
+  return (
+    <section className="card card-pad" style={{ marginBottom: 20 }}>
+      <CardHead
+        title="Upcoming this week"
+        sub={events.length > 0 ? `${events.length} event${events.length === 1 ? "" : "s"}` : undefined}
+        right={(
+          <button className="btn btn-ghost btn-sm" onClick={() => openGrowthPlan("week")}>
+            View all <Icon name="arrowRight" size={12} />
+          </button>
+        )}
+      />
+      {visible.length === 0 ? (
+        <EmptyState icon="calendar" title="Nothing scheduled this week"
+          sub="Use Growth Plan to see what's coming next." />
+      ) : (
+        <div className="col" style={{ gap: 4 }}>
+          {visible.map(e => <UpcomingEventRow key={e.id} e={e} onClick={() => followEvent(e)} />)}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ─── Active Work widget (migration 0022) ──────────────────
+// Count-only summary of currently-active work orders. No per-WO ticker,
+// no setInterval, no per-second updates — just a static "N work orders
+// in progress" line that clicks through to the filtered WO list.
+//
+// "scope='all'" → counts unique WOs across the team (manager view).
+// "scope='mine'" → counts WOs where the current user has an open entry
+//                  (worker view).
+function ActiveWorkWidget({ scope }: { scope: "all" | "mine" }) {
+  const { me, go, dataVersion } = useApp();
+  void dataVersion;
+  const activeWoCount = useMemo(() => {
+    const woIds = new Set<string>();
+    for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+      if (e.endedAt !== null) continue;
+      if (scope === "mine" && e.userId !== me.id) continue;
+      woIds.add(e.workOrderId);
+    }
+    return woIds.size;
+  }, [me.id, scope, dataVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (activeWoCount === 0) return null;
+  return (
+    <section className="card card-pad" style={{ marginBottom: 20 }}>
+      <button onClick={() => go("workorders")}
+        style={{
+          all: "unset", cursor: "pointer", display: "flex",
+          alignItems: "center", gap: 12, width: "100%",
+        }}>
+        <span className="dot dot-success" style={{ flexShrink: 0 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: "var(--t-body-md)", fontWeight: 600 }}>
+            {activeWoCount} work order{activeWoCount === 1 ? "" : "s"} in progress
+          </div>
+          <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginTop: 2 }}>
+            {scope === "mine" ? "You're on the clock" : "Currently being worked on"}
+          </div>
+        </div>
+        <Icon name="arrowRight" size={14} style={{ color: "var(--ink-mute)", flexShrink: 0 }} />
+      </button>
+    </section>
+  );
+}
+
+// Total tracked minutes across all WOs whose scheduledStart falls inside
+// [start, end]. Used for the Manager dashboard's "Hours this week" KPI.
+// Uses the trigger-computed durationMinutes on the WO itself so it includes
+// every worker (not just whatever entries the current role can see).
+function totalTrackedMinutes(start: Date, end: Date): number {
+  let minutes = 0;
+  const startMs = start.getTime();
+  const endMs   = end.getTime();
+  for (const w of Object.values(db.WORK_ORDERS)) {
+    if (!w.scheduledStart) continue;
+    const t = new Date(w.scheduledStart).getTime();
+    if (Number.isNaN(t) || t < startMs || t > endMs) continue;
+    minutes += w.durationMinutes;
+  }
+  return minutes;
+}
+
+function Next3DaysWidget() {
+  const { me, role, openWO, openAmc, openProject, openGrowthPlan, dataVersion } = useApp();
+  void dataVersion;
+  const events = useMemo(() => {
+    const r = rangeForDays(new Date(), 3);
+    return getCalendarEvents({ role, userId: me.id, rangeStart: r.start, rangeEnd: r.end, filter: "mine" });
+  }, [role, me.id, dataVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+  const followEvent = (e: CalendarEvent) => {
+    if (e.source.table === "projects")       openProject(e.source.id);
+    else if (e.source.table === "amc_contracts") openAmc(e.source.id);
+    else                                          openWO(e.source.id);
+  };
+  return (
+    <section className="card card-pad" style={{ marginBottom: 20 }}>
+      <CardHead
+        title="Next 3 days"
+        sub={events.length > 0 ? `${events.length} item${events.length === 1 ? "" : "s"} on your plate` : undefined}
+        right={(
+          <button className="btn btn-ghost btn-sm" onClick={() => openGrowthPlan("week")}>
+            Open Growth Plan <Icon name="arrowRight" size={12} />
+          </button>
+        )}
+      />
+      {events.length === 0 ? (
+        <EmptyState icon="check" title="Nothing scheduled"
+          sub="If you have nothing scheduled, take it easy." />
+      ) : (
+        <div className="col" style={{ gap: 4 }}>
+          {events.map(e => <UpcomingEventRow key={e.id} e={e} onClick={() => followEvent(e)} />)}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function Dashboard() {
   const { role, go } = useApp();
   if (role === "super_admin") {
@@ -345,8 +706,9 @@ export function Dashboard() {
 
 /* ─── Manager / default Ops dashboard ───────────────────── */
 function ManagerDashboard() {
-  const { me, openApproval, openWO, followTarget, go, fmtMoney, dataVersion } = useApp();
+  const { me, role, openApproval, openWO, followTarget, go, fmtMoney, dataVersion } = useApp();
   void dataVersion;
+  useAutoPauseExpiredAmcs(role);
   const [feedFilter, setFeedFilter] = useState<"all" | "check" | "sla">("all");
   const [timeframe, setTimeframe] = useState<Timeframe>("today");
   const period = useMemo(() => periodFor(timeframe), [timeframe]);
@@ -449,6 +811,12 @@ function ManagerDashboard() {
         }
       />
 
+      <AmcPauseAlert />
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
+      <ActiveWorkWidget scope="all" />
+      <UpcomingThisWeekWidget />
+
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 24 }}>
         <KPI label={"Open work orders · " + period.shortLabel} value={openInPeriod.length} accent="primary">
           <div className="row gap-2" style={{ marginTop: 6 }}>
@@ -462,6 +830,9 @@ function ManagerDashboard() {
             <div style={{ width: slaCompliance + "%" }} />
           </div>
         </KPI>
+        <KPI label={"Hours tracked · " + period.shortLabel}
+          value={Math.round(totalTrackedMinutes(period.start, period.end) / 60) + "h"}
+          sub="Worker time logged via Start/Done" />
         <KPI label={"AMC revenue · " + period.label}
           value={fmtMoney(amcRevenuePeriod, { compact: true })}
           sub={`Prorated from ${fmtMoney(annualAmcValue, { compact: true })} annual`} />
@@ -576,6 +947,10 @@ function FieldDashboard() {
         right={<SignOutButton />}
       />
 
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
+      <Next3DaysWidget />
+
       {live && (
         <div className="card card-accent card-pad" style={{ marginBottom: 16 }}>
           <div className="row gap-2" style={{ marginBottom: 6 }}>
@@ -612,9 +987,58 @@ function FieldDashboard() {
         />
       )}
 
+      <ActiveWorkWidget scope="mine" />
+
       <MyOpenWorkOrders openWOs={myOpenAll} onOpen={openWO}
         onQuickAction={async (wo, next) => {
+          // The dashboard quick-action was the user-facing Start/Done
+          // button most of the team uses. Previously it only flipped
+          // wo.status, never created a work_order_time_entries row —
+          // so the boss's "we have no time tracking" was literally
+          // true even though the schema/triggers/helpers all worked.
+          // Wired up below to call startWorkOrder / completeWorkOrder
+          // alongside the status flip.
           const prev = wo.status;
+
+          // ── Transition INTO in_progress → create a time entry first ──
+          // Covers: assigned/open/waiting_material → in_progress
+          // startWorkOrder already attempts the status flip best-effort
+          // (succeeds for md/admin/manager/lead_worker via wo_write;
+          // silently no-ops for regular workers — which is the existing
+          // RLS contract). We DON'T also call updateWorkOrder here so
+          // we don't double-fire the status flip.
+          if (next === "in_progress" && prev !== "in_progress") {
+            const r = await startWorkOrder(wo.id, me.id);
+            if (!r.ok) { fireToast(`Couldn't start: ${r.error}`); return; }
+            bumpData();
+            fireToast(`${wo.code} started`);
+            return;
+          }
+
+          // ── Transition OUT OF in_progress → close own entry first ──
+          // Covers: in_progress → pending_confirmation / done
+          if (prev === "in_progress"
+              && (next === "pending_confirmation" || next === "done")) {
+            const r1 = await completeWorkOrder(wo.id, me.id);
+            if (!r1.ok) { fireToast(`Couldn't close timer: ${r1.error}`); return; }
+            // Now flip status. Optimistic mirror update + revert on fail.
+            db.WORK_ORDERS[wo.id] = { ...wo, status: next };
+            bumpData();
+            const r2 = await updateWorkOrder(wo.id, { status: next });
+            if (!r2.ok) {
+              db.WORK_ORDERS[wo.id] = { ...wo, status: prev };
+              bumpData();
+              fireToast(`Timer closed but couldn't update status: ${r2.error}`);
+              return;
+            }
+            fireToast(`${wo.code} → ${WO_STATUS_LABEL[next]}`);
+            return;
+          }
+
+          // ── Default fallback ──
+          // Status-only transitions that aren't tied to a clock-in/out
+          // (none in `quickAction` today, but defensive for future
+          // additions like "Cancel" / "Block on material").
           db.WORK_ORDERS[wo.id] = { ...wo, status: next };
           bumpData();
           const res = await updateWorkOrder(wo.id, { status: next });
@@ -805,6 +1229,8 @@ function SupportDashboard() {
       <PageHeader eyebrow="Service desk" title="Repair queue"
         sub={tickets.filter(t => t.state !== "Resolved").length + " open tickets · 2 SLA at risk"}
         right={<SignOutButton />} />
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginBottom: 24 }}>
         <KPI accent="primary" label="Open tickets" value={tickets.filter(t => t.state !== "Resolved").length} />
         <KPI label="SLA at risk" value="2" sub="next breach in 12m" trend="down" />
@@ -829,18 +1255,22 @@ function SupportDashboard() {
 /* ─── Accounts dashboard ────────────────────────────────── */
 function AccountsDashboard() {
   const { fmtMoney } = useApp();
+  // Note: accounts role can't auto-pause (RLS rejects), so no
+  // useAutoPauseExpiredAmcs hook here — they only consume the alert.
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Finance" title="Accounts overview" sub="Invoicing, payments, AMC billing" right={<SignOutButton />} />
+      <AmcPauseAlert />
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 24 }}>
         <KPI accent="primary" label="Outstanding AR" value={fmtMoney(2_840_000, { compact: true })} sub="48d DSO" trend="down" />
         <KPI label="MTD invoiced" value={fmtMoney(1_280_000, { compact: true })} sub="8.2% vs LM" trend="up" />
         <KPI label="AMC due billing" value="11" sub={fmtMoney(384_000, { compact: true })} />
         <KPI label="Approval queue" value="4" />
       </div>
-      <EmptyState icon="receipt" title="Invoicing dashboard coming online"
-        sub="The full accounts module surfaces AR aging, payment reconciliation against AMC contracts, free-call → invoice conversion, and the AMC reactivation queue. Hooked in next sprint."
-        action={<button className="btn btn-ghost">Read spec</button>} />
+      <EmptyState icon="receipt" title="Accountant module — Coming soon"
+        sub="AR aging, payment reconciliation against AMC contracts, free-call to invoice conversion, and the AMC reactivation queue will be available in the next release." />
     </div>
   );
 }
@@ -851,14 +1281,16 @@ function SalesDashboard() {
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Sales" title="My pipeline" sub={`11 quotes in flight · ${fmtMoney(14_200_000, { compact: true })} pipeline`} right={<SignOutButton />} />
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 24 }}>
         <KPI accent="primary" label="Open quotations" value="11" sub={fmtMoney(14_200_000, { compact: true })} />
         <KPI label="AMC renewals · 60d" value="11" sub={`${fmtMoney(384_000, { compact: true })} possible`} />
         <KPI label="Win rate (TTM)" value="62%" trend="up" />
         <KPI label="Lead aging" value="5" sub="leads >14 days" trend="down" />
       </div>
-      <EmptyState icon="trendingUp" title="Sales workspace"
-        sub="Pipeline, quotation pipeline, AMC renewal queue, lead aging, and your communication timeline live here. Wired in next sprint." />
+      <EmptyState icon="trendingUp" title="Sales workspace — Coming soon"
+        sub="Pipeline, quotation tracking, AMC renewal queue, lead aging, and your communication timeline will be available in the next release." />
     </div>
   );
 }
@@ -1047,6 +1479,8 @@ function OperationalOverview() {
           ))}
         </div>
       </div>
+
+      <UpcomingThisWeekWidget />
 
       {/* ── KPI tiles ── */}
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginBottom: 24 }}>
@@ -1298,26 +1732,27 @@ function formatRelativeTime(iso: string): string {
   const d = Math.round(h / 24);
   if (d === 1) return "Yesterday";
   if (d < 7)   return `${d}d ago`;
-  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return fmtMonthDay(new Date(iso));
 }
 
 function formatShortDate(iso: string): string {
   if (!iso) return "—";
   const d = new Date(iso.length === 10 ? iso : iso.slice(0, 10));
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return fmtMonthDay(d);
 }
 
 function formatShortDateTime(iso: string): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return fmtDateTime(d);
 }
 
 /* ─── Admin dashboard ───────────────────────────────────── */
 function AdminDashboard() {
   const { go, openCreate, role } = useApp();
+  useAutoPauseExpiredAmcs(role);
   const users = Object.values(db.USERS);
   // Operational Overview is for admin + md only. super_admin is a platform
   // role — they get the platform-only welcome card (handled by the role
@@ -1330,6 +1765,9 @@ function AdminDashboard() {
         right={
           <button className="btn btn-primary" onClick={() => openCreate("user")}><Icon name="plus" size={14} /> New user</button>
         } />
+      <AmcPauseAlert />
+      <CriticalAlertsWidget />
+      <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginBottom: 24 }}>
         <KPI accent="primary" label="Active users" value={users.filter(u => u.role !== "subcontractor").length} sub="across 11 roles" />
         <KPI label="Approval chains" value="8" sub="all active" />

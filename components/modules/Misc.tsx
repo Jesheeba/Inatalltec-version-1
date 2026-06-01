@@ -18,10 +18,14 @@ import {
   type ProjectStatus, type ProjectStage,
 } from "@/lib/create";
 import { supabaseBrowser } from "@/lib/supabase/client";
+import { formatLongDateTime, formatMonthDay } from "@/lib/dates";
 import type { Project, User } from "@/lib/types";
 import {
   CardHead, ChoicePill, EmptyState, FeedItem, FilterBar, KPI, PageHeader, RowMenu, StatusBadge, WoCard,
 } from "../shared";
+import {
+  AdvancePhaseButton, PhaseBadge, PhaseHistoryTimeline, PhaseStepper,
+} from "../PhaseTracker";
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
@@ -490,6 +494,24 @@ export function ProjectDetail({ id }: { id: string }) {
           </div>
         } />
 
+      {/* Phase tracker (migration 0020) — only Main Contractor projects
+          have phases. The stepper shows all 6; the badge + advance
+          button sit on the right. Hidden controls when role isn't
+          allowed to change phases (canChangeProjectPhase). */}
+      <section className="card card-pad" style={{ marginBottom: 20 }}>
+        <div className="row between" style={{ flexWrap: "wrap", gap: 12, marginBottom: 12 }}>
+          <div className="row gap-3" style={{ alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ font: "var(--t-h3)" }}>Phase</div>
+            <PhaseBadge phase={p.currentPhase} showUnset />
+          </div>
+          <AdvancePhaseButton
+            projectId={id}
+            currentPhase={p.currentPhase}
+            onAdvanced={() => setHistoryTick(t => t + 1)} />
+        </div>
+        <PhaseStepper phase={p.currentPhase} />
+      </section>
+
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Contract value" value={fmtMoney(p.value, { compact: true })} />
         <KPI label="Progress" value={p.progress + "%"}>
@@ -497,6 +519,8 @@ export function ProjectDetail({ id }: { id: string }) {
         </KPI>
         <KPI label="Stage" value={PROJECT_STAGE_LABEL[p.stage as ProjectStage] ?? p.stage} />
         <KPI label="Due" value={p.dueAt} />
+        <ProjectManHoursKpi projectId={id} />
+        <ProjectManpowerKpi projectId={id} />
       </div>
 
       <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
@@ -597,7 +621,73 @@ export function ProjectDetail({ id }: { id: string }) {
       </section>
 
       <ProjectStatusHistory projectId={id} reloadKey={historyTick} />
+
+      <section className="card card-pad" style={{ marginTop: 20 }}>
+        <CardHead title="Phase history" sub="Every Design → DLP → Closed transition" />
+        <PhaseHistoryTimeline projectId={id} reloadKey={historyTick} />
+      </section>
     </div>
+  );
+}
+
+/* ─── Project workforce rollups (Phase 5D.1) ─────────────── */
+//
+// Total man-hours = worker hours (sum of wo.durationMinutes / 60 across
+// every WO on this project — trigger-computed from
+// work_order_time_entries, migration 0022) + sub-contractor hours (sum
+// of every work_order_sub_contractor_hours entry on those same WOs,
+// migration 0026). Subtitle breaks down both streams so accounts can
+// see what's worker vs sub. KPI re-renders on dataVersion.
+function ProjectManHoursKpi({ projectId }: { projectId: string }) {
+  const { dataVersion } = useApp();
+  const { workerHrs, subHrs } = useMemo(() => {
+    let workerMinutes = 0;
+    let subHours = 0;
+    const woIds = new Set<string>();
+    for (const w of Object.values(db.WORK_ORDERS)) {
+      if (w.source.kind !== "project" || w.source.id !== projectId) continue;
+      workerMinutes += w.durationMinutes || 0;
+      woIds.add(w.id);
+    }
+    for (const e of Object.values(db.WORK_ORDER_SUB_CONTRACTOR_HOURS)) {
+      if (woIds.has(e.workOrderId)) subHours += e.hours;
+    }
+    return { workerHrs: workerMinutes / 60, subHrs: subHours };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, dataVersion]);
+  const total = workerHrs + subHrs;
+  return (
+    <KPI label="Total man-hours" value={`${total.toFixed(1)} hrs`}
+      sub={`${workerHrs.toFixed(1)} worker · ${subHrs.toFixed(1)} sub`} />
+  );
+}
+
+// Manpower = count of distinct users who logged any time entry on any WO
+// in this project + count of distinct sub-contractors who logged any
+// hours entry on those same WOs. Sub of the KPI carries the breakdown
+// so the headline number stays a single digit-or-two for at-a-glance.
+function ProjectManpowerKpi({ projectId }: { projectId: string }) {
+  const { dataVersion } = useApp();
+  const { workers, subs } = useMemo(() => {
+    const woIds = new Set<string>();
+    for (const w of Object.values(db.WORK_ORDERS)) {
+      if (w.source.kind === "project" && w.source.id === projectId) woIds.add(w.id);
+    }
+    const workerIds = new Set<string>();
+    for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+      if (e.userId && woIds.has(e.workOrderId)) workerIds.add(e.userId);
+    }
+    const subIds = new Set<string>();
+    for (const e of Object.values(db.WORK_ORDER_SUB_CONTRACTOR_HOURS)) {
+      if (woIds.has(e.workOrderId)) subIds.add(e.subContractorId);
+    }
+    return { workers: workerIds.size, subs: subIds.size };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, dataVersion]);
+  const total = workers + subs;
+  return (
+    <KPI label="Manpower" value={total}
+      sub={`${workers} worker${workers === 1 ? "" : "s"} · ${subs} sub${subs === 1 ? "" : "s"}`} />
   );
 }
 
@@ -775,15 +865,13 @@ function HistoryEntry({ row }: { row: HistoryRow }) {
 function formatHistoryDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
-  });
+  return formatLongDateTime(d);
 }
 
 /* ─── Repair ──────────────────────────────────────────── */
 export function Repair() {
   const { openCreate, role, me } = useApp();
+  const router = useRouter();
   const scope = listScopeFor(role, "repairs");
   if (scope === "hidden") {
     return (
@@ -842,7 +930,9 @@ export function Repair() {
                 const s = db.site(t.site);
                 const slaPct = (t.sla.elapsed / t.sla.target) * 100;
                 return (
-                  <tr key={t.id}>
+                  <tr key={t.id}
+                      onClick={() => router.push(`/repair/${t.id}`)}
+                      style={{ cursor: "pointer" }}>
                     <td data-th="Code" className="numeric" style={{ fontFamily: "var(--font-mono)", font: "var(--t-small)", color: "var(--ink-mute)" }}>{t.code}</td>
                     <td data-th="Title">
                       <div style={{ font: "var(--t-body-md)" }}>{t.title}</div>
@@ -867,6 +957,196 @@ export function Repair() {
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ─── Repair detail ───────────────────────────────────── */
+// Mirrors ProjectDetail / AmcDetail. Lead Tech reassign + create WO from
+// repair context + linked WO list. There is no repair_status_history
+// table in the schema today, so the status-history section is omitted
+// (would need a migration to add — out of scope here).
+export function RepairDetail({ id }: { id: string }) {
+  const { openWO, openCreate, openCustomer, fireToast, bumpData, dataVersion, role, me } = useApp();
+  void dataVersion;
+  const router = useRouter();
+  const t = db.REPAIRS[id];
+  if (!t) {
+    return (
+      <div className="main-pad">
+        <EmptyState icon="alertCircle" title="Repair ticket not found"
+          action={<button className="btn btn-primary" onClick={() => router.push("/repair")}>Back to repairs</button>} />
+      </div>
+    );
+  }
+  const cust = db.cust(t.customer);
+  const site = db.site(t.site);
+  const wos = Object.values(db.WORK_ORDERS).filter(w => w.source.kind === "repair" && w.source.id === id);
+
+  // Lead Tech assignment — same role gating as Project/AMC: anyone with
+  // CREATE_REPAIR can reassign; others see read-only. CREATE_REPAIR is
+  // already in lib/permissions.ts.
+  const canEditLead = can(role, "CREATE_REPAIR");
+  const isAssignedLead = role === "lead_worker" && t.leadTechId === me.id;
+  const canCreateWo = canEditLead || isAssignedLead;
+  const leadTechOptions = useMemo(
+    () => Object.values(db.USERS).filter(u => u.role === "lead_worker"),
+    [dataVersion],
+  );
+
+  const onChangeLeadTech = async (nextId: string) => {
+    if (nextId === t.leadTechId) return;
+    const prevId = t.leadTechId;
+    db.REPAIRS[id] = { ...t, leadTechId: nextId };
+    bumpData();
+    const { error } = await supabaseBrowser()
+      .from("repair_tickets")
+      .update({ lead_tech_id: nextId || null })
+      .eq("id", id);
+    if (error) {
+      db.REPAIRS[id] = { ...t, leadTechId: prevId };
+      bumpData();
+      fireToast(`Couldn't reassign Lead: ${error.message}`);
+      return;
+    }
+    const nextUser = nextId ? db.user(nextId) : null;
+    fireToast(nextUser ? `Lead Tech → ${nextUser.name}` : "Lead Tech cleared");
+  };
+
+  const slaPct = (t.sla.elapsed / t.sla.target) * 100;
+
+  return (
+    <div className="main-pad">
+      <div style={{ marginBottom: 16 }}>
+        <a onClick={() => router.push("/repair")}
+           style={{ font: "var(--t-small)", color: "var(--ink-mute)", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 4 }}>
+          <Icon name="chevronLeft" size={14} /> All repair tickets
+        </a>
+      </div>
+
+      <PageHeader
+        eyebrow={"Repair · " + t.code}
+        title={t.title}
+        sub={[cust?.name, site?.name].filter(Boolean).join(" · ") || "-"}
+        right={
+          <div className="row gap-2" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {t.priority === "high" && <span className="badge badge-danger">High priority</span>}
+            <StatusBadge state={t.state} />
+          </div>
+        } />
+
+      {t.flagged && (
+        <div className="card card-pad" style={{
+          marginBottom: 16,
+          background: "var(--dan-50)", borderColor: "var(--dan-100)",
+        }}>
+          <div className="row gap-2" style={{ alignItems: "center" }}>
+            <Icon name="alertCircle" size={16} style={{ color: "var(--dan-700)" }} />
+            <span style={{ font: "var(--t-body-md)", color: "var(--dan-700)", fontWeight: 600 }}>
+              {t.flagged}
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
+        <KPI accent="primary" label="Classification" value={t.classification} />
+        <KPI label="Visits" value={t.visits} />
+        <KPI label="Opened" value={formatLongDateTime(new Date(t.openedAt))} />
+        <KPI label="SLA" value={`${t.sla.elapsed}/${t.sla.target}m`}>
+          <div className={"progress" + (slaPct > 85 ? " progress-warning" : " progress-success")} style={{ marginTop: 8 }}>
+            <div style={{ width: Math.min(100, slaPct) + "%" }} />
+          </div>
+        </KPI>
+      </div>
+
+      <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+        <section className="card card-pad">
+          <CardHead title="Team & metadata" />
+          <div className="col gap-3">
+            <LeadTechRow
+              leadTechId={t.leadTechId}
+              canEdit={canEditLead}
+              leadTechOptions={leadTechOptions}
+              onChange={onChangeLeadTech}
+            />
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Customer</span>
+              {cust
+                ? <a onClick={() => openCustomer(t.customer)}
+                     style={{ font: "var(--t-small)", cursor: "pointer", color: "var(--pri-700)" }}>{cust.name}</a>
+                : <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>-</span>}
+            </div>
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Site</span>
+              <span style={{ font: "var(--t-small)" }}>{site?.name ?? "-"}</span>
+            </div>
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Priority</span>
+              <span style={{ font: "var(--t-small)", textTransform: "capitalize" }}>{t.priority}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="card card-pad">
+          <CardHead title="SLA" />
+          <div className="col gap-3">
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Elapsed</span>
+              <span className="numeric" style={{ font: "var(--t-small)" }}>{t.sla.elapsed} min</span>
+            </div>
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Target</span>
+              <span className="numeric" style={{ font: "var(--t-small)" }}>{t.sla.target} min</span>
+            </div>
+            <div className="row between">
+              <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Status</span>
+              {t.sla.breach
+                ? <span className="badge badge-danger">Breached</span>
+                : slaPct > 85
+                  ? <span className="badge badge-warning">At risk</span>
+                  : <span className="badge badge-success">On track</span>}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section className="card card-pad" style={{ marginTop: 20 }}>
+        <CardHead
+          title={`Work orders · ${wos.length}`}
+          right={canCreateWo ? (
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => openCreate("workorder", {
+                source_kind: "repair",
+                source_id: id,
+                customer_id: t.customer,
+                site_id: t.site || undefined,
+              })}>
+              <Icon name="plus" size={13} /> Create Work Order
+            </button>
+          ) : undefined} />
+        <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))" }}>
+          {wos.map(w => <WoCard key={w.id} wo={w} compact onClick={() => openWO(w.id)} />)}
+          {wos.length === 0 && (
+            <EmptyState
+              icon="briefcase"
+              title="No work orders yet"
+              action={canCreateWo ? (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => openCreate("workorder", {
+                    source_kind: "repair",
+                    source_id: id,
+                    customer_id: t.customer,
+                    site_id: t.site || undefined,
+                  })}>
+                  <Icon name="plus" size={14} /> Create Work Order
+                </button>
+              ) : undefined} />
+          )}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1008,49 +1288,734 @@ export function Team() {
   );
 }
 
-/* ─── Reports ─────────────────────────────────────────── */
+/* ─── Reports (Phase 7) ──────────────────────────────────
+ *
+ * Three tabbed report views, no charts (boss wants numbers).
+ *
+ *   • Projects     — main contractor jobs + AMC contracts + repair
+ *                    tickets each as a row, hours rolled up from their
+ *                    work orders.
+ *   • Sub-contractors — directory rolled up by entry table.
+ *   • Workers      — users with role worker / lead_worker rolled up
+ *                    from work_order_time_entries.
+ *
+ * Each tab has:
+ *   • Filter bar (date range default last 90 days + per-tab filters)
+ *   • Sortable table (click headers; default = total hours desc)
+ *   • Export CSV button that downloads exactly what's on screen,
+ *     respecting filters AND sort order.
+ *
+ * No backend round-trips — every selector reads off the in-memory
+ * mirror, which already carries every entry the current user is
+ * allowed to see (per RLS at hydration).
+ * ─────────────────────────────────────────────────────── */
+
+const ALLOWED_REPORTS_ROLES = new Set<string>(["admin", "md", "manager", "accounts"]);
+type ReportTab = "project" | "sub" | "worker";
+
 export function Reports() {
-  const { fmtMoney } = useApp();
+  const { role } = useApp();
+  const [tab, setTab] = useState<ReportTab>("project");
+
+  if (!ALLOWED_REPORTS_ROLES.has(role)) {
+    return (
+      <div className="main-pad">
+        <PageHeader eyebrow="Analytics" title="Reports" />
+        <EmptyState icon="shield" title="Not available for your role"
+          sub="Reports are available to MD / Admin / Operations Manager / Accounts." />
+      </div>
+    );
+  }
+
   return (
     <div className="main-pad">
-      <PageHeader eyebrow="Analytics" title="Reports" sub="Job, technician, customer, operational reporting." />
-      <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 20 }}>
-        <KPI accent="primary" label="MTD revenue" value={fmtMoney(1_280_000, { compact: true })} sub="8.2% vs LM" trend="up" />
-        <KPI label="Avg WO cost" value={fmtMoney(2840)} sub="margin 38%" />
-        <KPI label="Free-call conversion" value="62%" trend="up" />
-        <KPI label="Customer rating" value="4.6 ★" />
+      <PageHeader eyebrow="Analytics" title="Reports"
+        sub="Manpower, man-hours, and project breakdowns" />
+
+      <div className="card card-pad" style={{ marginBottom: 16, padding: 8 }}>
+        <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+          {([
+            { k: "project", label: "Projects" },
+            { k: "sub",     label: "Sub-contractors" },
+            { k: "worker",  label: "Workers" },
+          ] as { k: ReportTab; label: string }[]).map(t => (
+            <button key={t.k}
+              className={"btn btn-sm " + (tab === t.k ? "btn-primary" : "btn-ghost")}
+              onClick={() => setTab(t.k)}>
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)" }}>
-        <section className="card card-pad">
-          <CardHead title="Revenue trend · 12 weeks" />
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 200 }}>
-            {[42, 55, 48, 62, 58, 70, 66, 82, 75, 88, 92, 100].map((h, i) => (
-              <div key={i} style={{
-                flex: 1, height: h + "%",
-                background: "linear-gradient(to top, var(--pri-500), var(--pri-300))",
-                borderRadius: "6px 6px 0 0",
-                opacity: i === 11 ? 1 : 0.85,
-              }} />
-            ))}
-          </div>
-        </section>
-        <section className="card card-pad">
-          <CardHead title="Margin by stream" />
-          <div className="col gap-3">
-            {[{ k: "Main Contractor", v: 38, c: "var(--pri-500)" }, { k: "AMC", v: 52, c: "var(--sec-500)" }, { k: "Repair", v: 28, c: "var(--acc-500)" }].map(r => (
-              <div key={r.k}>
-                <div className="row between" style={{ marginBottom: 6 }}>
-                  <span style={{ font: "var(--t-small)" }}>{r.k}</span>
-                  <span className="numeric" style={{ font: "var(--t-small)", fontWeight: 600 }}>{r.v}%</span>
-                </div>
-                <div className="progress"><div style={{ width: r.v + "%", background: r.c }} /></div>
-              </div>
-            ))}
-          </div>
-        </section>
+      {tab === "project" && <ProjectReport />}
+      {tab === "sub"     && <SubContractorReport />}
+      {tab === "worker"  && <WorkerReport />}
+    </div>
+  );
+}
+
+/* ─── shared helpers ─────────────────────────────────── */
+
+function todayYmd(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
+}
+function daysAgoYmd(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
+}
+function twoDigits(n: number): string { return n < 10 ? `0${n}` : String(n); }
+
+function formatYmdShort(yyyyMmDd: string | null): string {
+  if (!yyyyMmDd) return "—";
+  const [y, m, d] = yyyyMmDd.split("-").map(Number);
+  if (!y || !m || !d) return yyyyMmDd;
+  return formatMonthDay(new Date(y, m - 1, d, 12, 0, 0));
+}
+
+/** Excel-safe CSV. BOM prefix ensures UTF-8 detection; embedded
+ *  commas / quotes / newlines are escaped per RFC 4180. */
+function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
+  const esc = (v: string | number) => {
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.map(esc).join(","), ...rows.map(r => r.map(esc).join(","))];
+  const csv = lines.join("\r\n");
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+/** Reusable sortable header cell. */
+function SortHead<K extends string>({
+  k, current, dir, onSort, children, align,
+}: {
+  k: K; current: K; dir: "asc" | "desc";
+  onSort: (k: K) => void;
+  children: React.ReactNode;
+  align?: "left" | "right";
+}) {
+  const active = k === current;
+  return (
+    <th onClick={() => onSort(k)}
+        style={{
+          cursor: "pointer", userSelect: "none",
+          textAlign: align ?? "left",
+          background: active ? "var(--bg-muted)" : undefined,
+        }}>
+      <span className="row gap-1" style={{
+        alignItems: "center",
+        justifyContent: align === "right" ? "flex-end" : "flex-start",
+      }}>
+        {children}
+        {active && (
+          <Icon name={dir === "asc" ? "arrowUp" : "arrowDown"} size={11}
+                style={{ color: "var(--ink-mute)" }} />
+        )}
+      </span>
+    </th>
+  );
+}
+
+/** Standard date-range + Export-CSV bar shown above every report. */
+function ReportToolbar({
+  from, to, setFrom, setTo, onExport, extra,
+}: {
+  from: string; to: string;
+  setFrom: (s: string) => void; setTo: (s: string) => void;
+  onExport: () => void;
+  extra?: React.ReactNode;
+}) {
+  return (
+    <div className="card card-pad" style={{ marginBottom: 16 }}>
+      <div className="row gap-3" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div className="col" style={{ minWidth: 140 }}>
+          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>From</label>
+          <input className="input input-sm" type="date" value={from}
+                 max={to} onChange={e => setFrom(e.target.value)} />
+        </div>
+        <div className="col" style={{ minWidth: 140 }}>
+          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>To</label>
+          <input className="input input-sm" type="date" value={to}
+                 min={from} max={todayYmd()} onChange={e => setTo(e.target.value)} />
+        </div>
+        {extra}
+        <div style={{ flex: 1 }} />
+        <button className="btn btn-ghost btn-sm" onClick={onExport}>
+          <Icon name="fileText" size={14} /> Export CSV
+        </button>
       </div>
     </div>
+  );
+}
+
+/* ─── A. PROJECT REPORT ──────────────────────────────── */
+
+type ProjectType = "main_contractor" | "amc" | "repair";
+type StatusFilter = "all" | "active" | "completed";
+type TypeFilter   = "all" | ProjectType;
+
+interface ProjectReportRow {
+  containerId: string;
+  type: ProjectType;
+  code: string;
+  title: string;
+  status: string;
+  isActive: boolean;
+  workerHrs: number;
+  subHrs: number;
+  totalHrs: number;
+  workers: number;
+  subs: number;
+  manpower: number;
+}
+
+type ProjectSortKey = "code" | "title" | "status" | "totalHrs" | "workerHrs" | "subHrs" | "manpower" | "workers" | "subs";
+
+function ProjectReport() {
+  const { dataVersion } = useApp();
+  void dataVersion;
+  const [from, setFrom] = useState(daysAgoYmd(90));
+  const [to,   setTo]   = useState(todayYmd());
+  const [statusF, setStatusF] = useState<StatusFilter>("all");
+  const [typeF,   setTypeF]   = useState<TypeFilter>("all");
+  const [showAll, setShowAll] = useState(false);
+  const [sortKey, setSortKey] = useState<ProjectSortKey>("totalHrs");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  const rows = useMemo<ProjectReportRow[]>(() => {
+    return buildProjectRows(from, to);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [from, to, dataVersion]);
+
+  const filtered = useMemo(() => {
+    let out = rows;
+    if (statusF === "active")    out = out.filter(r => r.isActive);
+    if (statusF === "completed") out = out.filter(r => !r.isActive);
+    if (typeF !== "all")         out = out.filter(r => r.type === typeF);
+    // Default: drop containers with zero hours in range — those are
+    // noise. Toggle off to see every project including idle ones.
+    if (!showAll) out = out.filter(r => r.totalHrs > 0);
+    return out;
+  }, [rows, statusF, typeF, showAll]);
+
+  const sorted = useMemo(() => {
+    const out = [...filtered];
+    out.sort((a, b) => {
+      let cmp: number;
+      if (sortKey === "code" || sortKey === "title" || sortKey === "status") {
+        cmp = (a[sortKey] as string).localeCompare(b[sortKey] as string);
+      } else {
+        cmp = (a[sortKey] as number) - (b[sortKey] as number);
+      }
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return out;
+  }, [filtered, sortKey, sortDir]);
+
+  const onSort = (k: ProjectSortKey) => {
+    if (k === sortKey) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(k); setSortDir(k === "code" || k === "title" || k === "status" ? "asc" : "desc"); }
+  };
+
+  const onExport = () => {
+    downloadCsv(
+      `project-report-${todayYmd()}.csv`,
+      ["Type", "Code", "Title", "Status", "Total Hours", "Worker Hours", "Sub Hours", "Manpower", "Workers", "Subs"],
+      sorted.map(r => [
+        TYPE_LABEL[r.type], r.code, r.title, r.status,
+        r.totalHrs.toFixed(2), r.workerHrs.toFixed(2), r.subHrs.toFixed(2),
+        r.manpower, r.workers, r.subs,
+      ]),
+    );
+  };
+
+  return (
+    <>
+      <ReportToolbar from={from} to={to} setFrom={setFrom} setTo={setTo}
+        onExport={onExport}
+        extra={
+          <>
+            <div className="col" style={{ minWidth: 140 }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Status</label>
+              <select className="input input-sm" value={statusF}
+                      onChange={e => setStatusF(e.target.value as StatusFilter)}>
+                <option value="all">All</option>
+                <option value="active">Active</option>
+                <option value="completed">Completed</option>
+              </select>
+            </div>
+            <div className="col" style={{ minWidth: 160 }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Type</label>
+              <select className="input input-sm" value={typeF}
+                      onChange={e => setTypeF(e.target.value as TypeFilter)}>
+                <option value="all">All</option>
+                <option value="main_contractor">Main Contractor</option>
+                <option value="amc">AMC</option>
+                <option value="repair">Repair</option>
+              </select>
+            </div>
+            <div className="row" style={{ alignItems: "center", gap: 8, paddingBottom: 4 }}>
+              <input id="rpt-proj-showall" type="checkbox" checked={showAll}
+                     onChange={e => setShowAll(e.target.checked)}
+                     style={{ width: 18, height: 18 }} />
+              <label htmlFor="rpt-proj-showall" style={{ font: "var(--t-small)" }}>
+                Show projects with no hours
+              </label>
+            </div>
+          </>
+        } />
+
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <SortHead<ProjectSortKey> k="code"      current={sortKey} dir={sortDir} onSort={onSort}>Code</SortHead>
+                <SortHead<ProjectSortKey> k="title"     current={sortKey} dir={sortDir} onSort={onSort}>Title</SortHead>
+                <SortHead<ProjectSortKey> k="status"    current={sortKey} dir={sortDir} onSort={onSort}>Status</SortHead>
+                <SortHead<ProjectSortKey> k="totalHrs"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Total hrs</SortHead>
+                <SortHead<ProjectSortKey> k="workerHrs" current={sortKey} dir={sortDir} onSort={onSort} align="right">Worker hrs</SortHead>
+                <SortHead<ProjectSortKey> k="subHrs"    current={sortKey} dir={sortDir} onSort={onSort} align="right">Sub hrs</SortHead>
+                <SortHead<ProjectSortKey> k="manpower"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Manpower</SortHead>
+                <SortHead<ProjectSortKey> k="workers"   current={sortKey} dir={sortDir} onSort={onSort} align="right"># Workers</SortHead>
+                <SortHead<ProjectSortKey> k="subs"      current={sortKey} dir={sortDir} onSort={onSort} align="right"># Subs</SortHead>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 ? (
+                <tr><td colSpan={10} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
+                  No hours in this date range
+                </td></tr>
+              ) : sorted.map(r => (
+                <tr key={r.containerId}>
+                  <td data-th="Type">
+                    <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>{TYPE_LABEL[r.type]}</span>
+                  </td>
+                  <td data-th="Code" style={{ font: "var(--t-small)", fontWeight: 600 }}>{r.code}</td>
+                  <td data-th="Title" style={{ font: "var(--t-small)" }}>{r.title}</td>
+                  <td data-th="Status" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{r.status}</td>
+                  <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs > 0 ? r.totalHrs.toFixed(1) : "—"}</td>
+                  <td data-th="Worker hrs" className="numeric" style={{ textAlign: "right" }}>{r.workerHrs > 0 ? r.workerHrs.toFixed(1) : "—"}</td>
+                  <td data-th="Sub hrs" className="numeric" style={{ textAlign: "right" }}>{r.subHrs > 0 ? r.subHrs.toFixed(1) : "—"}</td>
+                  <td data-th="Manpower" className="numeric" style={{ textAlign: "right" }}>{r.manpower > 0 ? r.manpower : "—"}</td>
+                  <td data-th="# Workers" className="numeric" style={{ textAlign: "right" }}>{r.workers > 0 ? r.workers : "—"}</td>
+                  <td data-th="# Subs" className="numeric" style={{ textAlign: "right" }}>{r.subs > 0 ? r.subs : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
+
+const TYPE_LABEL: Record<ProjectType, string> = {
+  main_contractor: "Main Contractor",
+  amc: "AMC",
+  repair: "Repair",
+};
+
+function buildProjectRows(from: string, to: string): ProjectReportRow[] {
+  // Group WOs by container (project / amc / repair). Then per container
+  // sum worker + sub hours filtered by date.
+  const wosByProject = new Map<string, string[]>();
+  const wosByAmc     = new Map<string, string[]>();
+  const wosByRepair  = new Map<string, string[]>();
+  for (const w of Object.values(db.WORK_ORDERS)) {
+    const target =
+      w.source.kind === "project" ? wosByProject :
+      w.source.kind === "amc"     ? wosByAmc     : wosByRepair;
+    const list = target.get(w.source.id) ?? [];
+    list.push(w.id);
+    target.set(w.source.id, list);
+  }
+
+  const rows: ProjectReportRow[] = [];
+
+  const tallyHours = (woIds: string[]) => {
+    const ids = new Set(woIds);
+    let workerMinutes = 0;
+    let subHours = 0;
+    const workers = new Set<string>();
+    const subs = new Set<string>();
+    for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+      if (!ids.has(e.workOrderId)) continue;
+      if (!e.endedAt) continue;
+      const ymd = e.endedAt.slice(0, 10);
+      if (ymd < from || ymd > to) continue;
+      workerMinutes += e.durationMinutes;
+      if (e.userId) workers.add(e.userId);
+    }
+    for (const e of Object.values(db.WORK_ORDER_SUB_CONTRACTOR_HOURS)) {
+      if (!ids.has(e.workOrderId)) continue;
+      if (e.entryDate < from || e.entryDate > to) continue;
+      subHours += e.hours;
+      subs.add(e.subContractorId);
+    }
+    return { workerHrs: workerMinutes / 60, subHrs: subHours, workers, subs };
+  };
+
+  for (const p of Object.values(db.PROJECTS)) {
+    const t = tallyHours(wosByProject.get(p.id) ?? []);
+    rows.push({
+      containerId: "p:" + p.id, type: "main_contractor",
+      code: p.code, title: p.name, status: p.status,
+      isActive: isProjectActive(p.status),
+      workerHrs: t.workerHrs, subHrs: t.subHrs, totalHrs: t.workerHrs + t.subHrs,
+      workers: t.workers.size, subs: t.subs.size,
+      manpower: t.workers.size + t.subs.size,
+    });
+  }
+  for (const a of Object.values(db.AMCS)) {
+    const t = tallyHours(wosByAmc.get(a.id) ?? []);
+    const cust = db.cust(a.customer);
+    rows.push({
+      containerId: "a:" + a.id, type: "amc",
+      code: a.code, title: cust?.name ?? "—",
+      status: a.contract_status,
+      isActive: isAmcActive(a.contract_status),
+      workerHrs: t.workerHrs, subHrs: t.subHrs, totalHrs: t.workerHrs + t.subHrs,
+      workers: t.workers.size, subs: t.subs.size,
+      manpower: t.workers.size + t.subs.size,
+    });
+  }
+  for (const r of Object.values(db.REPAIRS)) {
+    const t = tallyHours(wosByRepair.get(r.id) ?? []);
+    rows.push({
+      containerId: "r:" + r.id, type: "repair",
+      code: r.code, title: r.title, status: r.state,
+      isActive: isRepairActive(r.state),
+      workerHrs: t.workerHrs, subHrs: t.subHrs, totalHrs: t.workerHrs + t.subHrs,
+      workers: t.workers.size, subs: t.subs.size,
+      manpower: t.workers.size + t.subs.size,
+    });
+  }
+  return rows;
+}
+
+function isProjectActive(s: string): boolean {
+  const t = s.toLowerCase();
+  return !(t.includes("completed") || t.includes("closed") || t.includes("cancel"));
+}
+function isAmcActive(s: string): boolean {
+  return !(s === "expired" || s === "cancelled" || s === "renewed");
+}
+function isRepairActive(s: string): boolean {
+  return s !== "Resolved";
+}
+
+/* ─── B. SUB-CONTRACTOR REPORT ───────────────────────── */
+
+interface SubReportRow {
+  id: string;
+  name: string;
+  company: string;
+  phone: string;
+  emiratesId: string;
+  isActive: boolean;
+  totalHrs: number;
+  projects: number;
+  wos: number;
+  lastEntry: string | null; // YYYY-MM-DD
+}
+type SubSortKey = "name" | "company" | "totalHrs" | "projects" | "wos" | "lastEntry";
+
+function SubContractorReport() {
+  const { dataVersion } = useApp();
+  void dataVersion;
+  const router = useRouter();
+  const [from, setFrom] = useState(daysAgoYmd(90));
+  const [to,   setTo]   = useState(todayYmd());
+  const [activeOnly, setActiveOnly] = useState(true);
+  const [sortKey, setSortKey] = useState<SubSortKey>("totalHrs");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  const rows = useMemo<SubReportRow[]>(() => {
+    return Object.values(db.SUB_CONTRACTORS).map(s => {
+      const entries = db.hoursForSub(s.id).filter(e => e.entryDate >= from && e.entryDate <= to);
+      const projectIds = new Set<string>();
+      const woIds = new Set<string>();
+      let last: string | null = null;
+      let total = 0;
+      for (const e of entries) {
+        total += e.hours;
+        woIds.add(e.workOrderId);
+        const wo = db.wo(e.workOrderId);
+        if (wo?.source.kind === "project") projectIds.add(wo.source.id);
+        if (!last || e.entryDate > last) last = e.entryDate;
+      }
+      return {
+        id: s.id,
+        name: s.name,
+        company: s.company ?? "—",
+        phone: s.phone ?? "—",
+        emiratesId: s.emiratesId ?? "—",
+        isActive: s.isActive,
+        totalHrs: total,
+        projects: projectIds.size,
+        wos: woIds.size,
+        lastEntry: last,
+      };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [from, to, dataVersion]);
+
+  const filtered = useMemo(() => {
+    let out = rows;
+    if (activeOnly) out = out.filter(r => r.isActive);
+    // Drop subs with zero hours in range so the report is signal-only.
+    out = out.filter(r => r.totalHrs > 0);
+    return out;
+  }, [rows, activeOnly]);
+
+  const sorted = useMemo(() => {
+    const out = [...filtered];
+    out.sort((a, b) => {
+      let cmp: number;
+      if (sortKey === "lastEntry") {
+        cmp = (a.lastEntry ?? "").localeCompare(b.lastEntry ?? "");
+      } else if (sortKey === "totalHrs" || sortKey === "projects" || sortKey === "wos") {
+        cmp = (a[sortKey] as number) - (b[sortKey] as number);
+      } else {
+        cmp = (a[sortKey] as string).localeCompare(b[sortKey] as string);
+      }
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return out;
+  }, [filtered, sortKey, sortDir]);
+
+  const onSort = (k: SubSortKey) => {
+    if (k === sortKey) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(k); setSortDir(k === "name" || k === "company" ? "asc" : "desc"); }
+  };
+
+  const onExport = () => {
+    downloadCsv(
+      `sub-contractor-report-${todayYmd()}.csv`,
+      ["Name", "Company", "Phone", "Emirates ID", "Total Hours", "# Projects", "# WOs", "Last Entry"],
+      sorted.map(r => [
+        r.name, r.company, r.phone, r.emiratesId,
+        r.totalHrs.toFixed(2), r.projects, r.wos, r.lastEntry ?? "—",
+      ]),
+    );
+  };
+
+  return (
+    <>
+      <ReportToolbar from={from} to={to} setFrom={setFrom} setTo={setTo}
+        onExport={onExport}
+        extra={
+          <div className="row" style={{ alignItems: "center", gap: 8, paddingBottom: 4 }}>
+            <input id="rpt-sub-active" type="checkbox" checked={activeOnly}
+                   onChange={e => setActiveOnly(e.target.checked)}
+                   style={{ width: 18, height: 18 }} />
+            <label htmlFor="rpt-sub-active" style={{ font: "var(--t-small)" }}>
+              Active only
+            </label>
+          </div>
+        } />
+
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table className="table">
+            <thead>
+              <tr>
+                <SortHead<SubSortKey> k="name"      current={sortKey} dir={sortDir} onSort={onSort}>Name</SortHead>
+                <SortHead<SubSortKey> k="company"   current={sortKey} dir={sortDir} onSort={onSort}>Company</SortHead>
+                <th className="hide-mobile">Phone</th>
+                <th className="hide-mobile">Emirates ID</th>
+                <SortHead<SubSortKey> k="totalHrs"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Total hrs</SortHead>
+                <SortHead<SubSortKey> k="projects"  current={sortKey} dir={sortDir} onSort={onSort} align="right"># Projects</SortHead>
+                <SortHead<SubSortKey> k="wos"       current={sortKey} dir={sortDir} onSort={onSort} align="right"># WOs</SortHead>
+                <SortHead<SubSortKey> k="lastEntry" current={sortKey} dir={sortDir} onSort={onSort} align="right">Last entry</SortHead>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 ? (
+                <tr><td colSpan={8} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
+                  No hours in this date range
+                </td></tr>
+              ) : sorted.map(r => (
+                <tr key={r.id}
+                    onClick={() => router.push(`/sub-contractors/${r.id}`)}
+                    style={{ cursor: "pointer" }}>
+                  <td data-th="Name" style={{ font: "var(--t-small)", fontWeight: 600 }}>
+                    {r.name}
+                    {!r.isActive && <span className="badge badge-outline"
+                      style={{ marginLeft: 6, font: "var(--t-micro)" }}>Inactive</span>}
+                  </td>
+                  <td data-th="Company" style={{ font: "var(--t-small)" }}>{r.company}</td>
+                  <td data-th="Phone" className="hide-mobile numeric" style={{ font: "var(--t-small)" }}>{r.phone}</td>
+                  <td data-th="Emirates ID" className="hide-mobile numeric"
+                      style={{ font: "var(--t-small)", fontFamily: "var(--font-mono)" }}>{r.emiratesId}</td>
+                  <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs.toFixed(1)}</td>
+                  <td data-th="# Projects" className="numeric" style={{ textAlign: "right" }}>{r.projects}</td>
+                  <td data-th="# WOs" className="numeric" style={{ textAlign: "right" }}>{r.wos}</td>
+                  <td data-th="Last entry" className="numeric" style={{ textAlign: "right", color: "var(--ink-mute)" }}>{formatYmdShort(r.lastEntry)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ─── C. WORKER REPORT ───────────────────────────────── */
+
+interface WorkerReportRow {
+  id: string;
+  name: string;
+  role: string;
+  totalHrs: number;
+  projects: number;
+  wos: number;
+  lastEntry: string | null; // YYYY-MM-DD
+}
+type WorkerSortKey = "name" | "role" | "totalHrs" | "projects" | "wos" | "lastEntry";
+type RoleFilter = "all" | "worker" | "lead_worker";
+
+function WorkerReport() {
+  const { dataVersion } = useApp();
+  void dataVersion;
+  const [from, setFrom] = useState(daysAgoYmd(90));
+  const [to,   setTo]   = useState(todayYmd());
+  const [roleF, setRoleF] = useState<RoleFilter>("all");
+  const [sortKey, setSortKey] = useState<WorkerSortKey>("totalHrs");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  const rows = useMemo<WorkerReportRow[]>(() => {
+    const candidates = Object.values(db.USERS).filter(u => u.role === "worker" || u.role === "lead_worker");
+    return candidates.map(u => {
+      let totalMinutes = 0;
+      const projects = new Set<string>();
+      const wos = new Set<string>();
+      let last: string | null = null;
+      for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+        if (e.userId !== u.id) continue;
+        if (!e.endedAt) continue;
+        const ymd = e.endedAt.slice(0, 10);
+        if (ymd < from || ymd > to) continue;
+        totalMinutes += e.durationMinutes;
+        wos.add(e.workOrderId);
+        const wo = db.wo(e.workOrderId);
+        if (wo?.source.kind === "project") projects.add(wo.source.id);
+        if (!last || ymd > last) last = ymd;
+      }
+      return {
+        id: u.id, name: u.name, role: u.role,
+        totalHrs: totalMinutes / 60,
+        projects: projects.size,
+        wos: wos.size,
+        lastEntry: last,
+      };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [from, to, dataVersion]);
+
+  const filtered = useMemo(() => {
+    let out = rows;
+    if (roleF !== "all") out = out.filter(r => r.role === roleF);
+    out = out.filter(r => r.totalHrs > 0);
+    return out;
+  }, [rows, roleF]);
+
+  const sorted = useMemo(() => {
+    const out = [...filtered];
+    out.sort((a, b) => {
+      let cmp: number;
+      if (sortKey === "lastEntry") {
+        cmp = (a.lastEntry ?? "").localeCompare(b.lastEntry ?? "");
+      } else if (sortKey === "totalHrs" || sortKey === "projects" || sortKey === "wos") {
+        cmp = (a[sortKey] as number) - (b[sortKey] as number);
+      } else {
+        cmp = (a[sortKey] as string).localeCompare(b[sortKey] as string);
+      }
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return out;
+  }, [filtered, sortKey, sortDir]);
+
+  const onSort = (k: WorkerSortKey) => {
+    if (k === sortKey) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(k); setSortDir(k === "name" || k === "role" ? "asc" : "desc"); }
+  };
+
+  const onExport = () => {
+    downloadCsv(
+      `worker-report-${todayYmd()}.csv`,
+      ["Name", "Role", "Total Hours", "# Projects", "# WOs", "Last Entry"],
+      sorted.map(r => [
+        r.name, ROLE_LABELS[r.role as keyof typeof ROLE_LABELS] ?? r.role,
+        r.totalHrs.toFixed(2), r.projects, r.wos, r.lastEntry ?? "—",
+      ]),
+    );
+  };
+
+  return (
+    <>
+      <ReportToolbar from={from} to={to} setFrom={setFrom} setTo={setTo}
+        onExport={onExport}
+        extra={
+          <div className="col" style={{ minWidth: 160 }}>
+            <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Role</label>
+            <select className="input input-sm" value={roleF}
+                    onChange={e => setRoleF(e.target.value as RoleFilter)}>
+              <option value="all">All</option>
+              <option value="worker">Technician</option>
+              <option value="lead_worker">Lead Technician</option>
+            </select>
+          </div>
+        } />
+
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table className="table">
+            <thead>
+              <tr>
+                <SortHead<WorkerSortKey> k="name"      current={sortKey} dir={sortDir} onSort={onSort}>Name</SortHead>
+                <SortHead<WorkerSortKey> k="role"      current={sortKey} dir={sortDir} onSort={onSort}>Role</SortHead>
+                <SortHead<WorkerSortKey> k="totalHrs"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Total hrs</SortHead>
+                <SortHead<WorkerSortKey> k="projects"  current={sortKey} dir={sortDir} onSort={onSort} align="right"># Projects</SortHead>
+                <SortHead<WorkerSortKey> k="wos"       current={sortKey} dir={sortDir} onSort={onSort} align="right"># WOs</SortHead>
+                <SortHead<WorkerSortKey> k="lastEntry" current={sortKey} dir={sortDir} onSort={onSort} align="right">Last entry</SortHead>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 ? (
+                <tr><td colSpan={6} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
+                  No hours in this date range
+                </td></tr>
+              ) : sorted.map(r => (
+                <tr key={r.id}>
+                  <td data-th="Name" style={{ font: "var(--t-small)", fontWeight: 600 }}>{r.name}</td>
+                  <td data-th="Role" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+                    {ROLE_LABELS[r.role as keyof typeof ROLE_LABELS] ?? r.role}
+                  </td>
+                  <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs.toFixed(1)}</td>
+                  <td data-th="# Projects" className="numeric" style={{ textAlign: "right" }}>{r.projects}</td>
+                  <td data-th="# WOs" className="numeric" style={{ textAlign: "right" }}>{r.wos}</td>
+                  <td data-th="Last entry" className="numeric" style={{ textAlign: "right", color: "var(--ink-mute)" }}>{formatYmdShort(r.lastEntry)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
   );
 }
 

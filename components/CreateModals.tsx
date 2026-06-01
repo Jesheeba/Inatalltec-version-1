@@ -23,13 +23,21 @@ import {
   JOB_CATEGORIES, JOB_CATEGORY_LABEL,
   UAE_EMIRATES,
   createReplacementRequest, REPLACEMENT_CONTEXT_LABEL,
+  createSubContractor, assignSubContractorToWO,
+  logSubContractorHours, editSubContractorHoursEntry,
   type ProjectStatus, type ProjectStage, type AmcPaymentMethod,
   type JobCategory, type ContractMeta,
 } from "@/lib/create";
-import type { ReplacementContext } from "@/lib/types";
+import { formatMonthDay } from "@/lib/dates";
+import type { ProjectPhase, ReplacementContext } from "@/lib/types";
+import { PROJECT_PHASES, PROJECT_PHASE_LABEL } from "@/lib/phases";
 import { can, type PermissionAction } from "@/lib/permissions";
 import { createNote, updateNote } from "@/lib/notes";
 import { currencySymbol } from "@/lib/format";
+import {
+  formatConflictLabel, getWorkerConflictsFor,
+  type WorkerConflict,
+} from "@/lib/conflicts";
 
 /* ─── Host ──────────────────────────────────────────────── */
 export function CreateModalsHost() {
@@ -75,6 +83,8 @@ export function CreateModalsHost() {
       {create.kind === "replacement_request" && (
         <RoleGate action="CREATE_REPLACEMENT" kindLabel="replacement requests"><ReplacementRequestForm /></RoleGate>
       )}
+      {create.kind === "sub_contractor" && <SubContractorForm />}
+      {create.kind === "sub_hours" && <LogSubHoursForm />}
     </Modal>
   );
 }
@@ -203,6 +213,48 @@ function CheckboxField({ checked, onChange, label, hint }:
           {hint && <div className="field-hint" style={{ marginTop: 2 }}>{hint}</div>}
         </span>
       </label>
+    </div>
+  );
+}
+
+// Inline warning block surfaced below a worker picker when the chosen
+// worker has another active WO in the selected time window. Non-blocking
+// — the Lead Tech can still submit. Renders nothing when conflicts is
+// empty so it's safe to drop into a form unconditionally.
+function ConflictWarning({ workerName, conflicts }: {
+  workerName: string;
+  conflicts: WorkerConflict[];
+}) {
+  if (conflicts.length === 0) return null;
+  return (
+    <div role="status" style={{
+      marginTop: 6,
+      padding: "8px 10px",
+      borderRadius: "var(--r-sm)",
+      background: "var(--warn-100)",
+      border: "1px solid var(--warn-100)",
+      color: "var(--warn-700)",
+      font: "var(--t-small)",
+      display: "flex", gap: 8, alignItems: "flex-start",
+    }}>
+      <Icon name="alertTriangle" size={14} style={{ marginTop: 2, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 600 }}>
+          {workerName} has {conflicts.length === 1 ? "a conflicting work order" : `${conflicts.length} conflicting work orders`}
+        </div>
+        <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+          {conflicts.slice(0, 3).map(c => (
+            <li key={c.workOrderId} style={{ marginTop: 2 }}>
+              {formatConflictLabel(c)}{c.isLead ? " (lead)" : ""}
+            </li>
+          ))}
+          {conflicts.length > 3 && (
+            <li style={{ marginTop: 2, color: "var(--warn-700)", opacity: 0.8 }}>
+              +{conflicts.length - 3} more
+            </li>
+          )}
+        </ul>
+      </div>
     </div>
   );
 }
@@ -854,14 +906,28 @@ function ProjectForm() {
   const [err, setErr] = useState<string | null>(null);
   const today = new Date().toISOString().slice(0, 10);
   const initialCustomer = (create?.prefill?.customer_id as string) || "";
+  // Phase 9.x Part 4 auto-assign — same pattern as AmcForm above.
+  const managers = useMemo(() => Object.values(db.USERS).filter(u => u.role === "manager"), []);
+  const autoManager = managers.length === 1 ? managers[0] : null;
+  useEffect(() => {
+    // eslint-disable-next-line no-console
+    console.log("[Auto-assign] Active manager:", autoManager?.name ?? "NONE");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [f, setF] = useState({
     name: "", code: "",
     customer_id: initialCustomer, site_id: "",
-    manager_id: "", lead_tech_id: "",
+    manager_id: autoManager?.id ?? "",
+    lead_tech_id: "",
     value_aed: "",
     started_at: today, due_at: "",
     status: "planned" as ProjectStatus,
     stage: "lead" as ProjectStage,
+    // Starting phase (migration 0020). Defaults to 'design' — the DB
+    // default is the same, so this just makes the form's choice
+    // visible. Operations Manager can pick a later phase if backfilling
+    // an in-flight project.
+    current_phase: "design" as ProjectPhase,
     // Step B (migration 0012) — Main Contractor Job specifics.
     // All optional; persisted to projects.scope_description, .job_category,
     // and .contract_meta (JSONB). has_tc_phase defaults on because most
@@ -880,7 +946,8 @@ function ProjectForm() {
   // don't persist defaults the user never saw.
   const [showContractTerms, setShowContractTerms] = useState(false);
   const customers = Object.values(db.CUSTOMERS);
-  const managers = useMemo(() => Object.values(db.USERS).filter(u => u.role === "manager"), []);
+  // managers resolved above for the Phase 9.x auto-assign — reuse here
+  // for the picker pool when there isn't exactly one.
   // Lead Tech picker — only lead_workers. Drives the "who owns execution"
   // assignment that lets the Lead see this project in their sidebar without
   // having to wait for a WO to be assigned to them (migration 0018). The
@@ -921,6 +988,7 @@ function ProjectForm() {
       started_at: f.started_at, due_at: f.due_at,
       status: f.status,
       stage: f.stage,
+      current_phase: f.current_phase,
       scope_description: f.scope_description.trim() || undefined,
       job_category: f.job_category || undefined,
       contract_meta: meta,
@@ -962,6 +1030,12 @@ function ProjectForm() {
             placeholder="— Select category —"
             options={JOB_CATEGORIES.map(c => ({ value: c, label: JOB_CATEGORY_LABEL[c] }))} />
         </Field>
+        <Field label="Starting phase"
+          hint="Most new projects start at Design. Pick a later phase only if you're backfilling a job that's already in motion.">
+          <Select value={f.current_phase}
+            onChange={v => setF({ ...f, current_phase: v as ProjectPhase })}
+            options={PROJECT_PHASES.map(p => ({ value: p, label: PROJECT_PHASE_LABEL[p] }))} />
+        </Field>
       </Section>
 
       <Section title="Customer & site">
@@ -990,11 +1064,14 @@ function ProjectForm() {
             <input className="input" type="date" required value={f.due_at} onChange={e => setF({ ...f, due_at: e.target.value })} />
           </Field>
         </Row>
-        <Field label="Manager">
-          <Select value={f.manager_id} onChange={v => setF({ ...f, manager_id: v })}
-            placeholder="- Unassigned -"
-            options={managers.map(m => ({ value: m.id, label: m.name }))} />
-        </Field>
+        {managers.length !== 1 && (
+          <Field label="Manager"
+            hint={managers.length === 0 ? "No active manager configured" : undefined}>
+            <Select value={f.manager_id} onChange={v => setF({ ...f, manager_id: v })}
+              placeholder="- Unassigned -"
+              options={managers.map(m => ({ value: m.id, label: m.name }))} />
+          </Field>
+        )}
         <Field label="Lead Technician" required
           hint="Who will manage execution and assign workers?">
           <Select required value={f.lead_tech_id}
@@ -1070,19 +1147,43 @@ function ProjectForm() {
 }
 
 /* ─── AMC ───────────────────────────────────────────────── */
+const CAN_CREATE_CUSTOMER_INLINE = new Set(["admin", "md", "manager", "sales", "accounts"]);
 function AmcForm() {
-  const { closeCreate, fireToast, bumpData, create, currentOrg } = useApp();
+  const { closeCreate, fireToast, bumpData, create, currentOrg, role: viewerRole } = useApp();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Phase 9.x Part 5 — inline new-customer mini-form. Spec is locked
+  // to Option α: Name + Tier only. Phone / email / notes / address
+  // get filled in later on the Customers page (those columns don't
+  // exist on the customers table today).
+  const canCreateCustomer = CAN_CREATE_CUSTOMER_INLINE.has(viewerRole);
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
+  const [newCustName, setNewCustName] = useState("");
+  const [newCustTier, setNewCustTier] = useState<"Strategic" | "Key" | "Standard">("Standard");
+  const [newCustBusy, setNewCustBusy] = useState(false);
+  const [newCustErr, setNewCustErr]   = useState<string | null>(null);
   const initialCustomer = (create?.prefill?.customer_id as string) || "";
   const expDefault = new Date(); expDefault.setFullYear(expDefault.getFullYear() + 1);
+  // Phase 9.x Part 4: auto-assign Account Manager when exactly one
+  // manager exists. Field is hidden from the UI in that case but the
+  // value is still sent on submit. Resolved at form mount (useMemo
+  // with [] deps so a manager hired mid-session doesn't suddenly
+  // re-shape the form for the user).
+  const managers = useMemo(() => Object.values(db.USERS).filter(u => u.role === "manager"), []);
+  const autoManager = managers.length === 1 ? managers[0] : null;
+  useEffect(() => {
+    // eslint-disable-next-line no-console
+    console.log("[Auto-assign] Active manager:", autoManager?.name ?? "NONE");
+    // mount-only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [f, setF] = useState({
     code: "", customer_id: initialCustomer, site_id: "",
-    manager_id: "", lead_tech_id: "", value_aed: "",
+    manager_id: autoManager?.id ?? "",
+    lead_tech_id: "", value_aed: "",
     expires_at: expDefault.toISOString().slice(0, 10),
   });
   const customers = Object.values(db.CUSTOMERS);
-  const managers = useMemo(() => Object.values(db.USERS).filter(u => u.role === "manager"), []);
   const leadTechs = useMemo(() => Object.values(db.USERS).filter(u => u.role === "lead_worker"), []);
 
   const submit = async (e: React.FormEvent) => {
@@ -1102,14 +1203,31 @@ function AmcForm() {
     });
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
-    fireToast("AMC contract created · 4 quarterly services scheduled"); bumpData(); closeCreate();
+    fireToast("AMC contract created · service 1 scheduled, services 2-N will auto-schedule on payment"); bumpData(); closeCreate();
+  };
+
+  const submitNewCustomer = async () => {
+    setNewCustErr(null);
+    const trimmed = newCustName.trim();
+    if (!trimmed) { setNewCustErr("Customer name is required."); return; }
+    setNewCustBusy(true);
+    const res = await createCustomer({ name: trimmed, tier: newCustTier });
+    setNewCustBusy(false);
+    if (!res.ok) { setNewCustErr(res.error); return; }
+    // Auto-select the new customer in the AMC form and collapse the mini-form.
+    setF({ ...f, customer_id: res.id, site_id: "" });
+    setShowNewCustomer(false);
+    setNewCustName("");
+    setNewCustTier("Standard");
+    fireToast(`Customer "${trimmed}" created`);
+    bumpData();
   };
 
   return (
     <FormShell icon="shieldCheck" title="New AMC contract"
-      sub="Annual maintenance - 4 quarterly services, payment-gated"
+      sub="Annual maintenance — service 1 scheduled on sign; rest unlock on payment"
       busy={busy} error={err} onSubmit={submit} submitLabel="Create AMC"
-      footerHint={<><Icon name="shieldCheck" size={13} style={{ color: "var(--pri-600)" }} />4 quarterly services will auto-schedule</>}>
+      footerHint={<><Icon name="shieldCheck" size={13} style={{ color: "var(--pri-600)" }} />Service 1 scheduled now; services 2-N unlock on first payment</>}>
       <Section title="Contract">
         <Row>
           <Field label="Code" hint="Auto-generated if blank">
@@ -1124,9 +1242,61 @@ function AmcForm() {
       <Section title="Coverage">
         <Row>
           <Field label="Customer" required>
-            <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
-              placeholder="- Select -"
-              options={customers.map(c => ({ value: c.id, label: c.name }))} />
+            <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+              <div style={{ flex: 1 }}>
+                <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
+                  placeholder="- Select -"
+                  options={customers.map(c => ({ value: c.id, label: c.name }))} />
+              </div>
+              {canCreateCustomer && (
+                <button type="button" className="btn btn-ghost btn-sm"
+                        onClick={() => setShowNewCustomer(v => !v)}
+                        title="Create a new customer without leaving this form">
+                  <Icon name="plus" size={13} /> New
+                </button>
+              )}
+            </div>
+            {showNewCustomer && (
+              <div className="card card-pad" style={{ marginTop: 8, background: "var(--bg-muted)" }}>
+                <div className="col gap-3">
+                  <div className="field">
+                    <label className="field-label">New customer name<span className="req">*</span></label>
+                    <input className="input" autoFocus value={newCustName}
+                           onChange={e => setNewCustName(e.target.value)}
+                           placeholder="e.g. Sobha Realty" />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Tier</label>
+                    <select className="input" value={newCustTier}
+                            onChange={e => setNewCustTier(e.target.value as "Strategic" | "Key" | "Standard")}>
+                      <option value="Standard">Standard</option>
+                      <option value="Key">Key</option>
+                      <option value="Strategic">Strategic</option>
+                    </select>
+                    <div className="field-hint">
+                      Phone, email, address, and other details can be added later on the Customers page.
+                    </div>
+                  </div>
+                  {newCustErr && (
+                    <div style={{ font: "var(--t-small)", color: "var(--dan-700)" }}>
+                      <Icon name="alertCircle" size={13} /> {newCustErr}
+                    </div>
+                  )}
+                  <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+                    <button type="button" className="btn btn-ghost btn-sm"
+                            onClick={() => { setShowNewCustomer(false); setNewCustErr(null); }}>
+                      Cancel
+                    </button>
+                    <button type="button" className="btn btn-primary btn-sm"
+                            disabled={newCustBusy} onClick={submitNewCustomer}>
+                      {newCustBusy
+                        ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Creating…</>
+                        : <><Icon name="check" size={13} /> Create customer</>}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </Field>
           <Field label="Site">
             <SiteSelectField
@@ -1137,14 +1307,25 @@ function AmcForm() {
           </Field>
         </Row>
         <Row>
-          <Field label="Account manager">
-            <Select value={f.manager_id} onChange={v => setF({ ...f, manager_id: v })}
-              placeholder="- Unassigned -"
-              options={managers.map(m => ({ value: m.id, label: m.name }))} />
-          </Field>
-          <Field label="Expires" required>
-            <input className="input" type="date" required value={f.expires_at} onChange={e => setF({ ...f, expires_at: e.target.value })} />
-          </Field>
+          {managers.length === 1 ? (
+            // Auto-assigned manager hidden — the value is still on f.manager_id.
+            // Render the Expires field full-width so the row doesn't collapse.
+            <Field label="Expires" required>
+              <input className="input" type="date" required value={f.expires_at} onChange={e => setF({ ...f, expires_at: e.target.value })} />
+            </Field>
+          ) : (
+            <>
+              <Field label="Account manager"
+                hint={managers.length === 0 ? "No active manager configured" : undefined}>
+                <Select value={f.manager_id} onChange={v => setF({ ...f, manager_id: v })}
+                  placeholder="- Unassigned -"
+                  options={managers.map(m => ({ value: m.id, label: m.name }))} />
+              </Field>
+              <Field label="Expires" required>
+                <input className="input" type="date" required value={f.expires_at} onChange={e => setF({ ...f, expires_at: e.target.value })} />
+              </Field>
+            </>
+          )}
         </Row>
         <Field label="Lead Technician" required
           hint="Who will manage execution and assign workers?">
@@ -1160,7 +1341,7 @@ function AmcForm() {
 
 /* ─── WORK ORDER / DELIVERY ─────────────────────────────── */
 function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
-  const { closeCreate, fireToast, bumpData, create } = useApp();
+  const { closeCreate, fireToast, bumpData, create, me } = useApp();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const now = new Date(); now.setMinutes(now.getMinutes() - now.getMinutes() % 30);
@@ -1185,12 +1366,37 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
       : initialSourceKind === "project" ? "PROJECT"
       : initialSourceKind === "repair" ? "REPAIR"
       : "PROJECT";
+  // Generate a sensible default title when the form was opened from a
+  // detail page ("+ Create Work Order" buttons on project/AMC/repair
+  // pages). Saves the user typing for the common case; still editable.
+  const initialTitle = (() => {
+    if (!initialSourceKind || !initialSourceId) return "";
+    if (initialSourceKind === "project") {
+      const p = db.proj(initialSourceId);
+      return p ? `Site visit · ${p.name}` : "";
+    }
+    if (initialSourceKind === "amc") {
+      const a = db.amc(initialSourceId);
+      if (!a) return "";
+      const cust = db.cust(a.customer)?.name;
+      return cust ? `${a.code} service visit · ${cust}` : `${a.code} service visit`;
+    }
+    if (initialSourceKind === "repair") {
+      const r = db.REPAIRS[initialSourceId];
+      return r ? `Repair · ${r.title}` : "";
+    }
+    return "";
+  })();
   const [f, setF] = useState({
-    title: "", type: initialType,
+    title: initialTitle, type: initialType,
     customer_id: initialCustomer, site_id: initialSiteId,
     scheduled_start: fmt(now), scheduled_end: fmt(later),
     assigned_lead: "", priority: "Standard",
     additional_workers: [] as string[],
+    // Migration 0023: external sub-contractors assigned to this WO at
+    // creation. Stored as sub_contractors.id; reconciled into the join
+    // table after the WO row is created.
+    additional_subs: [] as string[],
     source_kind: initialSourceKind, source_id: initialSourceId,
   });
   const customers = Object.values(db.CUSTOMERS);
@@ -1204,12 +1410,36 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
       u.role === "worker" || u.role === "lead_worker" || u.role === "driver"
     ).filter(u => u.id !== f.assigned_lead),
     [f.assigned_lead]);
+  // Active sub-contractor profiles (migration 0023). Inactive ones are
+  // hidden from the picker but existing WO assignments stay visible
+  // elsewhere — see SubContractors module.
+  const subOptions = useMemo(() => db.activeSubContractors(), []);
   const sourceOptions = useMemo<Opt[]>(() => {
     if (f.source_kind === "amc") return Object.values(db.AMCS).map(a => ({ value: a.id, label: a.code + " · " + (db.cust(a.customer)?.name ?? "-") }));
     if (f.source_kind === "project") return Object.values(db.PROJECTS).map(p => ({ value: p.id, label: p.code + " · " + p.name }));
     if (f.source_kind === "repair") return Object.values(db.REPAIRS).map(r => ({ value: r.id, label: r.code + " · " + r.title }));
     return [];
   }, [f.source_kind]);
+
+  // Conflict warnings (Fix 3) — recomputed whenever the time window or
+  // worker selection changes. Cheap O(n) over db.WORK_ORDERS each pass;
+  // memoised so React doesn't re-render every keystroke unnecessarily.
+  // No exclude id (this is a create form — the WO doesn't exist yet).
+  const leadConflicts = useMemo(() =>
+    f.assigned_lead && f.scheduled_start && f.scheduled_end
+      ? getWorkerConflictsFor(f.assigned_lead, f.scheduled_start, f.scheduled_end)
+      : [],
+    [f.assigned_lead, f.scheduled_start, f.scheduled_end]);
+  const workerConflicts = useMemo(() => {
+    if (!f.scheduled_start || !f.scheduled_end) return {} as Record<string, WorkerConflict[]>;
+    const map: Record<string, WorkerConflict[]> = {};
+    for (const id of f.additional_workers) {
+      map[id] = getWorkerConflictsFor(id, f.scheduled_start, f.scheduled_end);
+    }
+    return map;
+  }, [f.additional_workers, f.scheduled_start, f.scheduled_end]);
+  const totalWorkerConflictCount =
+    Object.values(workerConflicts).reduce((sum, l) => sum + l.length, 0);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault(); setErr(null);
@@ -1224,9 +1454,27 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
       source_kind: f.source_kind || undefined,
       source_id: f.source_id || undefined,
     });
+    if (!res.ok) { setBusy(false); setErr(res.error); return; }
+
+    // Fan out sub-contractor assignments. We do this AFTER the WO row
+    // exists so wos_uniq_wo_sub has something to anchor to. Failures
+    // are surfaced as a toast but don't abort the WO creation — the
+    // user can re-assign from the WO detail page.
+    const subFailures: string[] = [];
+    for (const subId of f.additional_subs) {
+      const a = await assignSubContractorToWO(res.id, subId, me.id);
+      if (!a.ok) {
+        const subName = db.subContractor(subId)?.name ?? "sub-contractor";
+        subFailures.push(`${subName}: ${a.error}`);
+      }
+    }
     setBusy(false);
-    if (!res.ok) { setErr(res.error); return; }
-    fireToast("Work order scheduled"); bumpData(); closeCreate();
+    if (subFailures.length > 0) {
+      fireToast(`WO created; some sub-contractor assignments failed: ${subFailures.join("; ")}`);
+    } else {
+      fireToast("Work order scheduled");
+    }
+    bumpData(); closeCreate();
   };
 
   const toggleWorker = (id: string) => {
@@ -1237,6 +1485,18 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
         additional_workers: has
           ? prev.additional_workers.filter(x => x !== id)
           : [...prev.additional_workers, id],
+      };
+    });
+  };
+
+  const toggleSub = (id: string) => {
+    setF(prev => {
+      const has = prev.additional_subs.includes(id);
+      return {
+        ...prev,
+        additional_subs: has
+          ? prev.additional_subs.filter(x => x !== id)
+          : [...prev.additional_subs, id],
       };
     });
   };
@@ -1302,10 +1562,15 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             onChange={v => setF({ ...f, assigned_lead: v })}
             placeholder="- Select Lead Technician -"
             options={leadOptions.map(u => ({ value: u.id, label: `${u.name} · ${ROLE_LABELS[u.role]}` }))} />
+          {f.assigned_lead && (
+            <ConflictWarning
+              workerName={db.user(f.assigned_lead)?.name ?? "This lead"}
+              conflicts={leadConflicts} />
+          )}
         </Field>
         <Field label="Additional workers"
           hint={f.additional_workers.length > 0
-            ? `${f.additional_workers.length} selected`
+            ? `${f.additional_workers.length} selected${totalWorkerConflictCount > 0 ? ` · ${totalWorkerConflictCount} conflict${totalWorkerConflictCount === 1 ? "" : "s"}` : ""}`
             : "Optional — Technicians, Lead Techs, and Drivers can join the crew"}>
           {workerOptions.length === 0 ? (
             <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: 8 }}>
@@ -1319,8 +1584,12 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             }}>
               {workerOptions.map(u => {
                 const checked = f.additional_workers.includes(u.id);
+                const hasConflict = checked && (workerConflicts[u.id]?.length ?? 0) > 0;
                 return (
                   <label key={u.id}
+                    title={hasConflict
+                      ? `Time conflict: ${workerConflicts[u.id].map(c => c.code).join(", ")}`
+                      : undefined}
                     style={{
                       display: "flex", alignItems: "center", gap: 10,
                       padding: "8px 10px", borderRadius: "var(--r-sm)",
@@ -1332,7 +1601,69 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
                       style={{ width: 18, height: 18, flexShrink: 0, cursor: "pointer" }} />
                     <span className={"avatar avatar-sm avatar-" + (u.tint || "primary")}>{u.initials}</span>
                     <span style={{ flex: 1, font: "var(--t-body-md)" }} className="truncate">{u.name}</span>
+                    {hasConflict && (
+                      <Icon name="alertTriangle" size={14} style={{ color: "var(--warn-700)" }} />
+                    )}
                     <span style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>{ROLE_LABELS[u.role]}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+          {f.additional_workers
+            .filter(id => (workerConflicts[id]?.length ?? 0) > 0)
+            .map(id => (
+              <ConflictWarning key={id}
+                workerName={db.user(id)?.name ?? "Worker"}
+                conflicts={workerConflicts[id]} />
+            ))}
+        </Field>
+        <Field label="Sub-contractors"
+          hint={f.additional_subs.length > 0
+            ? `${f.additional_subs.length} selected`
+            : "Optional — external contractors from the sub-contractor directory"}>
+          {subOptions.length === 0 ? (
+            <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: 8 }}>
+              No active sub-contractors yet — add one from <strong>Sub-contractors</strong> in the sidebar, then re-open this form.
+            </div>
+          ) : (
+            <div style={{
+              maxHeight: 200, overflowY: "auto",
+              border: "1px solid var(--border)", borderRadius: "var(--r-md)",
+              padding: 6, background: "var(--bg-elev)",
+            }}>
+              {subOptions.map(s => {
+                const checked = f.additional_subs.includes(s.id);
+                return (
+                  <label key={s.id}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 10,
+                      padding: "8px 10px", borderRadius: "var(--r-sm)",
+                      cursor: "pointer", minHeight: 44,
+                      background: checked ? "var(--pri-50)" : "transparent",
+                    }}>
+                    <input type="checkbox" checked={checked}
+                      onChange={() => toggleSub(s.id)}
+                      style={{ width: 18, height: 18, flexShrink: 0, cursor: "pointer" }} />
+                    <span style={{
+                      width: 28, height: 28, borderRadius: 999, flexShrink: 0,
+                      background: "var(--bg-muted)", display: "flex",
+                      alignItems: "center", justifyContent: "center",
+                      color: "var(--ink-mute)",
+                    }}>
+                      <Icon name="user" size={14} />
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="truncate" style={{ font: "var(--t-body-md)" }}>
+                        {s.name}
+                      </div>
+                      <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                        {s.company ?? "Independent"}
+                      </div>
+                    </div>
+                    <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>
+                      Sub
+                    </span>
                   </label>
                 );
               })}
@@ -2076,4 +2407,257 @@ function ReplacementRequestForm() {
       </Section>
     </FormShell>
   );
+}
+
+/* ─── Sub-contractor (migration 0023) ──────────────────────
+   Adds a profile to the sub_contractors directory. Phone +
+   Emirates ID are soft-validated (warning hint only) — per
+   spec, we don't reject formats since field staff often enter
+   them inconsistently. The DB unique constraint on emirates_id
+   surfaces a friendly error message if there's a collision.
+============================================================ */
+
+// UAE phone: optional +971, optional spaces/hyphens, 8-10 digits after.
+// We only warn — don't block.
+const UAE_PHONE_RE = /^(\+?971|0)?[\s\-]?\d{1,2}[\s\-]?\d{3}[\s\-]?\d{4}$/;
+// Emirates ID: 15 digits, optionally formatted XXX-YYYY-XXXXXXX-X. Warn-only.
+const EMIRATES_ID_RE = /^\d{3}[\s\-]?\d{4}[\s\-]?\d{7}[\s\-]?\d{1}$/;
+
+function SubContractorForm() {
+  const { closeCreate, fireToast, bumpData, me } = useApp();
+  const [f, setF] = useState({
+    name: "", phone: "", emirates_id: "", company: "", notes: "",
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Soft-validation hints (warnings, not blockers).
+  const phoneWarn = f.phone && !UAE_PHONE_RE.test(f.phone.trim())
+    ? "Doesn't look like a UAE phone format (+971…) — still saveable if intentional."
+    : null;
+  const eidWarn = f.emirates_id && !EMIRATES_ID_RE.test(f.emirates_id.trim())
+    ? "Emirates ID is usually 15 digits (e.g. 784-1990-1234567-1) — still saveable if intentional."
+    : null;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    if (!f.name.trim()) { setErr("Name is required."); return; }
+    setBusy(true);
+    const res = await createSubContractor({
+      name:        f.name,
+      phone:       f.phone || null,
+      emirates_id: f.emirates_id || null,
+      company:     f.company || null,
+      notes:       f.notes || null,
+    }, me.id);
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    fireToast(`${res.sub.name} added`);
+    bumpData();
+    closeCreate();
+  };
+
+  return (
+    <FormShell icon="users"
+      title="Add sub-contractor"
+      sub="External contractor profile — name, phone, Emirates ID, company"
+      busy={busy} error={err} onSubmit={submit}
+      submitLabel="Add sub-contractor">
+      <Section title="Identity">
+        <Field label="Name" required>
+          <input className="input" required value={f.name}
+            onChange={e => setF({ ...f, name: e.target.value })}
+            placeholder="e.g. Ahmed Khan" />
+        </Field>
+        <Field label="Company" hint='Leave blank if independent.'>
+          <input className="input" value={f.company}
+            onChange={e => setF({ ...f, company: e.target.value })}
+            placeholder="e.g. Al Salam Electrical LLC" />
+        </Field>
+      </Section>
+      <Section title="Contact & compliance">
+        <Field label="Phone" hint={phoneWarn ?? "UAE format preferred: +971XXXXXXXXX"}>
+          <input className="input" type="tel" value={f.phone}
+            onChange={e => setF({ ...f, phone: e.target.value })}
+            placeholder="+971 50 123 4567" />
+        </Field>
+        <Field label="Emirates ID"
+          hint={eidWarn ?? "15-digit national ID (kept for HR / labour compliance)."}>
+          <input className="input" value={f.emirates_id}
+            onChange={e => setF({ ...f, emirates_id: e.target.value })}
+            placeholder="784-1990-1234567-1" />
+        </Field>
+        <Field label="Notes" hint="Optional — internal notes about this profile.">
+          <textarea className="textarea" rows={3} value={f.notes}
+            onChange={e => setF({ ...f, notes: e.target.value })}
+            placeholder="e.g. ELV specialist; works weekends" />
+        </Field>
+      </Section>
+    </FormShell>
+  );
+}
+
+// ─── Log sub-contractor hours (Phase 5D.1) ────────────────
+//
+// Opened from the WO slideover's Crew section. The trigger button there
+// is already permission-gated (admin/md/manager OR lead_worker on their
+// own WO), so this form is reached only by an authorised user. The
+// underlying RLS (wosh_write) is the hard backstop — a hostile direct
+// openCreate("sub_hours") still fails server-side.
+//
+// Mode is implicit: prefill.entry_id present → edit existing row;
+// absent → log new. Same fields either way, different submit handler.
+//
+// Hard validations:
+//   • Hours > 0 and ≤ 24 (matches DB CHECK wosh_chk_hours_range)
+//   • Date not in the future
+//   • Date not before the sub's assignedAt on this WO
+function LogSubHoursForm() {
+  const { closeCreate, fireToast, bumpData, me, create } = useApp();
+  const prefill = (create?.prefill ?? {}) as Record<string, unknown>;
+  const wo_id      = String(prefill.wo_id      ?? "");
+  const sub_id     = String(prefill.sub_id     ?? "");
+  const sub_name   = String(prefill.sub_name   ?? "");
+  const wo_code    = String(prefill.wo_code    ?? "");
+  const assigned_at = String(prefill.assigned_at ?? "");
+  const entry_id   = (prefill.entry_id as string | undefined) || null;
+  const isEdit = !!entry_id;
+
+  const todayStr = useMemo(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${padTwo(d.getMonth() + 1)}-${padTwo(d.getDate())}`;
+  }, []);
+  // sub's assignedAt is an ISO timestamptz; we only care about the date.
+  const assignedDateStr = assigned_at ? assigned_at.slice(0, 10) : "";
+
+  const initialHours = typeof prefill.hours === "number"
+    ? String(prefill.hours)
+    : typeof prefill.hours === "string" ? prefill.hours : "";
+  const initialDate = (prefill.entry_date as string | undefined) || todayStr;
+  const initialNotes = (prefill.notes as string | undefined) || "";
+
+  const [hours, setHours]         = useState<string>(initialHours);
+  const [entryDate, setEntryDate] = useState<string>(initialDate);
+  const [notes, setNotes]         = useState<string>(initialNotes);
+  const [hoursTouched, setHoursTouched] = useState(false);
+  const [dateTouched, setDateTouched]   = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState<string | null>(null);
+
+  const hoursNum = Number(hours);
+  const hoursError = (!hours || Number.isNaN(hoursNum))
+    ? "Hours required."
+    : (hoursNum <= 0)
+      ? "Hours must be greater than 0."
+      : (hoursNum > 24)
+        ? "Hours cannot exceed 24."
+        : null;
+  const dateError = (!entryDate)
+    ? "Date required."
+    : (entryDate > todayStr)
+      ? "Date cannot be in the future."
+      : (assignedDateStr && entryDate < assignedDateStr)
+        ? `Date can't be before ${formatYmd(assignedDateStr)} (sub was assigned then).`
+        : null;
+  const notesError = notes.length > 250
+    ? `Notes can't exceed 250 characters (currently ${notes.length}).`
+    : null;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    setHoursTouched(true);
+    setDateTouched(true);
+    if (hoursError || dateError || notesError) {
+      setErr(hoursError || dateError || notesError);
+      return;
+    }
+    setBusy(true);
+    if (isEdit && entry_id) {
+      const res = await editSubContractorHoursEntry(entry_id, {
+        hours: hoursNum,
+        entryDate,
+        notes: notes.trim() || null,
+      });
+      setBusy(false);
+      if (!res.ok) { setErr(res.error); return; }
+      fireToast(`Updated to ${formatHoursLabel(hoursNum)} for ${sub_name || "sub-contractor"}`);
+    } else {
+      if (!wo_id || !sub_id) { setBusy(false); setErr("Missing work order or sub-contractor."); return; }
+      const res = await logSubContractorHours({
+        workOrderId: wo_id,
+        subContractorId: sub_id,
+        entryDate,
+        hours: hoursNum,
+        notes: notes.trim() || null,
+      }, me.id);
+      setBusy(false);
+      if (!res.ok) { setErr(res.error); return; }
+      fireToast(`Logged ${formatHoursLabel(hoursNum)} for ${sub_name || "sub-contractor"}`);
+    }
+    bumpData();
+    closeCreate();
+  };
+
+  return (
+    <FormShell icon="clock"
+      title={isEdit ? "Edit hours" : "Log hours"}
+      sub={[sub_name, wo_code].filter(Boolean).join(" · ") || undefined}
+      busy={busy} error={err} onSubmit={submit}
+      submitLabel={isEdit ? "Save changes" : "Log hours"}>
+      <Section title="Session">
+        <Field label="Date" required>
+          <input className="input" type="date" required
+            value={entryDate}
+            max={todayStr}
+            min={assignedDateStr || undefined}
+            onBlur={() => setDateTouched(true)}
+            onChange={e => setEntryDate(e.target.value)} />
+          {dateTouched && dateError && (
+            <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginTop: 4 }}>
+              {dateError}
+            </div>
+          )}
+        </Field>
+        <Field label="Hours" required hint="0.25 (15 min) to 24.0">
+          <input className="input" type="number" required
+            min="0.25" max="24" step="0.25"
+            value={hours}
+            onBlur={() => setHoursTouched(true)}
+            onChange={e => setHours(e.target.value)}
+            placeholder="6.0" />
+          {hoursTouched && hoursError && (
+            <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginTop: 4 }}>
+              {hoursError}
+            </div>
+          )}
+        </Field>
+        <Field label="Notes" hint={`Optional · ${notes.length}/250`}>
+          <textarea className="textarea" rows={3}
+            maxLength={250}
+            value={notes}
+            onChange={e => setNotes(e.target.value)}
+            placeholder="e.g. morning shift, completed cable pulling" />
+          {notesError && (
+            <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginTop: 4 }}>
+              {notesError}
+            </div>
+          )}
+        </Field>
+      </Section>
+    </FormShell>
+  );
+}
+
+function padTwo(n: number): string { return n < 10 ? `0${n}` : String(n); }
+
+function formatHoursLabel(h: number): string {
+  return `${h.toFixed(1)} hrs`;
+}
+
+function formatYmd(yyyyMmDd: string): string {
+  const [y, m, d] = yyyyMmDd.split("-").map(Number);
+  if (!y || !m || !d) return yyyyMmDd;
+  return formatMonthDay(new Date(y, m - 1, d, 12, 0, 0));
 }

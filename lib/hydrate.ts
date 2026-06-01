@@ -10,10 +10,12 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
-  AmcContract, AmcStatus, Approval, ApprovalStep, Customer, Milestone,
-  Project, RepairTicket, ReplacementContext, ReplacementRequest, ReplacementStatus,
-  Site, Team, WorkOrder, WoStatus, WoType,
+  AmcContract, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, Milestone,
+  Project, ProjectPhase, RepairTicket, ReplacementContext, ReplacementRequest, ReplacementStatus,
+  Site, SubContractor, Team, WorkOrder, WorkOrderSubContractor, WorkOrderSubContractorHours,
+  WorkOrderTimeEntry, WoStatus, WoType,
 } from "./types";
+import { formatShortDate } from "./dates";
 
 export interface HydrationBundle {
   customers: Customer[];
@@ -21,8 +23,31 @@ export interface HydrationBundle {
   teams: Team[];
   projects: Project[];
   amcs: AmcContract[];
+  // Individual AMC quarterly service visits from amc_service_schedule.
+  // The aggregated done/total counts on AmcContract are not enough for the
+  // Growth Plan calendar — it needs one event per visit. Added in the 1B
+  // calendar build; older code that only consumes `amcs` is unaffected.
+  amcServices: AmcService[];
   repairs: RepairTicket[];
   workOrders: WorkOrder[];
+  // Per-worker × per-session time entries from work_order_time_entries
+  // (migration 0022). Open sessions (endedAt = null) drive the
+  // "Active Work" dashboard widget; closed sessions sum into reports.
+  // RLS restricts what each role sees here:
+  //   • md / admin / manager / accounts / service_support → every row
+  //   • lead_worker → entries on WOs they lead OR are assigned to
+  //   • worker / driver / subcontractor → only their own entries
+  workOrderTimeEntries: WorkOrderTimeEntry[];
+  // Migration 0023 — sub-contractor directory + per-WO assignments.
+  // Hydrated separately because they're not derivable from workOrders
+  // alone (the join carries its own time-tracking columns).
+  subContractors: SubContractor[];
+  workOrderSubContractors: WorkOrderSubContractor[];
+  // Migration 0026 — per-day hours log for sub-contractors. The
+  // assignment row in workOrderSubContractors says "this sub is on
+  // this WO"; the hours log says "and worked these sessions on these
+  // days". Lead Tech writes via lib/create.logSubContractorHours.
+  workOrderSubContractorHours: WorkOrderSubContractorHours[];
   approvals: Approval[];
   replacements: ReplacementRequest[];
 }
@@ -116,6 +141,10 @@ function mapProject(r: Row, milestones: Milestone[]): Project {
     leadTechId: asString(r.lead_tech_id),
     status: asString(r.status, "In Progress"),
     stage: asString(r.stage, "Mobilisation"),
+    // Execution phase (migration 0020). Pre-0020 rows have no column
+    // and rows created after but never advanced have NULL — both
+    // hydrate as null and trigger the "Set Phase" UI.
+    currentPhase: (r.current_phase as ProjectPhase | null) ?? null,
     progress: asNumber(r.progress),
     value: asNumber(r.value_aed),
     startedAt: asString(r.started_at),
@@ -143,6 +172,32 @@ function mapAmc(r: Row): AmcContract {
     overdueDays: asNumber(r.overdue_days),
     freeCalls: asNumber(r.free_calls_used),
     expiresAt: asString(r.expires_at),
+    // Pause/renewal fields. suspendedAt / suspendedReason exist since
+    // 0009b; pausedBy / resumedAt / firstPaymentDueAt / renewedFromId
+    // are new in 0021. All nullable.
+    suspendedAt:       (r.suspended_at          as string | null) ?? null,
+    suspendedReason:   (r.suspended_reason      as string | null) ?? null,
+    pausedBy:          (r.paused_by             as string | null) ?? null,
+    resumedAt:         (r.resumed_at            as string | null) ?? null,
+    firstPaymentDueAt: (r.first_payment_due_at  as string | null) ?? null,
+    renewedFromId:     (r.renewed_from_id       as string | null) ?? null,
+  };
+}
+
+// One row of amc_service_schedule → AmcService. The DB carries
+// scheduled_date as a Postgres `date` (YYYY-MM-DD); we keep the same
+// string shape so the calendar can build a Date in the local timezone
+// without timezone-shift surprises that ISO timestamps cause.
+function mapAmcService(r: Row): AmcService {
+  return {
+    id:              asString(r.id),
+    amcContractId:   asString(r.amc_contract_id),
+    serviceNumber:   asNumber(r.service_number),
+    scheduledDate:   asString(r.scheduled_date).slice(0, 10),
+    status:          ((r.status as AmcServiceStatus) ?? "scheduled"),
+    workOrderId:    (r.work_order_id as string | null) ?? null,
+    completedAt:    (r.completed_at as string | null) ?? null,
+    notes:          (r.notes as string | null) ?? null,
   };
 }
 
@@ -190,6 +245,72 @@ function mapWorkOrder(r: Row, assignedIds: string[]): WorkOrder {
     elapsedMin: asNumber(r.elapsed_min),
     materials: asArray<string>(r.materials),
     flagged: (r.flagged as string | undefined) ?? undefined,
+    // Migration 0022 fields. Trigger-maintained on the server.
+    startedAt:          (r.started_at   as string | null) ?? null,
+    completedAt:        (r.completed_at as string | null) ?? null,
+    durationMinutes:    asNumber(r.duration_minutes),
+    actualWorkersCount: asNumber(r.actual_workers_count),
+  };
+}
+
+function mapWorkOrderTimeEntry(r: Row): WorkOrderTimeEntry {
+  return {
+    id:              asString(r.id),
+    workOrderId:     asString(r.work_order_id),
+    userId:         (r.user_id as string | null) ?? null,
+    startedAt:       asString(r.started_at),
+    endedAt:        (r.ended_at as string | null) ?? null,
+    durationMinutes: asNumber(r.duration_minutes),
+    note:           (r.note as string | null) ?? null,
+    createdAt:       asString(r.created_at),
+  };
+}
+
+function mapSubContractor(r: Row): SubContractor {
+  return {
+    id:          asString(r.id),
+    name:        asString(r.name),
+    phone:      (r.phone        as string | null) ?? null,
+    emiratesId: (r.emirates_id  as string | null) ?? null,
+    company:    (r.company      as string | null) ?? null,
+    notes:      (r.notes        as string | null) ?? null,
+    isActive:   (r.is_active    as boolean | null) ?? true,
+    createdAt:   asString(r.created_at),
+    createdBy:  (r.created_by   as string | null) ?? null,
+  };
+}
+
+function mapWorkOrderSubContractor(r: Row): WorkOrderSubContractor {
+  return {
+    id:                asString(r.id),
+    workOrderId:       asString(r.work_order_id),
+    subContractorId:   asString(r.sub_contractor_id),
+    assignedAt:        asString(r.assigned_at),
+    assignedBy:       (r.assigned_by  as string | null) ?? null,
+    startedAt:        (r.started_at   as string | null) ?? null,
+    completedAt:      (r.completed_at as string | null) ?? null,
+    durationMinutes:   asNumber(r.duration_minutes),
+    note:             (r.note         as string | null) ?? null,
+  };
+}
+
+// Migration 0026. hours is numeric(5,2); PostgREST returns numerics
+// either as number or as string depending on size — coerce defensively.
+// entry_date is a Postgres `date` and arrives as a 'YYYY-MM-DD' string.
+function mapWorkOrderSubContractorHours(r: Row): WorkOrderSubContractorHours {
+  const rawHours = r.hours;
+  const hours = typeof rawHours === "number"
+    ? rawHours
+    : typeof rawHours === "string" ? Number(rawHours) : 0;
+  return {
+    id:                asString(r.id),
+    workOrderId:       asString(r.work_order_id),
+    subContractorId:   asString(r.sub_contractor_id),
+    entryDate:         asString(r.entry_date).slice(0, 10),
+    hours,
+    notes:            (r.notes      as string | null) ?? null,
+    loggedBy:         (r.logged_by  as string | null) ?? null,
+    loggedAt:          asString(r.logged_at),
   };
 }
 
@@ -257,15 +378,17 @@ function relativeOpenedAt(iso: string): string {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ${m % 60 ? `${m % 60}m` : ""}`.trim();
-  return new Date(iso).toLocaleDateString();
+  // Hydration runs on the server — use a stable English formatter so
+  // the string matches across SSR + CSR and React doesn't blow up.
+  return formatShortDate(new Date(iso));
 }
 
 export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle> {
   // Fan out all reads in parallel - these are independent.
   const [
     customersRaw, sitesRaw, teamsRaw, projectsRaw, milestonesRaw,
-    amcsRaw, repairsRaw, workOrdersRaw, woAssignRaw, approvalsRaw, approvalStepsRaw, usersRaw,
-    replacementsRaw,
+    amcsRaw, amcServicesRaw, repairsRaw, workOrdersRaw, woAssignRaw, approvalsRaw, approvalStepsRaw, usersRaw,
+    replacementsRaw, woTimeEntriesRaw, subContractorsRaw, woSubContractorsRaw, woSubHoursRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -273,6 +396,7 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "projects"),
     fetchAll(admin, "milestones"),
     fetchAll(admin, "amc_contracts"),
+    fetchAll(admin, "amc_service_schedule"),
     fetchAll(admin, "repair_tickets"),
     fetchAll(admin, "work_orders"),
     fetchAll(admin, "work_order_assignments"),
@@ -280,6 +404,10 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "approval_steps"),
     fetchAll(admin, "users", "id, team_id"),
     fetchAll(admin, "replacement_requests"),
+    fetchAll(admin, "work_order_time_entries"),
+    fetchAll(admin, "sub_contractors"),
+    fetchAll(admin, "work_order_sub_contractors"),
+    fetchAll(admin, "work_order_sub_contractor_hours"),
   ]);
 
   // Group milestones by project_id.
@@ -335,8 +463,13 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     teams: teamsRaw.map(r => mapTeam(r, membersByTeam.get(asString(r.id)) ?? [])),
     projects: projectsRaw.map(r => mapProject(r, milestonesByProject.get(asString(r.id)) ?? [])),
     amcs: amcsRaw.map(mapAmc),
+    amcServices: amcServicesRaw.map(mapAmcService),
     repairs: repairsRaw.map(mapRepair),
     workOrders: workOrdersRaw.map(r => mapWorkOrder(r, assignByWo.get(asString(r.id)) ?? [])),
+    workOrderTimeEntries: woTimeEntriesRaw.map(mapWorkOrderTimeEntry),
+    subContractors: subContractorsRaw.map(mapSubContractor),
+    workOrderSubContractors: woSubContractorsRaw.map(mapWorkOrderSubContractor),
+    workOrderSubContractorHours: woSubHoursRaw.map(mapWorkOrderSubContractorHours),
     approvals: approvalsRaw.map(r => mapApproval(r, stepsByApproval.get(asString(r.id)) ?? [])),
     replacements: replacementsRaw.map(mapReplacement),
   };

@@ -17,6 +17,10 @@ export type RouteName =
   | "dashboard" | "workorders" | "feed" | "scheduling" | "approvals"
   | "projects" | "amc" | "repair" | "inventory" | "logistics"
   | "replacements"
+  // Growth Plan — calendar/planner aggregating projects, AMC visits, WOs.
+  | "growth-plan"
+  // Sub-contractors directory (migration 0023).
+  | "sub-contractors"
   | "customers" | "sites" | "team" | "reports" | "admin" | "notifications"
   | "organizations" | "admins"
   // pseudo-route - sidebar item opens the Notes slide-out panel instead
@@ -31,7 +35,8 @@ export type CreateKind =
   | "picker" | "user" | "customer" | "site" | "project" | "amc"
   | "workorder" | "repair" | "material_request" | "delivery"
   | "team_member" | "quotation" | "organization" | "note"
-  | "amc_payment" | "replacement_request";
+  | "amc_payment" | "replacement_request" | "sub_contractor"
+  | "sub_hours";
 export interface CreateState { kind: CreateKind; prefill?: Record<string, unknown> }
 
 interface Ctx {
@@ -79,6 +84,10 @@ interface Ctx {
   openProject: (id: string) => void;
   openAmc: (id: string) => void;
   openReplacement: (id: string) => void;
+  // Navigate to /growth-plan. Optional `range` pre-selects the calendar
+  // range filter ("today" | "week" | "month" | "3months") via query
+  // string so dashboard widgets can deep-link straight into a scope.
+  openGrowthPlan: (range?: string) => void;
   followTarget: (target: FollowTarget | null | undefined) => void;
 
   modal: ModalState | null;
@@ -124,9 +133,12 @@ function shade(hex: string, percent: number): string {
 }
 
 const NAME_FROM_PATH = (path: string): RouteName => {
-  const m = path.match(/^\/([a-z]+)/);
+  // Allow hyphens in the first segment so multi-word routes like
+  // "growth-plan" resolve correctly. The previous regex stopped at the
+  // first hyphen and silently fell back to "dashboard".
+  const m = path.match(/^\/([a-z-]+)/);
   const name = (m ? m[1] : "dashboard") as RouteName;
-  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "customers", "sites", "team", "reports", "admin", "notifications", "organizations", "admins"];
+  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "growth-plan", "sub-contractors", "customers", "sites", "team", "reports", "admin", "notifications", "organizations", "admins"];
   return known.includes(name) ? name : "dashboard";
 };
 
@@ -165,8 +177,13 @@ export function AppProvider({
       for (const t of initialBundle.teams) db.TEAMS[t.id] = t;
       for (const p of initialBundle.projects) db.PROJECTS[p.id] = p;
       for (const a of initialBundle.amcs) db.AMCS[a.id] = a;
+      for (const s of initialBundle.amcServices) db.AMC_SERVICE_SCHEDULE[s.id] = s;
       for (const r of initialBundle.repairs) db.REPAIRS[r.id] = r;
       for (const w of initialBundle.workOrders) db.WORK_ORDERS[w.id] = w;
+      for (const e of initialBundle.workOrderTimeEntries) db.WORK_ORDER_TIME_ENTRIES[e.id] = e;
+      for (const s of initialBundle.subContractors) db.SUB_CONTRACTORS[s.id] = s;
+      for (const j of initialBundle.workOrderSubContractors) db.WORK_ORDER_SUB_CONTRACTORS[j.id] = j;
+      for (const h of initialBundle.workOrderSubContractorHours) db.WORK_ORDER_SUB_CONTRACTOR_HOURS[h.id] = h;
       for (const a of initialBundle.approvals) db.APPROVALS[a.id] = a;
       for (const r of initialBundle.replacements) db.REPLACEMENTS[r.id] = r;
     }
@@ -285,6 +302,8 @@ export function AppProvider({
   const openProject = useCallback((id: string) => go("projects", { id }), [go]);
   const openAmc = useCallback((id: string) => go("amc", { id }), [go]);
   const openReplacement = useCallback((id: string) => go("replacements", { id }), [go]);
+  const openGrowthPlan = useCallback((range?: string) =>
+    go("growth-plan", range ? { range } : {}), [go]);
 
   const followTarget = useCallback((target?: FollowTarget | null) => {
     if (!target) return;
@@ -327,7 +346,7 @@ export function AppProvider({
     notifOpen, setNotif,
     notesOpen, setNotesOpen, notesVersion, bumpNotes,
     sidebarCollapsed, setSidebarCollapsed, toggleSidebar,
-    slideover, setSlideover, openWO, openApproval, openCustomer, openProject, openAmc, openReplacement, followTarget,
+    slideover, setSlideover, openWO, openApproval, openCustomer, openProject, openAmc, openReplacement, openGrowthPlan, followTarget,
     modal, setModal,
     create, openCreate, closeCreate, dataVersion, bumpData,
     toast, fireToast, dismissToast,

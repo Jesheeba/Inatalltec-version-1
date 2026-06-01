@@ -9,14 +9,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import { useApp } from "@/lib/app-context";
 import { db, ROLE_LABELS } from "@/lib/db";
-import type { IconName, Role, WoStatus } from "@/lib/types";
+import type { IconName, Role, WoStatus, WorkOrder, WorkOrderSubContractorHours, WorkOrderTimeEntry } from "@/lib/types";
 import { CardHead, ChoicePill, EmptyState, Modal, SlideOver, StatusBadge } from "./shared";
 import { NotificationDropdown } from "./notifications";
 import { navigateTo } from "@/lib/maps";
 import {
   updateWorkOrder, WORK_ORDER_STATUSES, WO_STATUS_LABEL,
   REPLACEMENT_STATUS_LABEL, REPLACEMENT_STATUS_BADGE,
+  resumeAmc,
+  startWorkOrder, completeWorkOrder, markWorkOrderDone,
+  deleteSubContractorHoursEntry,
 } from "@/lib/create";
+import { formatDurationMinutes, formatLongDateTime, formatMonthDay, formatRelativeDay, formatTimeOfDay } from "@/lib/dates";
 import { supabaseBrowser } from "@/lib/supabase/client";
 
 /* ─── Command Palette ───────────────────────────────────── */
@@ -183,6 +187,489 @@ const WO_STATUS_PILL_CLS: Record<WoStatus, string> = {
   cancelled:            "badge-danger",
 };
 
+// ─── Time-tracking panel (migration 0022) ─────────────────
+//
+// Static display only — no live ticker, no setInterval, no per-second
+// re-renders. Stores started-at / ended-at timestamps and renders
+// pre-calculated durations (trigger-computed on the server). Three
+// visual states:
+//
+//   State 1 — "Not started":          Start Work CTA only.
+//   State 2 — "Started, in progress":  static "Started at HH:MM by …"
+//                                       + Mark Done.
+//   State 3 — "Completed":             totals + per-worker history.
+//
+// The "Mark WO Done" button only shows for md/admin/manager/lead_worker
+// — those are the roles wo_write covers, so the UPDATE will actually
+// land. It also closes any open timers on this WO (manager-override).
+// ============================================================
+
+function TimeTrackingPanel({ wo }: { wo: WorkOrder }) {
+  const { me, role, fireToast, bumpData, dataVersion } = useApp();
+  void dataVersion;
+
+  const onCrew = wo.assignedLead === me.id || (wo.assigned ?? []).includes(me.id);
+  const canCloseWo = role === "md" || role === "admin" || role === "manager"
+                  || role === "lead_worker";
+
+  const myOpenEntry = db.openEntryFor(wo.id, me.id);
+  const entries = useMemo(
+    () => db.woEntries(wo.id).sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
+    [wo.id, dataVersion], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const openEntries = entries.filter(e => e.endedAt === null);
+  const closedEntries = entries.filter(e => e.endedAt !== null);
+
+  // "Completed" = WO marked done by manager OR every entry is closed
+  // AND at least one entry existed. (A WO with status='done' but no
+  // entries shows the "Completed (no time logged)" sub-state.)
+  const woIsTerminal = wo.status === "done" || wo.status === "closed" || wo.status === "cancelled";
+  const completed = woIsTerminal && openEntries.length === 0;
+  const inProgress = openEntries.length > 0;
+
+  const [busy, setBusy] = useState<"start" | "done" | "close" | null>(null);
+  const [doneOpen, setDoneOpen] = useState(false);
+  const [doneNote, setDoneNote] = useState("");
+
+  const onStart = async () => {
+    setBusy("start");
+    const res = await startWorkOrder(wo.id, me.id);
+    setBusy(null);
+    if (!res.ok) { fireToast(res.error); return; }
+    bumpData();
+    fireToast("Started");
+  };
+
+  const onSubmitDone = async () => {
+    setBusy("done");
+    const res = await completeWorkOrder(wo.id, me.id, doneNote);
+    setBusy(null);
+    if (!res.ok) { fireToast(res.error); return; }
+    setDoneOpen(false);
+    setDoneNote("");
+    bumpData();
+    fireToast(res.entry
+      ? `Logged ${formatDurationMinutes(res.entry.durationMinutes)}`
+      : "Nothing to close");
+  };
+
+  const onMarkWoDone = async () => {
+    if (!confirm("Mark this work order as Done? This closes any open timers.")) return;
+    setBusy("close");
+    const res = await markWorkOrderDone(wo.id);
+    setBusy(null);
+    if (!res.ok) { fireToast(res.error); return; }
+    bumpData();
+    fireToast(`${wo.code} marked done`);
+  };
+
+  // Hide entirely for users with no relationship to this WO.
+  if (!onCrew && !canCloseWo) return null;
+
+  return (
+    <section className="card card-pad" style={{ marginBottom: 16 }}>
+      <div className="row between" style={{ alignItems: "center", marginBottom: 14 }}>
+        <div style={{ font: "var(--t-h3)" }}>Time tracking</div>
+        {completed && (
+          <span className="badge badge-success" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <Icon name="check" size={11} /> Completed
+          </span>
+        )}
+      </div>
+
+      {/* ── STATE 1: not started ───────────────────────────── */}
+      {!inProgress && !completed && entries.length === 0 && (
+        <>
+          <div className="row gap-2" style={{ alignItems: "center", marginBottom: 14 }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: 999,
+              background: "transparent", border: "1.5px solid var(--ink-quiet)",
+              flexShrink: 0,
+            }} />
+            <span style={{ font: "var(--t-body)", color: "var(--ink-mute)" }}>
+              Not started
+            </span>
+          </div>
+          {onCrew && (
+            <button className="btn btn-primary" disabled={busy !== null} onClick={onStart}>
+              {busy === "start"
+                ? <><Icon name="loader" size={14} style={{ animation: "spin 1s linear infinite" }} /> Starting…</>
+                : <><Icon name="play" size={14} /> Start Work</>}
+            </button>
+          )}
+        </>
+      )}
+
+      {/* ── STATE 2: in progress ───────────────────────────── */}
+      {inProgress && (
+        <>
+          {openEntries.length === 1 ? (
+            <ActiveSingleLine entry={openEntries[0]} />
+          ) : (
+            <ActiveMultiLine entries={openEntries} />
+          )}
+          <div className="row gap-2" style={{ marginTop: 14, flexWrap: "wrap" }}>
+            {onCrew && myOpenEntry && (
+              <button className="btn btn-primary" disabled={busy !== null}
+                onClick={() => setDoneOpen(true)}>
+                <Icon name="check" size={14} /> Mark Done
+              </button>
+            )}
+            {onCrew && !myOpenEntry && (
+              <button className="btn btn-primary" disabled={busy !== null} onClick={onStart}>
+                {busy === "start"
+                  ? <><Icon name="loader" size={14} style={{ animation: "spin 1s linear infinite" }} /> Starting…</>
+                  : <><Icon name="play" size={14} /> Start Work</>}
+              </button>
+            )}
+            {canCloseWo && (
+              <button className="btn btn-ghost" disabled={busy !== null} onClick={onMarkWoDone}>
+                {busy === "close"
+                  ? <><Icon name="loader" size={14} style={{ animation: "spin 1s linear infinite" }} /> Closing…</>
+                  : <><Icon name="checkCircle" size={14} /> Mark WO Done</>}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ── STATE 3: completed, or post-session ───────────── */}
+      {!inProgress && closedEntries.length > 0 && (
+        <CompletedSummary wo={wo} entries={closedEntries} />
+      )}
+
+      {/* If WO is terminal but no entries logged at all */}
+      {completed && entries.length === 0 && (
+        <div className="row gap-2" style={{ alignItems: "center" }}>
+          <Icon name="info" size={14} style={{ color: "var(--ink-mute)" }} />
+          <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+            No time logged on this work order.
+          </span>
+        </div>
+      )}
+
+      {/* Mark Done modal — note capture only, no live elapsed display. */}
+      {doneOpen && (
+        <div role="dialog" aria-modal="true"
+          onClick={() => { if (busy === null) setDoneOpen(false); }}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(15, 23, 42, 0.42)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 20, zIndex: 1000,
+          }}>
+          <form onClick={ev => ev.stopPropagation()}
+            onSubmit={ev => { ev.preventDefault(); onSubmitDone(); }}
+            style={{
+              background: "var(--bg-elev)", borderRadius: "var(--r-md)",
+              boxShadow: "var(--shadow-lg)", width: "100%", maxWidth: 460,
+              padding: 20, display: "flex", flexDirection: "column", gap: 14,
+            }}>
+            <div>
+              <div style={{ font: "var(--t-h3)" }}>Close your timer</div>
+              <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 4 }}>
+                Add a note if anything useful happened in this session (optional).
+              </div>
+            </div>
+            <textarea className="textarea" rows={3}
+              value={doneNote} onChange={ev => setDoneNote(ev.target.value)}
+              placeholder="e.g. Completed rack termination; cleanup tomorrow."
+              autoFocus />
+            <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+              <button type="button" className="btn btn-ghost"
+                onClick={() => setDoneOpen(false)} disabled={busy !== null}>Cancel</button>
+              <button type="submit" className="btn btn-primary" disabled={busy !== null}>
+                {busy === "done"
+                  ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
+                  : <><Icon name="check" size={13} /> Done</>}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Single active worker — one-line "Started at HH:MM today by Name". */
+function ActiveSingleLine({ entry }: { entry: WorkOrderTimeEntry }) {
+  const user = entry.userId ? db.user(entry.userId) : null;
+  const d = new Date(entry.startedAt);
+  return (
+    <div className="row gap-2" style={{ alignItems: "center" }}>
+      <span className="dot dot-success" style={{ flexShrink: 0 }} />
+      <span style={{ font: "var(--t-body)" }}>
+        Started at <strong>{formatTimeOfDay(d)}</strong> {formatRelativeDay(d)}
+        {user?.name ? <> by <strong>{user.name}</strong></> : null}
+      </span>
+    </div>
+  );
+}
+
+/** Multiple active workers — header + one row per open entry. */
+function ActiveMultiLine({ entries }: { entries: WorkOrderTimeEntry[] }) {
+  return (
+    <div>
+      <div className="row gap-2" style={{ alignItems: "center", marginBottom: 10 }}>
+        <span className="dot dot-success" style={{ flexShrink: 0 }} />
+        <span style={{ font: "var(--t-body-md)", fontWeight: 600 }}>
+          {entries.length} workers active
+        </span>
+      </div>
+      <div className="col gap-1" style={{ paddingLeft: 18 }}>
+        {entries.map(e => {
+          const user = e.userId ? db.user(e.userId) : null;
+          const d = new Date(e.startedAt);
+          return (
+            <div key={e.id} style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+              <strong style={{ color: "var(--ink)" }}>{user?.name ?? "Removed user"}</strong>
+              {" — started "}{formatTimeOfDay(d)} {formatRelativeDay(d)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Completed display: totals + per-worker entry breakdown. */
+function CompletedSummary({ wo, entries }: { wo: WorkOrder; entries: WorkOrderTimeEntry[] }) {
+  return (
+    <div>
+      <div className="row gap-3" style={{ alignItems: "center", marginBottom: 14, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
+                        textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+            Duration
+          </div>
+          <div className="numeric" style={{ font: "var(--t-h3)", marginTop: 2 }}>
+            {formatDurationMinutes(wo.durationMinutes)}
+          </div>
+        </div>
+        <div style={{ width: 1, alignSelf: "stretch", background: "var(--divider)" }} />
+        <div>
+          <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
+                        textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+            Workers
+          </div>
+          <div className="numeric" style={{ font: "var(--t-h3)", marginTop: 2 }}>
+            {wo.actualWorkersCount || entries.length}
+          </div>
+        </div>
+      </div>
+
+      <div style={{
+        font: "var(--t-micro)", color: "var(--ink-mute)",
+        textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,
+        marginBottom: 8,
+      }}>
+        Worker entries
+      </div>
+      <div className="col gap-2">
+        {entries.map(e => <CompletedEntryRow key={e.id} e={e} />)}
+      </div>
+    </div>
+  );
+}
+
+function CompletedEntryRow({ e }: { e: WorkOrderTimeEntry }) {
+  const user = e.userId ? db.user(e.userId) : null;
+  const start = new Date(e.startedAt);
+  const end = e.endedAt ? new Date(e.endedAt) : null;
+  return (
+    <div className="row gap-3" style={{
+      padding: "10px 12px", borderRadius: "var(--r-md)",
+      background: "var(--bg-muted)", border: "1px solid var(--border)",
+      alignItems: "center",
+    }}>
+      <span className={"avatar avatar-sm avatar-" + (user?.tint || "primary")}>
+        {user?.initials ?? "?"}
+      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="truncate" style={{ font: "var(--t-body-md)" }}>
+          {user?.name ?? "Removed user"}
+        </div>
+        <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+          {formatTimeOfDay(start)} → {end ? formatTimeOfDay(end) : "—"}
+          {" · "}{formatRelativeDay(start)}
+          {e.note ? ` · ${e.note}` : ""}
+        </div>
+      </div>
+      <span className="numeric" style={{
+        font: "var(--t-small)", fontWeight: 600, flexShrink: 0,
+      }}>
+        {formatDurationMinutes(e.durationMinutes)}
+      </span>
+    </div>
+  );
+}
+
+// ─── Sub-contractor crew rows (migrations 0023 + 0026) ────
+//
+// Renders inside the WO slideover Crew section, beneath the regular
+// staff rows. Each row shows the sub-contractor's name + company,
+// a "+ Log Hours" button (permission-gated), and an inline list of
+// previously-logged entries with edit/delete actions per row.
+//
+// Permission model — must mirror RLS wosh_write (migration 0026):
+//   canLog (= INSERT visibility):
+//     admin/md/manager always.
+//     lead_worker only when wo.assignedLead === me.id.
+//   canTouchEntry(entry) (= UPDATE/DELETE visibility):
+//     admin/md/manager always.
+//     lead_worker only when canLog AND entry.loggedBy === me.id.
+// (The hard backstop is RLS — these gates just keep buttons honest.)
+function SubContractorRows({ wo }: { wo: WorkOrder }) {
+  const { dataVersion, role, me, openCreate, fireToast, bumpData } = useApp();
+  void dataVersion;
+  const assignments = db.subForWO(wo.id);
+  if (assignments.length === 0) return null;
+
+  const isStaff = role === "admin" || role === "md" || role === "manager";
+  const isOwnLead = role === "lead_worker" && wo.assignedLead === me.id;
+  const canLog = isStaff || isOwnLead;
+
+  return (
+    <>
+      {assignments.map(j => {
+        const s = db.subContractor(j.subContractorId);
+        const subName = s?.name ?? "Removed sub-contractor";
+        const entries = db.hoursForSubOnWO(wo.id, j.subContractorId);
+        return (
+          <div key={j.id} className="col gap-2"
+               style={{ padding: "8px 10px", borderRadius: "var(--r-md)" }}>
+            <div className="row gap-3" style={{ alignItems: "center" }}>
+              <span style={{
+                width: 36, height: 36, borderRadius: 999, flexShrink: 0,
+                background: "var(--bg-muted)", display: "flex",
+                alignItems: "center", justifyContent: "center",
+                color: "var(--ink-mute)",
+              }}>
+                <Icon name="user" size={16} />
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="row gap-2" style={{ alignItems: "center" }}>
+                  <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>Sub</span>
+                  <span className="truncate" style={{ font: "var(--t-body-md)" }}>{subName}</span>
+                </div>
+                <div className="truncate" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+                  {s?.company ?? "Independent"}
+                  {s?.phone ? ` · ${s.phone}` : ""}
+                </div>
+              </div>
+              {canLog && s && (
+                <button className="btn btn-primary btn-sm"
+                  onClick={() => openCreate("sub_hours", {
+                    wo_id: wo.id, sub_id: s.id,
+                    sub_name: s.name, wo_code: wo.code,
+                    assigned_at: j.assignedAt,
+                  })}>
+                  <Icon name="plus" size={14} /> Log Hours
+                </button>
+              )}
+            </div>
+            <SubHoursList
+              entries={entries}
+              canTouchEntry={(loggedBy) => isStaff || (isOwnLead && loggedBy === me.id)}
+              onEdit={(entry) => {
+                if (!s) return;
+                openCreate("sub_hours", {
+                  wo_id: wo.id, sub_id: s.id,
+                  sub_name: s.name, wo_code: wo.code,
+                  assigned_at: j.assignedAt,
+                  entry_id: entry.id,
+                  hours: entry.hours,
+                  entry_date: entry.entryDate,
+                  notes: entry.notes ?? "",
+                });
+              }}
+              onDelete={async (entry) => {
+                if (!confirm("Delete this hours entry? This cannot be undone.")) return;
+                const res = await deleteSubContractorHoursEntry(entry.id);
+                if (!res.ok) { fireToast(`Couldn't delete: ${res.error}`); return; }
+                fireToast("Hours entry deleted");
+                bumpData();
+              }}
+            />
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+// Renders the per-sub list of logged hours below the sub's identity row.
+// Pure presentational — the parent decides which actions are visible.
+function SubHoursList({
+  entries, canTouchEntry, onEdit, onDelete,
+}: {
+  entries: WorkOrderSubContractorHours[];
+  canTouchEntry: (loggedBy: string | null) => boolean;
+  onEdit: (entry: WorkOrderSubContractorHours) => void;
+  onDelete: (entry: WorkOrderSubContractorHours) => void;
+}) {
+  if (entries.length === 0) return null;
+  // Newest first — entryDate desc, then loggedAt desc to break ties when
+  // a lead logs two sessions on the same day.
+  const sorted = [...entries].sort((a, b) => {
+    if (a.entryDate !== b.entryDate) return a.entryDate < b.entryDate ? 1 : -1;
+    return a.loggedAt < b.loggedAt ? 1 : -1;
+  });
+  const totalHours = sorted.reduce((sum, e) => sum + e.hours, 0);
+  const distinctDays = new Set(sorted.map(e => e.entryDate)).size;
+  return (
+    <div className="col gap-1" style={{
+      marginLeft: 48, paddingTop: 4, paddingBottom: 4,
+      borderLeft: "2px solid var(--border)", paddingLeft: 12,
+    }}>
+      {sorted.map(e => (
+        <div key={e.id} className="row gap-2"
+             style={{ alignItems: "center", font: "var(--t-small)" }}>
+          <span className="numeric" style={{ color: "var(--ink-mute)", flexShrink: 0, minWidth: 56 }}>
+            {formatEntryDate(e.entryDate)}
+          </span>
+          <span className="numeric" style={{ fontWeight: 600, flexShrink: 0, minWidth: 60 }}>
+            {e.hours.toFixed(1)} hrs
+          </span>
+          {e.notes && (
+            <span className="truncate" style={{ flex: 1, color: "var(--ink-mute)", fontStyle: "italic" }}>
+              {`"${e.notes}"`}
+            </span>
+          )}
+          {!e.notes && <span style={{ flex: 1 }} />}
+          {canTouchEntry(e.loggedBy) && (
+            <>
+              <button className="btn btn-ghost btn-icon btn-sm"
+                onClick={() => onEdit(e)}
+                aria-label="Edit entry">
+                <Icon name="pen" size={12} />
+              </button>
+              <button className="btn btn-ghost btn-icon btn-sm"
+                onClick={() => onDelete(e)}
+                aria-label="Delete entry">
+                <Icon name="trash" size={12} />
+              </button>
+            </>
+          )}
+        </div>
+      ))}
+      <div style={{
+        font: "var(--t-small)", color: "var(--ink-mute)", fontWeight: 600,
+        marginTop: 4, paddingTop: 4, borderTop: "1px dashed var(--border)",
+      }}>
+        Total: {totalHours.toFixed(1)} hrs across {distinctDays} {distinctDays === 1 ? "day" : "days"}
+      </div>
+    </div>
+  );
+}
+
+// Stable date-only formatter — anchor at noon to dodge timezone
+// wraparound for the date-only entry_date column.
+function formatEntryDate(yyyyMmDd: string): string {
+  const [y, m, d] = yyyyMmDd.split("-").map(Number);
+  if (!y || !m || !d) return yyyyMmDd;
+  return formatMonthDay(new Date(y, m - 1, d, 12, 0, 0));
+}
+
 export function WoSlideover() {
   const { slideover, setSlideover, fireToast, followTarget, bumpData, dataVersion, role, me, openCreate, openReplacement } = useApp();
   const woId = slideover?.kind === "wo" ? slideover.id : null;
@@ -300,6 +787,7 @@ export function WoSlideover() {
 
       {tab === "overview" && (
         <div className="col gap-4">
+          <TimeTrackingPanel wo={wo} />
           <section className="card card-pad">
             <CardHead title="Crew" />
             <div className="col gap-2">
@@ -318,6 +806,7 @@ export function WoSlideover() {
                   </div>
                 );
               })}
+              <SubContractorRows wo={wo} />
             </div>
           </section>
 
@@ -499,10 +988,7 @@ function WoHistoryEntry({ row }: { row: WoHistoryRow }) {
   const when = (() => {
     const d = new Date(row.changed_at);
     if (Number.isNaN(d.getTime())) return row.changed_at;
-    return d.toLocaleString(undefined, {
-      year: "numeric", month: "short", day: "numeric",
-      hour: "2-digit", minute: "2-digit",
-    });
+    return formatLongDateTime(d);
   })();
   return (
     <div className="row gap-3" style={{
@@ -684,16 +1170,25 @@ function Effect({ icon, text }: { icon: IconName; text: string }) {
 }
 
 export function ReactivationModal() {
-  const { modal, setModal, fireToast, fmtMoney } = useApp();
+  const { modal, setModal, fireToast, fmtMoney, bumpData, me } = useApp();
   const [stage, setStage] = useState<"review" | "approving" | "done">("review");
-  useEffect(() => { setStage("review"); }, [modal]);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => { setStage("review"); setErr(null); }, [modal]);
   if (!modal || modal.kind !== "reactivation") return null;
   const c = db.amc(modal.data.id);
   if (!c) return null;
 
-  const approve = () => {
+  const approve = async () => {
     setStage("approving");
-    setTimeout(() => setStage("done"), 1100);
+    setErr(null);
+    const res = await resumeAmc(c.id, me.id);
+    if (!res.ok) {
+      setErr(res.error);
+      setStage("review");
+      return;
+    }
+    bumpData();
+    setStage("done");
   };
   const close = () => {
     setModal(null);
@@ -733,6 +1228,16 @@ export function ReactivationModal() {
               <Effect icon="fileText" text="Audit log entry under your name" />
             </div>
             <textarea className="textarea" placeholder="Optional note to customer & team…" style={{ marginTop: 16 }} />
+            {err && (
+              <div style={{
+                marginTop: 12, padding: "10px 12px",
+                background: "var(--dan-50)", color: "var(--dan-700)",
+                borderRadius: "var(--r-md)", font: "var(--t-small)",
+                display: "flex", alignItems: "center", gap: 8,
+              }}>
+                <Icon name="alertCircle" size={14} /> {err}
+              </div>
+            )}
           </div>
           <div style={{ padding: "14px 22px", borderTop: "1px solid var(--divider)", display: "flex", gap: 10, justifyContent: "flex-end" }}>
             <button className="btn btn-ghost" onClick={close}>Reject & block</button>

@@ -135,6 +135,28 @@ export interface Milestone {
   pct: number;
 }
 
+// Project execution phase (migration 0020). Six manually-advanced steps
+// a Main Contractor job moves through after kickoff. Only md/admin/manager
+// can change this; UI surfaces a horizontal stepper on the detail page and
+// a small pill badge on cards / calendar events.
+export type ProjectPhase =
+  | "design"
+  | "material_supply"
+  | "installation"
+  | "tc"
+  | "dlp"
+  | "closed";
+
+export interface ProjectPhaseHistory {
+  id: string;
+  projectId: string;
+  fromPhase: ProjectPhase | null;
+  toPhase: ProjectPhase;
+  changedBy: string | null;   // users.id, NULL when set under service-role
+  changedAt: string;          // ISO timestamptz
+  note: string | null;
+}
+
 export interface Project {
   id: string;
   code: string;
@@ -150,6 +172,10 @@ export interface Project {
   leadTechId: string;
   status: string;
   stage: string;
+  // Execution phase (migration 0020). NULL for projects created before
+  // the migration — Operations Manager backfills via "Set Phase" UI.
+  // New projects default to 'design' server-side.
+  currentPhase: ProjectPhase | null;
   progress: number;
   value: number;
   startedAt: string;
@@ -189,6 +215,19 @@ export interface AmcContract {
   overdueDays: number;
   freeCalls: number;
   expiresAt: string;
+  // Pause / resume / renewal fields. The frontend labels
+  // contract_status='suspended' as "Paused"; the DB keeps the existing
+  // 'suspended' value so the auto-resume payment trigger keeps working.
+  // suspendedAt / suspendedReason have lived on the DB since 0009b and
+  // are surfaced now so the AmcDetail page can show "Paused since X
+  // because Y". pausedBy / resumedAt / firstPaymentDueAt / renewedFromId
+  // are new in migration 0021.
+  suspendedAt: string | null;       // ISO timestamptz of pause (existing column)
+  suspendedReason: string | null;   // free-text reason (existing column)
+  pausedBy: string | null;          // users.id of who paused (auto sweep → null)
+  resumedAt: string | null;         // ISO timestamptz of most recent resume
+  firstPaymentDueAt: string | null; // signed_at + payment_grace_days, ISO
+  renewedFromId: string | null;     // previous AMC this one renews (chain)
 }
 
 export interface RepairTicket {
@@ -251,7 +290,139 @@ export interface WorkOrder {
   materials: string[];
   tasks?: WoTask[];
   flagged?: string;
+  // Time-tracking fields (migration 0022). All nullable for WOs created
+  // before the migration applied / before any worker clicked Start.
+  // durationMinutes is trigger-computed from work_order_time_entries
+  // (sum across all closed sessions); actualWorkersCount is count of
+  // distinct workers who ever logged a session.
+  startedAt: string | null;            // earliest entry's started_at
+  completedAt: string | null;          // "Mark WO Done" timestamp
+  durationMinutes: number;             // default 0
+  actualWorkersCount: number;          // default 0
 }
+
+// One row per (worker × session). Mirror of public.work_order_time_entries
+// from migration 0022. endedAt = null means the session is currently open
+// (the worker hasn't clicked Done yet). durationMinutes is the DB-generated
+// stored column — 0 while open, integer minutes once closed.
+export interface WorkOrderTimeEntry {
+  id: string;
+  workOrderId: string;
+  userId: string | null;               // null after worker is soft-deleted
+  startedAt: string;                   // ISO timestamptz
+  endedAt: string | null;
+  durationMinutes: number;
+  note: string | null;
+  createdAt: string;
+}
+
+// External contractor directory (migration 0023). No login — these
+// profiles are stored so we can list them in WO assignment, track
+// their hours, and keep HR/compliance fields (Emirates ID, phone).
+// Distinct concept from the `subcontractor` role enum value, which is
+// for the rare case of a sub-contractor who has a sign-in account.
+export interface SubContractor {
+  id: string;
+  name: string;
+  phone: string | null;
+  emiratesId: string | null;
+  company: string | null;
+  notes: string | null;
+  isActive: boolean;
+  createdAt: string;
+  createdBy: string | null;            // users.id who added them
+}
+
+// One row per (work_order × sub_contractor). Tracks the assignment +
+// the sub-contractor's own start/done timestamps + computed duration.
+// Parallel to work_order_time_entries but with a different key shape
+// because sub-contractors don't have user_id rows.
+export interface WorkOrderSubContractor {
+  id: string;
+  workOrderId: string;
+  subContractorId: string;
+  assignedAt: string;
+  assignedBy: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  durationMinutes: number;
+  note: string | null;
+}
+
+// One row per logged session for a sub-contractor on a work order
+// (migration 0026). Layered on top of the assignment row in
+// work_order_sub_contractors — the composite FK guarantees the sub is
+// already on the WO before hours can land. Multiple entries per
+// (WO, sub, day) are allowed (a sub may come and go during the day).
+// hours is numeric(5,2) at the DB; it round-trips as a number here.
+export interface WorkOrderSubContractorHours {
+  id: string;
+  workOrderId: string;
+  subContractorId: string;
+  entryDate: string;       // YYYY-MM-DD (DB column is `date`, not timestamptz)
+  hours: number;           // > 0 and <= 24 (DB CHECK)
+  notes: string | null;
+  loggedBy: string | null; // users.id who entered it; null if user was deleted
+  loggedAt: string;        // ISO timestamptz, server default now()
+}
+
+// ============================================================
+// AMC scheduled service visit — one row per quarterly PPM in
+// amc_service_schedule (migration 0009b). Hydrated separately from
+// AmcContract.services (which is just an aggregate done/total) so the
+// Growth Plan calendar can render each visit as an individual event.
+// ============================================================
+export type AmcServiceStatus =
+  | "scheduled"
+  | "in_progress"
+  | "completed"
+  | "skipped"
+  | "overdue";
+
+export interface AmcService {
+  id: string;
+  amcContractId: string;
+  serviceNumber: number;      // 1..N within the contract year
+  scheduledDate: string;      // YYYY-MM-DD
+  status: AmcServiceStatus;
+  workOrderId: string | null; // set once a WO has been raised for this visit
+  completedAt: string | null;
+  notes: string | null;
+}
+
+// ============================================================
+// Growth Plan / Calendar — normalized event model. Projects, AMC
+// scheduled visits, and Work Orders all collapse into this shape so the
+// month / week / list views can render and filter against one stream.
+// Populated by lib/calendar.ts; not persisted, not hydrated.
+// ============================================================
+export type CalendarEventKind = "project" | "amc_visit" | "work_order";
+
+export interface CalendarEvent {
+  id: string;
+  kind: CalendarEventKind;
+  title: string;
+  startsAt: Date;
+  endsAt: Date | null;
+  customerId?: string;
+  customerName?: string;
+  siteId?: string;
+  siteName?: string;
+  leadTechId?: string;
+  leadTechName?: string;
+  assigneeIds: string[];
+  status?: string;
+  color: string;
+  source: {
+    table: "projects" | "amc_contracts" | "work_orders";
+    id: string;
+  };
+  metadata?: Record<string, unknown>;
+}
+
+export type CalendarView = "month" | "week" | "list";
+export type CalendarFilter = "all" | "project" | "amc_visit" | "work_order" | "mine";
+export type CalendarRange = "today" | "week" | "month" | "3months" | "custom";
 
 // Replacement Requests — Worker → Lead Tech approval flow
 // (migration 0017). Workers raise from the field, Lead Techs gate

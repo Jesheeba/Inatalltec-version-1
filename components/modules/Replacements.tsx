@@ -34,6 +34,7 @@ import type { ReplacementContext, ReplacementRequest, ReplacementStatus } from "
 import {
   CardHead, EmptyState, FilterBar, KPI, Modal, PageHeader,
 } from "../shared";
+import { formatMonthDay, formatLongDateTime } from "@/lib/dates";
 
 /* ─── List ─────────────────────────────────────────────── */
 
@@ -574,14 +575,11 @@ function formatRelative(iso: string): string {
   if (h < 24) return `${h}h`;
   const d = Math.round(h / 24);
   if (d < 7)  return `${d}d`;
-  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return formatMonthDay(new Date(iso));
 }
 
 function formatFull(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
-  });
+  return formatLongDateTime(d);
 }

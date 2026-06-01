@@ -8,9 +8,15 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
 import { db, ROLE_LABELS } from "@/lib/db";
-import { updateAmc, AMC_STATUSES, AMC_STATUS_LABEL, AMC_PAYMENT_METHOD_LABEL, type AmcPaymentMethod } from "@/lib/create";
+import {
+  updateAmc, AMC_STATUSES, AMC_STATUS_LABEL, AMC_PAYMENT_METHOD_LABEL,
+  pauseAmc, resumeAmc, calculateDaysUntilPause,
+  type AmcPaymentMethod,
+} from "@/lib/create";
+import { RenewAmcModal } from "../RenewAmcModal";
 import { can, listScopeFor } from "@/lib/permissions";
 import { supabaseBrowser } from "@/lib/supabase/client";
+import { formatLongDate, formatLongDateTime } from "@/lib/dates";
 import type { AmcContract, AmcStatus, User } from "@/lib/types";
 import {
   CardHead, ChoicePill, EmptyState, FilterBar, KPI, PageHeader, StatusBadge, WoCard,
@@ -38,7 +44,7 @@ function ReactivationBanner({ contract, onOpen }: { contract: AmcContract; onOpe
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div className="row gap-2">
-          <span className="badge" style={{ background: "var(--pri-500)", color: "#fff" }}>Suspended</span>
+          <span className="badge" style={{ background: "var(--pri-500)", color: "#fff" }}>Paused</span>
           {contract.overdueDays > 0 && (
             <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{contract.overdueDays}d overdue</span>
           )}
@@ -157,7 +163,7 @@ export function AmcList() {
         <KPI label="Annualised value" value={fmtMoney(1_840_000, { compact: true })}>
           <div className="progress" style={{ marginTop: 8 }}><div style={{ width: "72%" }} /></div>
         </KPI>
-        <KPI label="Suspended · payment" value={counts.suspended} sub={`${fmtMoney(134_000, { compact: true })} at risk`} trend="down" />
+        <KPI label="Paused · payment" value={counts.suspended} sub={`${fmtMoney(134_000, { compact: true })} at risk`} trend="down" />
         <KPI accent="violet" label="Pending payment" value={counts.pending_payment} sub="awaiting first payment" />
       </div>
 
@@ -167,7 +173,7 @@ export function AmcList() {
           { value: "draft",           label: "Draft",           count: counts.draft },
           { value: "pending_payment", label: "Pending Payment", count: counts.pending_payment },
           { value: "active",          label: "Active",          count: counts.active },
-          { value: "suspended",       label: "Suspended",       count: counts.suspended },
+          { value: "suspended",       label: "Paused",          count: counts.suspended },
           { value: "expired",         label: "Expired",         count: counts.expired },
           { value: "cancelled",       label: "Cancelled",       count: counts.cancelled },
         ]} />
@@ -252,8 +258,123 @@ function AmcLeadTechRow({
   );
 }
 
+// ── AMC pause / renewal helpers (migration 0021) ─────────
+// Roles allowed to pause / resume / renew an AMC. Mirrors the existing
+// amc_write RLS policy (0016): md / admin / manager. UI hides the
+// buttons for other roles; the DB still rejects unauthorised writes.
+function canManageAmcPause(role: string): boolean {
+  return role === "md" || role === "admin" || role === "manager";
+}
+
+// Roles allowed to record AMC payments. Mirrors amc_pay_write
+// (migration 0025): md / admin / manager / sales / accounts.
+// Technicians (lead_worker / worker / driver / subcontractor) should
+// not see the "Record Payment" CTA on the contract detail page —
+// they're field execution, not finance.
+function canRecordAmcPayment(role: string): boolean {
+  return role === "md" || role === "admin" || role === "manager"
+      || role === "sales" || role === "accounts";
+}
+
+// Roles allowed to change the AMC contract_status pill. Tightest gate
+// — must match amc_write (md / admin / manager). Anyone else gets a
+// read-only badge instead of the editable ChoicePill.
+function canChangeAmcStatus(role: string): boolean {
+  return role === "md" || role === "admin" || role === "manager";
+}
+
+// When the contract is within this many days of expires_at (or already
+// past), the "Renew Contract" button appears on the detail page.
+const RENEW_WINDOW_DAYS = 30;
+
+function isRenewEligible(amc: AmcContract): boolean {
+  if (!amc.expiresAt) return false;
+  const exp = new Date(amc.expiresAt).getTime();
+  if (Number.isNaN(exp)) return false;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const daysToExpiry = Math.round((exp - today.getTime()) / 86_400_000);
+  return daysToExpiry <= RENEW_WINDOW_DAYS;
+}
+
+// Inline reason-capture modal for the Pause button. Resume uses a
+// simpler confirm (no reason needed) but reuses the same chrome.
+function PauseReasonModal({ open, mode, onClose, onConfirm, busy, err }: {
+  open: boolean;
+  mode: "pause" | "resume";
+  onClose: () => void;
+  onConfirm: (reason: string) => void;
+  busy: boolean;
+  err: string | null;
+}) {
+  const [reason, setReason] = useState("");
+  useEffect(() => { if (!open) setReason(""); }, [open]);
+  if (!open) return null;
+  const requiresReason = mode === "pause";
+  return (
+    <div role="dialog" aria-modal="true"
+      onClick={() => { if (!busy) onClose(); }}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(15, 23, 42, 0.42)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 20, zIndex: 1000,
+      }}>
+      <form onClick={e => e.stopPropagation()}
+        onSubmit={e => { e.preventDefault(); if (requiresReason && !reason.trim()) return; onConfirm(reason); }}
+        style={{
+          background: "var(--bg-elev)", borderRadius: "var(--r-md)",
+          boxShadow: "var(--shadow-lg)", width: "100%", maxWidth: 460,
+          padding: 20, display: "flex", flexDirection: "column", gap: 14,
+        }}>
+        <div>
+          <div style={{ font: "var(--t-h3)" }}>
+            {mode === "pause" ? "Pause AMC contract" : "Resume AMC contract"}
+          </div>
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 4 }}>
+            {mode === "pause"
+              ? "Halts further scheduled visits and free calls until you resume or payment is recorded."
+              : "Brings the contract back to active. Scheduled visits resume immediately."}
+          </div>
+        </div>
+        <div>
+          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
+                          textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+            {mode === "pause" ? "Pause reason" : "Note (optional)"}
+            {requiresReason && <span style={{ color: "var(--dan-700)" }}> *</span>}
+          </label>
+          <textarea className="textarea" rows={3}
+            value={reason} onChange={e => setReason(e.target.value)}
+            placeholder={mode === "pause"
+              ? "e.g. Customer disputes invoice; awaiting clarification"
+              : "Optional note about why you're resuming"}
+            style={{ marginTop: 6 }} required={requiresReason} />
+        </div>
+        {err && (
+          <div style={{
+            padding: "10px 12px", background: "var(--dan-50)",
+            color: "var(--dan-700)", borderRadius: "var(--r-md)",
+            font: "var(--t-small)", display: "flex", alignItems: "center", gap: 8,
+          }}>
+            <Icon name="alertCircle" size={14} /> {err}
+          </div>
+        )}
+        <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+          <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+          <button type="submit" className="btn btn-primary"
+            disabled={busy || (requiresReason && !reason.trim())}>
+            {busy
+              ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
+              : (mode === "pause"
+                  ? <><Icon name="pause" size={13} /> Pause AMC</>
+                  : <><Icon name="play" size={13} /> Resume AMC</>)}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export function AmcDetail({ id }: { id: string }) {
-  const { go, openWO, openCreate, setModal, openCustomer, fmtMoney, fireToast, bumpData, dataVersion, role, me } = useApp();
+  const { go, openWO, openAmc, openCreate, setModal, openCustomer, fmtMoney, fireToast, bumpData, dataVersion, role, me } = useApp();
   // Subscribe to dataVersion so a status change or new payment re-renders.
   void dataVersion;
   const c = db.amc(id);
@@ -353,6 +474,66 @@ export function AmcDetail({ id }: { id: string }) {
     value: s, label: AMC_STATUS_LABEL[s], cls: AMC_STATUS_PILL_CLS[s],
   }));
 
+  // ── Pause / Resume / Renew state (migration 0021) ──
+  const canPauseResume = canManageAmcPause(role);
+  const canRecordPay  = canRecordAmcPayment(role);
+  const canEditStatus = canChangeAmcStatus(role);
+  const isPaused = c.contract_status === "suspended";
+  const renewEligible = isRenewEligible(c);
+  // Find any contract that renewed THIS one (reverse chain link).
+  const renewedToContract = useMemo(
+    () => Object.values(db.AMCS).find(a => a.renewedFromId === id) ?? null,
+    [id, dataVersion], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const renewedFromContract = c.renewedFromId ? db.amc(c.renewedFromId) : null;
+
+  const [pauseModal, setPauseModal] = useState<{ open: boolean; mode: "pause" | "resume" }>({
+    open: false, mode: "pause",
+  });
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const [pauseErr, setPauseErr]   = useState<string | null>(null);
+  const [renewOpen, setRenewOpen] = useState(false);
+
+  const onConfirmPauseOrResume = async (reason: string) => {
+    setPauseBusy(true); setPauseErr(null);
+    const res = pauseModal.mode === "pause"
+      ? await pauseAmc(id, reason, me.id)
+      : await resumeAmc(id, me.id);
+    setPauseBusy(false);
+    if (!res.ok) { setPauseErr(res.error); return; }
+    fireToast(pauseModal.mode === "pause"
+      ? `${c.code} paused`
+      : `${c.code} resumed`);
+    bumpData();
+    setHistoryTick(t => t + 1);
+    setPauseModal({ open: false, mode: pauseModal.mode });
+  };
+
+  // Pause-warning / payment-status copy.
+  //
+  // The yellow/neutral payment banners must NEVER show on a paid
+  // contract — first_payment_due_at stays populated as historical
+  // metadata even after recordAmcPayment flips the status to 'active'.
+  // We use contract_status === 'pending_payment' as the "not yet paid"
+  // signal: the 0027 payment trigger flips pending_payment → active
+  // atomically with the payment INSERT, so this status is a reliable
+  // proxy for "no payment_received_at yet" without needing to thread
+  // payment_received_at all the way through types + hydrate. The red
+  // "paused" banner is gated separately on isPaused below.
+  //
+  // `daysToPause` is positive when the cliff is upcoming, zero on
+  // cliff day, negative when the cliff has passed without an
+  // autoPause sweep having caught it yet.
+  const daysToPause = !isPaused && c.contract_status === "pending_payment"
+    ? calculateDaysUntilPause(c)
+    : null;
+  // Yellow (warning): cliff approaching within 10 days OR already past
+  // but auto-pause hasn't run yet.
+  const showPauseWarning = daysToPause !== null && daysToPause <= 10;
+  // Neutral (info): cliff is more than 10 days away — payment due but
+  // no pressure yet.
+  const showPaymentDueInfo = daysToPause !== null && daysToPause > 10 && !!c.firstPaymentDueAt;
+
   return (
     <div className="main-pad">
       <div style={{ marginBottom: 16 }}>
@@ -366,7 +547,10 @@ export function AmcDetail({ id }: { id: string }) {
         sub={[site?.name, site?.area].filter(Boolean).join(" · ") || "-"}
         right={
           <div className="row gap-2" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
-            {(c.contract_status === "pending_payment" || c.contract_status === "suspended") && (
+            {/* Record Payment — gated behind canRecordPay so technicians
+                (lead_worker/worker/driver) never see a CTA they can't
+                actually use. DB-side amc_pay_write enforces it too. */}
+            {canRecordPay && (c.contract_status === "pending_payment" || c.contract_status === "suspended") && (
               <button className="btn btn-primary" onClick={() => openCreate("amc_payment", {
                 amc_id: id, code: c.code, value_aed: c.value,
                 was_suspended: c.contract_status === "suspended",
@@ -375,20 +559,146 @@ export function AmcDetail({ id }: { id: string }) {
                 {c.contract_status === "suspended" ? " Record Payment & Reactivate" : " Record Payment"}
               </button>
             )}
-            {c.contract_status === "suspended" && (
-              <button className="btn btn-ghost" onClick={() => setModal({ kind: "reactivation", data: { id } })}>
-                <Icon name="refresh" size={14} /> Reactivate
+            {/* Legacy "Reactivate" button removed for paused contracts —
+                md/admin/manager use the new "Resume AMC" button below
+                (calls resumeAmc directly), and accounts users use the
+                "Record Payment & Reactivate" button above (the payment
+                trigger fn_amc_payment_received auto-resumes). The
+                ReactivationModal that this button opened is still
+                accessible from the AmcList banner. */}
+            {canPauseResume && !isPaused && c.contract_status !== "expired" && c.contract_status !== "cancelled" && c.contract_status !== "renewed" && (
+              <button className="btn btn-ghost"
+                onClick={() => { setPauseErr(null); setPauseModal({ open: true, mode: "pause" }); }}>
+                <Icon name="pause" size={14} /> Pause AMC
               </button>
             )}
-            <ChoicePill<AmcStatus>
-              ariaLabel="AMC contract status"
-              value={c.contract_status}
-              options={statusOptions}
-              onChange={onChangeStatus}
-            />
+            {canPauseResume && isPaused && (
+              <button className="btn btn-ghost"
+                onClick={() => { setPauseErr(null); setPauseModal({ open: true, mode: "resume" }); }}>
+                <Icon name="play" size={14} /> Resume AMC
+              </button>
+            )}
+            {canPauseResume && renewEligible && !renewedToContract && (
+              <button className="btn btn-primary"
+                onClick={() => setRenewOpen(true)}>
+                <Icon name="refresh" size={14} /> Renew Contract
+              </button>
+            )}
+            {/* Status pill: editable for md/admin/manager; read-only
+                StatusBadge for everyone else (technicians, accounts,
+                sales). Aligns with amc_write RLS gate. */}
+            {canEditStatus ? (
+              <ChoicePill<AmcStatus>
+                ariaLabel="AMC contract status"
+                value={c.contract_status}
+                options={statusOptions}
+                onChange={onChangeStatus}
+              />
+            ) : (
+              <StatusBadge state={c.contract_status} />
+            )}
           </div>
         }
       />
+
+      {/* Pause-reason / resume-note modal (migration 0021) */}
+      <PauseReasonModal
+        open={pauseModal.open}
+        mode={pauseModal.mode}
+        busy={pauseBusy}
+        err={pauseErr}
+        onClose={() => { if (!pauseBusy) setPauseModal({ open: false, mode: pauseModal.mode }); }}
+        onConfirm={onConfirmPauseOrResume} />
+
+      {/* Renew-contract modal */}
+      <RenewAmcModal
+        previous={c}
+        open={renewOpen}
+        onClose={() => setRenewOpen(false)}
+        onRenewed={(newId) => { setRenewOpen(false); openAmc(newId); }} />
+
+      {/* Paused banner — surfaces the reason inline since the existing
+          ReactivationBanner lives on AmcList, not here. Specialises the
+          headline + adds a "record payment to resume" hint when the
+          reason is the 0027 'Payment overdue' auto-pause. */}
+      {isPaused && c.suspendedReason && (
+        <div className="card card-pad" style={{
+          marginBottom: 16,
+          background: "var(--dan-50)",
+          borderColor: "var(--dan-100)",
+        }}>
+          <div className="row gap-2" style={{ alignItems: "flex-start" }}>
+            <Icon name="pause" size={16} style={{ color: "var(--dan-700)", marginTop: 2, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ font: "var(--t-body-md)", color: "var(--dan-700)", fontWeight: 600 }}>
+                {c.suspendedReason === "Payment overdue"
+                  ? "Paused due to overdue payment"
+                  : "Contract is paused"}
+              </div>
+              <div style={{ font: "var(--t-small)", color: "var(--ink)", marginTop: 4 }}>
+                {c.suspendedReason === "Payment overdue"
+                  ? "Record payment to resume."
+                  : c.suspendedReason}
+              </div>
+              {c.suspendedAt && (
+                <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginTop: 4 }}>
+                  Paused {formatPauseAgo(c.suspendedAt)}
+                  {c.pausedBy ? ` · by ${db.user(c.pausedBy)?.name ?? "Unknown"}` : " · auto"}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Warning banner — payment overdue or about to auto-pause.
+          Handles three cases:
+            • daysToPause > 0 (cliff upcoming): "auto-pause in N days"
+            • daysToPause === 0: "auto-pause today"
+            • daysToPause < 0  (past due, sweep hasn't run): "overdue,
+              record to avoid suspension". This is the 0027 spec copy. */}
+      {showPauseWarning && (
+        <div className="card card-pad" style={{
+          marginBottom: 16,
+          background: "var(--warn-100)",
+          borderColor: "var(--warn-100)",
+        }}>
+          <div className="row gap-2" style={{ alignItems: "center" }}>
+            <Icon name="alertTriangle" size={16} style={{ color: "var(--warn-700)" }} />
+            <div style={{ font: "var(--t-body-md)", color: "var(--warn-700)" }}>
+              {daysToPause! < 0
+                ? "Payment overdue — record payment to avoid suspension."
+                : daysToPause === 0
+                ? "First payment overdue — contract will auto-pause today."
+                : `First payment due in ${daysToPause} day${daysToPause === 1 ? "" : "s"} — record payment to avoid suspension.`}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Neutral info banner — first payment due, plenty of runway.
+          Shows for pending_payment contracts when the cliff is >10 days
+          out. Stops surprising the user with no signal at all between
+          contract-signing and the 10-day warning window. */}
+      {showPaymentDueInfo && c.firstPaymentDueAt && (
+        <div className="card card-pad" style={{
+          marginBottom: 16,
+          background: "var(--bg-muted)",
+          borderColor: "var(--border)",
+        }}>
+          <div className="row gap-2" style={{ alignItems: "center" }}>
+            <Icon name="clock" size={16} style={{ color: "var(--ink-mute)" }} />
+            <div style={{ font: "var(--t-body-md)", color: "var(--ink)" }}>
+              First payment due {formatRelativeDate(c.firstPaymentDueAt.slice(0, 10))}
+              {daysToPause !== null && daysToPause > 0 && (
+                <span style={{ color: "var(--ink-mute)", marginLeft: 6 }}>
+                  · {daysToPause} day{daysToPause === 1 ? "" : "s"} remaining
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI label="Annual value" value={fmtMoney(c.value, { compact: true })} />
@@ -424,6 +734,26 @@ export function AmcDetail({ id }: { id: string }) {
             <MetaRow k="Value" v={fmtMoney(c.value)} />
             <MetaRow k="Expires" v={c.expiresAt} />
             <MetaRow k="Status" v={<StatusBadge state={c.contract_status} />} />
+            {renewedFromContract && (
+              <MetaRow
+                k="Renewed from"
+                v={renewedFromContract.code}
+                sub={db.cust(renewedFromContract.customer)?.name ?? undefined}
+                onClick={() => openAmc(renewedFromContract.id)} />
+            )}
+            {renewedToContract && (
+              <MetaRow
+                k="Renewed to"
+                v={renewedToContract.code}
+                sub={db.cust(renewedToContract.customer)?.name ?? undefined}
+                onClick={() => openAmc(renewedToContract.id)} />
+            )}
+            {c.firstPaymentDueAt && c.contract_status === "active" && (
+              <MetaRow k="First payment due" v={c.firstPaymentDueAt.slice(0, 10)}
+                sub={daysToPause !== null
+                  ? (daysToPause >= 0 ? `${daysToPause} day${daysToPause === 1 ? "" : "s"} until auto-pause` : `${-daysToPause} day${daysToPause === -1 ? "" : "s"} overdue`)
+                  : undefined} />
+            )}
           </div>
         </section>
       </div>
@@ -651,7 +981,7 @@ function ScheduleEntry({
 function formatScheduleDate(dateOnly: string): string {
   const d = new Date(dateOnly.slice(0, 10));
   if (Number.isNaN(d.getTime())) return dateOnly;
-  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  return formatLongDate(d);
 }
 
 /* ─── Activation details (post-payment summary) ──────────
@@ -826,12 +1156,25 @@ function formatRelativeDate(dateOnly: string): string {
   if (Number.isNaN(d.getTime())) return dateOnly;
   const today = new Date(new Date().toISOString().slice(0, 10));
   const days = Math.round((d.getTime() - today.getTime()) / 86_400_000);
-  const display = d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  const display = formatLongDate(d);
   if (days === 0) return `${display} (today)`;
   if (days === 1) return `${display} (tomorrow)`;
   if (days === -1) return `${display} (yesterday)`;
   if (days > 0) return `${display} (in ${days} days)`;
   return `${display} (${-days} days ago)`;
+}
+
+// Format a pause timestamp as a relative phrase: "today", "yesterday",
+// "3 days ago", or the absolute date for older entries.
+function formatPauseAgo(iso: string): string {
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return iso;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const days = Math.floor((today.getTime() - t) / 86_400_000);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 14) return `${days} days ago`;
+  return formatLongDate(new Date(iso));
 }
 
 /* ─── AMC status history ─────────────────────────────────
@@ -934,8 +1277,5 @@ function AmcHistoryEntry({ row }: { row: AmcHistoryRow }) {
 function formatHistoryDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
-  });
+  return formatLongDateTime(d);
 }

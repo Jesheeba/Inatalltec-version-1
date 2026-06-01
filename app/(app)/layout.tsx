@@ -36,17 +36,29 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   const V6_COLS = "id, full_name, email, phone, initials, tint, role, manager_id, team_id, region, organization_id, is_active";
   const PRE_COLS = "id, full_name, email, phone, initials, tint, role, manager_id, team_id, region, is_active";
 
+  // SPEED OPTIMIZATION (Bug 4): the three independent reads below — the
+  // signed-in user's row, the users list, and the hydration bundle —
+  // were previously chained `await` calls. They have no dependencies on
+  // each other once we have authUser.id, so fanning them out cuts the
+  // layout's blocking I/O time from ~3× round-trip to a single round-
+  // trip. Hydrate itself was already parallel inside Promise.all; this
+  // wraps the outer layer too.
+  const [singleRes, listRes, bundle] = await Promise.all([
+    admin.from("users").select(V6_COLS).eq("auth_id", authUser.id).maybeSingle(),
+    admin.from("users").select(V6_COLS).eq("is_active", true),
+    hydrateAll(admin),
+  ]);
+
   let row: Record<string, unknown> | null = null;
   let error: { message?: string; code?: string } | null = null;
 
-  const first = await admin.from("users").select(V6_COLS).eq("auth_id", authUser.id).maybeSingle();
-  if (first.error && /organization_id/i.test(first.error.message)) {
+  if (singleRes.error && /organization_id/i.test(singleRes.error.message)) {
     const fallback = await admin.from("users").select(PRE_COLS).eq("auth_id", authUser.id).maybeSingle();
     row = fallback.data as Record<string, unknown> | null;
     error = fallback.error;
   } else {
-    row = first.data as Record<string, unknown> | null;
-    error = first.error;
+    row = singleRes.data as Record<string, unknown> | null;
+    error = singleRes.error;
   }
 
   // Auth user exists but has no profile in the users table - surface this
@@ -93,11 +105,9 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     organization_id: (row.organization_id as string | undefined) ?? undefined,
   };
 
-  // Fetch every active user so the in-memory db.USERS used by list views
-  // survives a page reload. Soft-deleted users (is_active=false) are excluded
-  // so they don't reappear after deletion. Schema-tolerant in the same way as
-  // the single-row fetch above.
-  const listRes = await admin.from("users").select(V6_COLS).eq("is_active", true);
+  // Active-users list was fetched in the Promise.all above; only the
+  // schema-tolerance fallback runs sequentially (and only when the V6
+  // select hit a missing column).
   const list = listRes.error && /organization_id/i.test(listRes.error.message)
     ? await admin.from("users").select(PRE_COLS).eq("is_active", true)
     : listRes;
@@ -122,11 +132,10 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     };
   });
 
-  // Hydrate every list view's source-of-truth from Supabase in a single
-  // parallel fan-out. This replaces the previous mock-data fallback -
-  // db.PROJECTS / db.CUSTOMERS / db.AMCS / etc. are populated from real
-  // rows on every page load, so creates persist visibly across refreshes.
-  const bundle = await hydrateAll(admin);
+  // hydrateAll already ran in the top-level Promise.all above — the
+  // bundle is populated by the time we reach here. db.PROJECTS /
+  // db.CUSTOMERS / db.AMCS / etc. are populated from real rows on every
+  // page load, so creates persist visibly across refreshes.
 
   return (
     <>

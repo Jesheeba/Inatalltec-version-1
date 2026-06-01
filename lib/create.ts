@@ -23,9 +23,10 @@
 import { supabaseBrowser } from "./supabase/client";
 import { db } from "./db";
 import type {
-  AmcContract, AmcStatus, Approval, Customer, Organization, Project, RepairTicket,
+  AmcContract, AmcStatus, Approval, Customer, Organization, Project, ProjectPhase, RepairTicket,
   ReplacementContext, ReplacementRequest, ReplacementStatus,
-  Role, Site, Tint, User, WorkOrder, WoStatus, WoType,
+  Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
+  WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType,
 } from "./types";
 
 // Returns null when Supabase is configured, otherwise a Result-shaped
@@ -574,6 +575,9 @@ export interface ProjectInput {
   scope_description?: string;
   job_category?: JobCategory;
   contract_meta?: ContractMeta;
+  // Execution phase (migration 0020). Optional — DB default is
+  // 'design' so omitting it auto-starts new projects there.
+  current_phase?: ProjectPhase;
 }
 export async function createProject(input: ProjectInput): Promise<Result> {
   if (!input.name?.trim()) return { ok: false, error: "Project name is required." };
@@ -595,6 +599,7 @@ export async function createProject(input: ProjectInput): Promise<Result> {
     leadTechId: input.lead_tech_id || "",
     status,
     stage,
+    currentPhase: input.current_phase ?? "design",
     progress: 0,
     value: input.value_aed,
     startedAt: input.started_at,
@@ -618,6 +623,10 @@ export async function createProject(input: ProjectInput): Promise<Result> {
     lead_tech_id: input.lead_tech_id || null,
     status,
     stage,
+    // Send current_phase only when the form explicitly picked one.
+    // Omitting lets the projects.current_phase DEFAULT 'design' apply
+    // server-side (migration 0020:2b) so we never write a stale value.
+    ...(input.current_phase ? { current_phase: input.current_phase } : {}),
     progress: 0,
     value_aed: input.value_aed,
     started_at: input.started_at,
@@ -668,7 +677,7 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
 
   const { data, error } = await supabaseBrowser()
     .from("projects").update(body).eq("id", id)
-    .select("id, code, name, customer_id, site_id, manager_id, team_id, lead_tech_id, status, stage, progress, value_aed, started_at, due_at")
+    .select("id, code, name, customer_id, site_id, manager_id, team_id, lead_tech_id, status, stage, current_phase, progress, value_aed, started_at, due_at")
     .single();
   if (error) return { ok: false, error: error.message };
 
@@ -684,6 +693,7 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
     leadTechId: (data.lead_tech_id as string) ?? "",
     status: data.status as string,
     stage: data.stage as string,
+    currentPhase: (data.current_phase as ProjectPhase | null) ?? null,
     progress: (data.progress as number) ?? 0,
     value: (data.value_aed as number) ?? 0,
     startedAt: (data.started_at as string) ?? "",
@@ -692,6 +702,74 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
   };
   db.PROJECTS[id] = next;
   return { ok: true, project: next };
+}
+
+// ─────────────────────────────────────────────────────────
+// PROJECT PHASE — manual advancement (migration 0020).
+//
+// Updates projects.current_phase, which fires trg_project_phase_change
+// (SECURITY DEFINER) to insert a project_phase_history row capturing
+// from_phase, to_phase, changed_by. If a note is provided, the app
+// follows up by patching the most recent history row with the note —
+// the trigger can't carry the note because it's not a column on
+// projects, only on the history table.
+//
+// Permissions: RLS (projects_write + pph_write) already restricts to
+// md/admin/manager. The UI also hides the button via canChangeProjectPhase.
+//
+// Optimistic mirror: caller is expected to bumpData() after success.
+// ─────────────────────────────────────────────────────────
+export async function advanceProjectPhase(
+  projectId: string,
+  newPhase: ProjectPhase,
+  note?: string,
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  const supa = supabaseBrowser();
+
+  // 1) Update the column. Trigger logs from/to automatically.
+  const { error: updateErr } = await supa
+    .from("projects")
+    .update({ current_phase: newPhase })
+    .eq("id", projectId);
+  if (updateErr) return { ok: false, error: updateErr.message };
+
+  // 2) Attach the note to the just-created history row, if provided.
+  //    Two-step rather than RPC: keeps the migration surface small and
+  //    note-attachment failures are non-fatal (the phase change itself
+  //    has already succeeded and been audited).
+  const trimmedNote = note?.trim();
+  if (trimmedNote) {
+    const { data: latest } = await supa
+      .from("project_phase_history")
+      .select("id")
+      .eq("project_id", projectId)
+      .order("changed_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (latest?.id) {
+      const { error: noteErr } = await supa
+        .from("project_phase_history")
+        .update({ note: trimmedNote })
+        .eq("id", latest.id);
+      if (noteErr) {
+        // Phase advance already succeeded; surface the note failure as
+        // a soft warning so the caller can toast it without rolling
+        // back the (already-committed) phase change.
+        // eslint-disable-next-line no-console
+        console.warn("[advanceProjectPhase] note save failed:", noteErr.message);
+      }
+    }
+  }
+
+  // 3) Mirror in memory so list views update without a refetch.
+  const existing = db.PROJECTS[projectId];
+  if (existing) db.PROJECTS[projectId] = { ...existing, currentPhase: newPhase };
+
+  return { ok: true, id: projectId };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -712,24 +790,14 @@ export async function createAmc(input: AmcInput): Promise<Result> {
   if (!input.expires_at) return { ok: false, error: "Expiry date is required." };
 
   const code = input.code?.trim() || `AMC-${Math.floor(Math.random() * 900 + 100)}`;
-  const id = shortId("amc");
-  // Per AMC engine spec (migration 0009): new contracts start as 'draft' and
-  // move to 'pending_payment' when signed, then auto-activate when payment
-  // arrives (fn_amc_payment_received trigger).
-  const row: AmcContract = {
-    id, code,
-    customer: input.customer_id,
-    site: input.site_id || "",
-    manager: input.manager_id || "",
-    leadTechId: input.lead_tech_id || "",
-    contract_status: "draft",
-    value: input.value_aed,
-    services: { done: 0, total: 4 },
-    nextDue: "-",
-    overdueDays: 0,
-    freeCalls: 0,
-    expiresAt: input.expires_at,
-  };
+
+  // Post-0027 flow: amc_contracts.signed_at defaults to current_date,
+  // the BEFORE INSERT trigger populates first_payment_due_at, and the
+  // AFTER INSERT trigger trg_amc_seed_first_service seeds service 1
+  // anchored on signed_at. Services 2..N are created later when payment
+  // is recorded (fn_amc_payment_received). We therefore insert with
+  // initial status 'pending_payment' (signed, waiting for payment).
+  // contract_status flips to 'active' on the payment trigger.
 
   const guard = ensureSupabase();
   if (guard) return guard;
@@ -739,12 +807,37 @@ export async function createAmc(input: AmcInput): Promise<Result> {
     site_id: input.site_id || null,
     manager_id: input.manager_id || null,
     lead_tech_id: input.lead_tech_id || null,
-    contract_status: "draft",
+    contract_status: "pending_payment",
     value_aed: input.value_aed,
     expires_at: input.expires_at,
-  }).select("id").single();
+  })
+  .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+  .single();
   if (error) return { ok: false, error: error.message };
-  row.id = data.id;
+
+  const newId = data.id as string;
+  // Mirror the DB-populated row (signed_at default + triggers ran already).
+  const row: AmcContract = {
+    id:                newId,
+    code:              (data.code as string) ?? code,
+    customer:          (data.customer_id as string) ?? input.customer_id,
+    site:              (data.site_id as string) ?? (input.site_id || ""),
+    manager:           (data.manager_id as string) ?? (input.manager_id || ""),
+    leadTechId:        (data.lead_tech_id as string) ?? (input.lead_tech_id || ""),
+    contract_status:   (data.contract_status as AmcStatus) ?? "pending_payment",
+    value:             (data.value_aed as number) ?? input.value_aed,
+    services:          { done: 0, total: 4 },
+    nextDue:           (data.next_due_label as string) ?? "-",
+    overdueDays:       (data.overdue_days as number) ?? 0,
+    freeCalls:         (data.free_calls_used as number) ?? 0,
+    expiresAt:         (data.expires_at as string) ?? input.expires_at,
+    suspendedAt:       (data.suspended_at as string | null) ?? null,
+    suspendedReason:   (data.suspended_reason as string | null) ?? null,
+    pausedBy:          (data.paused_by as string | null) ?? null,
+    resumedAt:         (data.resumed_at as string | null) ?? null,
+    firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? null,
+    renewedFromId:     (data.renewed_from_id as string | null) ?? null,
+  };
 
   db.AMCS[row.id] = row;
   return { ok: true, id: row.id };
@@ -760,11 +853,15 @@ export async function createAmc(input: AmcInput): Promise<Result> {
 export const AMC_STATUSES = [
   "draft", "pending_payment", "active", "suspended", "expired", "cancelled", "renewed",
 ] as const;
+// Display labels for the DB enum. 'suspended' renders as "Paused" per
+// the AMC pause spec (migration 0021) — the boss says "pause" in the
+// business, the engine still keys off the existing 'suspended' value
+// so the fn_amc_payment_received auto-resume trigger keeps working.
 export const AMC_STATUS_LABEL: Record<AmcStatus, string> = {
   draft:           "Draft",
   pending_payment: "Pending Payment",
   active:          "Active",
-  suspended:       "Suspended",
+  suspended:       "Paused",
   expired:         "Expired",
   cancelled:       "Cancelled",
   renewed:         "Renewed",
@@ -805,25 +902,31 @@ export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true
 
   const { data, error } = await supabaseBrowser()
     .from("amc_contracts").update(body).eq("id", id)
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
     .single();
   if (error) return { ok: false, error: error.message };
 
   const current = db.AMCS[id];
   const next: AmcContract = {
-    id:              data.id as string,
-    code:            data.code as string,
-    customer:        (data.customer_id as string) ?? current?.customer ?? "",
-    site:            (data.site_id as string) ?? current?.site ?? "",
-    manager:         (data.manager_id as string) ?? "",
-    leadTechId:      (data.lead_tech_id as string) ?? "",
-    contract_status: data.contract_status as AmcStatus,
-    value:           (data.value_aed as number) ?? 0,
-    services:        current?.services ?? { done: 0, total: 4 },
-    nextDue:         (data.next_due_label as string) ?? "-",
-    overdueDays:     (data.overdue_days as number) ?? 0,
-    freeCalls:       (data.free_calls_used as number) ?? 0,
-    expiresAt:       (data.expires_at as string) ?? "",
+    id:                data.id as string,
+    code:              data.code as string,
+    customer:          (data.customer_id as string) ?? current?.customer ?? "",
+    site:              (data.site_id as string) ?? current?.site ?? "",
+    manager:           (data.manager_id as string) ?? "",
+    leadTechId:        (data.lead_tech_id as string) ?? "",
+    contract_status:   data.contract_status as AmcStatus,
+    value:             (data.value_aed as number) ?? 0,
+    services:          current?.services ?? { done: 0, total: 4 },
+    nextDue:           (data.next_due_label as string) ?? "-",
+    overdueDays:       (data.overdue_days as number) ?? 0,
+    freeCalls:         (data.free_calls_used as number) ?? 0,
+    expiresAt:         (data.expires_at as string) ?? "",
+    suspendedAt:       (data.suspended_at as string | null) ?? null,
+    suspendedReason:   (data.suspended_reason as string | null) ?? null,
+    pausedBy:          (data.paused_by as string | null) ?? null,
+    resumedAt:         (data.resumed_at as string | null) ?? null,
+    firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? null,
+    renewedFromId:     (data.renewed_from_id as string | null) ?? null,
   };
   db.AMCS[id] = next;
   return { ok: true, amc: next };
@@ -905,9 +1008,11 @@ export async function recordAmcPayment(
 
   // 2. Re-fetch the parent contract — the trigger already updated it, but the
   //    INSERT response doesn't include those columns. Single round-trip is fine.
+  //    Pulls the migration-0021 fields too so the mirrored row stays correct
+  //    when the payment trigger auto-resumes a paused contract.
   const { data: amcRow, error: amcErr } = await supa
     .from("amc_contracts")
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
     .eq("id", amcId)
     .single();
   if (amcErr || !amcRow) {
@@ -918,23 +1023,296 @@ export async function recordAmcPayment(
 
   const current = db.AMCS[amcId];
   const updated: AmcContract = {
-    id:              amcRow.id as string,
-    code:            amcRow.code as string,
-    customer:        (amcRow.customer_id as string) ?? current?.customer ?? "",
-    site:            (amcRow.site_id as string) ?? current?.site ?? "",
-    manager:         (amcRow.manager_id as string) ?? "",
-    leadTechId:      (amcRow.lead_tech_id as string) ?? "",
-    contract_status: amcRow.contract_status as AmcContract["contract_status"],
-    value:           (amcRow.value_aed as number) ?? 0,
-    services:        current?.services ?? { done: 0, total: 4 },
-    nextDue:         (amcRow.next_due_label as string) ?? "-",
-    overdueDays:     (amcRow.overdue_days as number) ?? 0,
-    freeCalls:       (amcRow.free_calls_used as number) ?? 0,
-    expiresAt:       (amcRow.expires_at as string) ?? "",
+    id:                amcRow.id as string,
+    code:              amcRow.code as string,
+    customer:          (amcRow.customer_id as string) ?? current?.customer ?? "",
+    site:              (amcRow.site_id as string) ?? current?.site ?? "",
+    manager:           (amcRow.manager_id as string) ?? "",
+    leadTechId:        (amcRow.lead_tech_id as string) ?? "",
+    contract_status:   amcRow.contract_status as AmcContract["contract_status"],
+    value:             (amcRow.value_aed as number) ?? 0,
+    services:          current?.services ?? { done: 0, total: 4 },
+    nextDue:           (amcRow.next_due_label as string) ?? "-",
+    overdueDays:       (amcRow.overdue_days as number) ?? 0,
+    freeCalls:         (amcRow.free_calls_used as number) ?? 0,
+    expiresAt:         (amcRow.expires_at as string) ?? "",
+    suspendedAt:       (amcRow.suspended_at as string | null) ?? null,
+    suspendedReason:   (amcRow.suspended_reason as string | null) ?? null,
+    pausedBy:          (amcRow.paused_by as string | null) ?? null,
+    resumedAt:         (amcRow.resumed_at as string | null) ?? null,
+    firstPaymentDueAt: (amcRow.first_payment_due_at as string | null) ?? null,
+    renewedFromId:     (amcRow.renewed_from_id as string | null) ?? null,
   };
   db.AMCS[amcId] = updated;
 
   return { ok: true, payment_id: insertRow.id as string, amc_updated: updated };
+}
+
+// ─────────────────────────────────────────────────────────
+// AMC PAUSE / RESUME / RENEWAL (migration 0021)
+// ─────────────────────────────────────────────────────────
+//
+// All three helpers ride on top of the existing AMC engine — they
+// write to columns that already exist (suspended_at, suspended_reason)
+// plus the new pause-audit columns added in 0021 (paused_by,
+// resumed_at). The existing fn_amc_payment_received trigger handles
+// auto-resume on payment, so no special "resume on payment" path
+// here.
+//
+// Auto-pause: autoPauseExpiredAmcs() calls the SQL helper
+// fn_check_amc_pause_eligibility() to find AMCs past their
+// first_payment_due_at without a payment, then UPDATEs them to
+// suspended in one batch. Called from the dashboard mount.
+//
+// Renewal: renewAmc() inserts a fresh amc_contracts row with the
+// renewed_from_id pointer set. The BEFORE INSERT trigger
+// trg_amc_set_first_payment_due_at populates first_payment_due_at
+// from signed_at + grace days, so the new contract starts a fresh
+// 30-day pause window automatically.
+// ─────────────────────────────────────────────────────────
+
+const AUTO_PAUSE_REASON = "Payment overdue (auto)";
+
+/**
+ * Pause an AMC contract manually. Writes to suspended_at/_reason (the
+ * existing pause columns the payment trigger reads) plus paused_by
+ * (new in 0021). Status flips to 'suspended' which renders as "Paused".
+ *
+ * Resume happens automatically when an amc_payments row is inserted
+ * for this contract; the existing fn_amc_payment_received trigger
+ * flips status back to 'active' and clears suspended_at/_reason.
+ * Manual resume via resumeAmc() works the same way (without payment).
+ */
+export async function pauseAmc(
+  amcId: string,
+  reason: string,
+  byUserId: string | null,
+): Promise<{ ok: true; amc: AmcContract } | { ok: false; error: string }> {
+  if (!amcId) return { ok: false, error: "AMC id is required." };
+  if (!reason?.trim()) return { ok: false, error: "Pause reason is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  return updateAmcWithExtras(amcId, {
+    contract_status: "suspended",
+    suspended_at:    new Date().toISOString(),
+    suspended_reason: reason.trim(),
+    paused_by:       byUserId,
+  });
+}
+
+/**
+ * Resume a paused AMC manually. Sets resumed_at, clears suspended_at /
+ * suspended_reason, flips status back to 'active'. The existing
+ * trg_amc_status_change trigger audits the flip automatically.
+ *
+ * Note: paused_by is intentionally NOT cleared so the audit trail of
+ * who paused remains visible alongside who resumed (resumed_by would
+ * be a follow-up if needed — out of 0021 scope).
+ */
+export async function resumeAmc(
+  amcId: string,
+  _byUserId: string | null,
+): Promise<{ ok: true; amc: AmcContract } | { ok: false; error: string }> {
+  if (!amcId) return { ok: false, error: "AMC id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  void _byUserId; // reserved for resumed_by in a future migration
+
+  return updateAmcWithExtras(amcId, {
+    contract_status:  "active",
+    suspended_at:     null,
+    suspended_reason: null,
+    resumed_at:       new Date().toISOString(),
+  });
+}
+
+/**
+ * Calls fn_check_amc_pause_eligibility() to find AMCs that should be
+ * auto-paused (signed > grace_days ago, no payment, still active) and
+ * batch-flips them to suspended. Returns the count flipped so the
+ * caller can toast or just log silently.
+ *
+ * The UPDATE is gated by amc_write RLS (md/admin/manager), so this
+ * silently no-ops for other roles — by design. Callers can check
+ * upfront whether to even attempt the sweep.
+ *
+ * paused_by is left NULL so the UI can distinguish auto vs. manual
+ * pauses (PhaseTracker-style logic: NULL = system, set = user).
+ */
+export async function autoPauseExpiredAmcs(): Promise<{ ok: true; paused: number } | { ok: false; error: string }> {
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  const supa = supabaseBrowser();
+  const { data: eligible, error: rpcErr } = await supa.rpc("fn_check_amc_pause_eligibility");
+  if (rpcErr) return { ok: false, error: rpcErr.message };
+  const rows = (eligible ?? []) as Array<{ id: string }>;
+  if (rows.length === 0) return { ok: true, paused: 0 };
+
+  const ids = rows.map(r => r.id);
+  const { error: updErr } = await supa
+    .from("amc_contracts")
+    .update({
+      contract_status:  "suspended",
+      suspended_at:     new Date().toISOString(),
+      suspended_reason: AUTO_PAUSE_REASON,
+      paused_by:        null,
+    })
+    .in("id", ids);
+  if (updErr) return { ok: false, error: updErr.message };
+
+  // Mirror in memory so the dashboard re-renders without a refetch.
+  // Each row keeps its existing fields; only the pause-related ones flip.
+  const nowIso = new Date().toISOString();
+  for (const id of ids) {
+    const cur = db.AMCS[id];
+    if (cur) {
+      db.AMCS[id] = {
+        ...cur,
+        contract_status: "suspended",
+        suspendedAt:     nowIso,
+        suspendedReason: AUTO_PAUSE_REASON,
+        pausedBy:        null,
+      };
+    }
+  }
+
+  return { ok: true, paused: ids.length };
+}
+
+/**
+ * Days remaining until first_payment_due_at — positive = still in
+ * grace window, negative = overdue, null = no due date set yet.
+ * Used by AmcPauseAlert to render "Pauses in X days" copy.
+ */
+export function calculateDaysUntilPause(amc: AmcContract): number | null {
+  if (!amc.firstPaymentDueAt) return null;
+  const due = new Date(amc.firstPaymentDueAt).getTime();
+  if (Number.isNaN(due)) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.round((due - today.getTime()) / 86_400_000);
+}
+
+/**
+ * Renew an AMC. Creates a fresh amc_contracts row pointing at the
+ * previous one via renewed_from_id. Inherits the previous customer,
+ * site, lead tech, manager, and value unless the caller overrides.
+ *
+ * The new row's first_payment_due_at is populated server-side by
+ * trg_amc_set_first_payment_due_at (BEFORE INSERT) from the supplied
+ * signed_at — caller doesn't need to compute it.
+ *
+ * Note: this does NOT change the previous contract's status. The UI
+ * shows the chain link on both sides; if the boss wants the old
+ * contract to flip to 'renewed' automatically, a small UPDATE here
+ * would do it. Holding for now since the spec doesn't call for it.
+ */
+export interface AmcRenewalInput {
+  code?: string;             // new contract code (auto-generated if omitted)
+  value_aed: number;
+  expires_at: string;        // when the renewal expires
+  signed_at?: string;        // signing date — defaults to today
+  manager_id?: string | null;
+  lead_tech_id?: string | null;
+}
+export async function renewAmc(
+  previousAmcId: string,
+  input: AmcRenewalInput,
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  if (!previousAmcId) return { ok: false, error: "Previous AMC id is required." };
+  if (!input.value_aed) return { ok: false, error: "Annual value is required." };
+  if (!input.expires_at) return { ok: false, error: "Expiry date is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  const prev = db.AMCS[previousAmcId];
+  if (!prev) return { ok: false, error: "Previous AMC not found in local mirror." };
+
+  const supa = supabaseBrowser();
+  const code = input.code?.trim() || `AMC-${Math.floor(Math.random() * 900 + 100)}`;
+  const signedAt = input.signed_at || new Date().toISOString().slice(0, 10);
+
+  const { data, error } = await supa.from("amc_contracts").insert({
+    code,
+    customer_id:     prev.customer,
+    site_id:         prev.site || null,
+    manager_id:      input.manager_id !== undefined ? input.manager_id : (prev.manager || null),
+    lead_tech_id:    input.lead_tech_id !== undefined ? input.lead_tech_id : (prev.leadTechId || null),
+    contract_status: "draft",
+    value_aed:       input.value_aed,
+    expires_at:      input.expires_at,
+    signed_at:       signedAt,
+    renewed_from_id: previousAmcId,
+    // first_payment_due_at is populated by the BEFORE INSERT trigger
+    // (trg_amc_set_first_payment_due_at) from signed_at + grace days.
+  }).select("id").single();
+  if (error) return { ok: false, error: error.message };
+
+  const newId = data.id as string;
+  const newRow: AmcContract = {
+    id:                newId,
+    code,
+    customer:          prev.customer,
+    site:              prev.site,
+    manager:           input.manager_id !== undefined ? (input.manager_id ?? "") : prev.manager,
+    leadTechId:        input.lead_tech_id !== undefined ? (input.lead_tech_id ?? "") : prev.leadTechId,
+    contract_status:   "draft",
+    value:             input.value_aed,
+    services:          { done: 0, total: 4 },
+    nextDue:           "-",
+    overdueDays:       0,
+    freeCalls:         0,
+    expiresAt:         input.expires_at,
+    suspendedAt:       null,
+    suspendedReason:   null,
+    pausedBy:          null,
+    resumedAt:         null,
+    firstPaymentDueAt: null, // server populated; UI re-fetches next paint
+    renewedFromId:     previousAmcId,
+  };
+  db.AMCS[newId] = newRow;
+
+  return { ok: true, id: newId };
+}
+
+// Internal helper — UPDATE amc_contracts with arbitrary extra columns
+// beyond the AmcPatch contract, used by pause/resume. Splits the
+// re-fetch + mirror logic out of those callers so they stay readable.
+async function updateAmcWithExtras(
+  amcId: string,
+  body: Record<string, unknown>,
+): Promise<{ ok: true; amc: AmcContract } | { ok: false; error: string }> {
+  const supa = supabaseBrowser();
+  const { data, error } = await supa
+    .from("amc_contracts").update(body).eq("id", amcId)
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+    .single();
+  if (error) return { ok: false, error: error.message };
+  const current = db.AMCS[amcId];
+  const next: AmcContract = {
+    id:                data.id as string,
+    code:              data.code as string,
+    customer:          (data.customer_id as string) ?? current?.customer ?? "",
+    site:              (data.site_id as string) ?? current?.site ?? "",
+    manager:           (data.manager_id as string) ?? "",
+    leadTechId:        (data.lead_tech_id as string) ?? "",
+    contract_status:   data.contract_status as AmcStatus,
+    value:             (data.value_aed as number) ?? 0,
+    services:          current?.services ?? { done: 0, total: 4 },
+    nextDue:           (data.next_due_label as string) ?? "-",
+    overdueDays:       (data.overdue_days as number) ?? 0,
+    freeCalls:         (data.free_calls_used as number) ?? 0,
+    expiresAt:         (data.expires_at as string) ?? "",
+    suspendedAt:       (data.suspended_at as string | null) ?? null,
+    suspendedReason:   (data.suspended_reason as string | null) ?? null,
+    pausedBy:          (data.paused_by as string | null) ?? null,
+    resumedAt:         (data.resumed_at as string | null) ?? null,
+    firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? null,
+    renewedFromId:     (data.renewed_from_id as string | null) ?? null,
+  };
+  db.AMCS[amcId] = next;
+  return { ok: true, amc: next };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1013,6 +1391,11 @@ export async function createWorkOrder(input: WorkOrderInput): Promise<Result> {
     slaMin: null,
     elapsedMin: 0,
     materials: [],
+    // 0022 time-tracking defaults — fresh WO has never been started.
+    startedAt: null,
+    completedAt: null,
+    durationMinutes: 0,
+    actualWorkersCount: 0,
   };
 
   const guard = ensureSupabase();
@@ -1114,10 +1497,14 @@ export async function updateWorkOrder(
   }
 
   // Re-fetch so the mirror reflects what the DB stored (defaults applied,
-  // trigger-side updates visible).
+  // trigger-side updates visible). The 0022 time-tracking columns are
+  // included because they're now required on the WorkOrder type — the
+  // trigger may have updated them as a side effect of a concurrent worker
+  // session, so we always read them back rather than carrying stale prior
+  // values forward.
   const { data: refreshed, error: rErr } = await supa
     .from("work_orders")
-    .select("id, code, type, priority, title, source_kind, source_id, customer_id, site_id, scheduled_start, scheduled_end, status, assigned_lead, progress, sla_min, elapsed_min, materials, flagged")
+    .select("id, code, type, priority, title, source_kind, source_id, customer_id, site_id, scheduled_start, scheduled_end, status, assigned_lead, progress, sla_min, elapsed_min, materials, flagged, started_at, completed_at, duration_minutes, actual_workers_count")
     .eq("id", id).maybeSingle();
   if (rErr || !refreshed) return { ok: false, error: rErr?.message || "Work order disappeared after update." };
 
@@ -1149,9 +1536,261 @@ export async function updateWorkOrder(
     elapsedMin: (refreshed.elapsed_min as number) ?? 0,
     materials: Array.isArray(refreshed.materials) ? (refreshed.materials as string[]) : [],
     flagged: (refreshed.flagged as string | undefined) ?? undefined,
+    startedAt:          (refreshed.started_at   as string | null) ?? null,
+    completedAt:        (refreshed.completed_at as string | null) ?? null,
+    durationMinutes:    (refreshed.duration_minutes     as number) ?? 0,
+    actualWorkersCount: (refreshed.actual_workers_count as number) ?? 0,
   };
   db.WORK_ORDERS[next.id] = next;
   return { ok: true, wo: next };
+}
+
+// ─────────────────────────────────────────────────────────
+// WORK ORDER — time tracking (migration 0022)
+//
+// Two writes per session:
+//   startWorkOrder(woId, userId)       → INSERT row, ended_at = NULL
+//   completeWorkOrder(woId, userId, ?) → UPDATE the open row's ended_at
+//
+// Both refresh the WORK_ORDER_TIME_ENTRIES mirror AND re-read the parent
+// WO to pick up trigger-computed roll-ups (duration_minutes,
+// actual_workers_count, started_at). No app-side math — the DB owns it.
+//
+// Lead workers / managers can also call markWorkOrderDone() to close the
+// WO outright (sets work_orders.completed_at + status='done'); regular
+// workers don't have wo_write so they can only track their own time.
+// ─────────────────────────────────────────────────────────
+
+interface TimeEntryRow {
+  id: string;
+  work_order_id: string;
+  user_id: string | null;
+  started_at: string;
+  ended_at: string | null;
+  duration_minutes: number;
+  note: string | null;
+  created_at: string;
+}
+
+function rowToEntry(r: TimeEntryRow): WorkOrderTimeEntry {
+  return {
+    id:              r.id,
+    workOrderId:     r.work_order_id,
+    userId:          r.user_id,
+    startedAt:       r.started_at,
+    endedAt:         r.ended_at,
+    durationMinutes: r.duration_minutes ?? 0,
+    note:            r.note,
+    createdAt:       r.created_at,
+  };
+}
+
+/** Re-fetch the parent WO so the mirror picks up trigger-computed
+ *  roll-ups after a time-entry change. Silent no-op on failure — the
+ *  next page hydration will reconcile. */
+async function refreshWorkOrderMirror(woId: string): Promise<void> {
+  const supa = supabaseBrowser();
+  const { data, error } = await supa
+    .from("work_orders")
+    .select("id, started_at, completed_at, duration_minutes, actual_workers_count, status")
+    .eq("id", woId).maybeSingle();
+  if (error || !data) return;
+  const cur = db.WORK_ORDERS[woId];
+  if (!cur) return;
+  db.WORK_ORDERS[woId] = {
+    ...cur,
+    status:             ((data.status as WoStatus) ?? cur.status),
+    startedAt:          (data.started_at          as string | null) ?? cur.startedAt,
+    completedAt:        (data.completed_at        as string | null) ?? cur.completedAt,
+    durationMinutes:    (data.duration_minutes    as number) ?? cur.durationMinutes,
+    actualWorkersCount: (data.actual_workers_count as number) ?? cur.actualWorkersCount,
+  };
+}
+
+/**
+ * Worker clicks "Start Work". Inserts an open time entry; the
+ * woe_uniq_open partial index in 0022 blocks a second concurrent
+ * insert, so a stray double-click returns an error we treat as a
+ * no-op (we just return the existing open entry).
+ *
+ * Best-effort wo.status='in_progress' bump: succeeds for
+ * md/admin/manager/lead_worker via wo_write; fails silently for
+ * regular workers (RLS rejects) — which is the intended design.
+ * The lead can flip status separately.
+ */
+export async function startWorkOrder(
+  woId: string,
+  userId: string,
+): Promise<{ ok: true; entry: WorkOrderTimeEntry } | { ok: false; error: string }> {
+  if (!woId)   return { ok: false, error: "Work order id is required." };
+  if (!userId) return { ok: false, error: "User id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const startedAt = new Date().toISOString();
+  const { data, error } = await supa.from("work_order_time_entries").insert({
+    work_order_id: woId,
+    user_id:       userId,
+    started_at:    startedAt,
+  }).select("id, work_order_id, user_id, started_at, ended_at, duration_minutes, note, created_at")
+    .maybeSingle();
+
+  // Unique-violation on woe_uniq_open → there's already an open session.
+  // Surface the existing row so the UI lands in the correct state instead
+  // of erroring out (edge case 3: "Worker clicks Start twice").
+  if (error) {
+    if (/woe_uniq_open|duplicate key/i.test(error.message)) {
+      const existing = db.openEntryFor(woId, userId);
+      if (existing) return { ok: true, entry: existing };
+      const { data: open } = await supa
+        .from("work_order_time_entries")
+        .select("id, work_order_id, user_id, started_at, ended_at, duration_minutes, note, created_at")
+        .eq("work_order_id", woId).eq("user_id", userId).is("ended_at", null)
+        .maybeSingle();
+      if (open) {
+        const entry = rowToEntry(open as TimeEntryRow);
+        db.WORK_ORDER_TIME_ENTRIES[entry.id] = entry;
+        return { ok: true, entry };
+      }
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Time entry row missing after insert." };
+
+  const entry = rowToEntry(data as TimeEntryRow);
+  db.WORK_ORDER_TIME_ENTRIES[entry.id] = entry;
+
+  // Best-effort status bump. Swallow RLS errors so a regular worker
+  // still gets their time tracked even though wo_write rejects them.
+  const cur = db.WORK_ORDERS[woId];
+  if (cur && cur.status !== "in_progress"
+         && cur.status !== "done" && cur.status !== "closed"
+         && cur.status !== "cancelled") {
+    await supa.from("work_orders").update({ status: "in_progress" }).eq("id", woId);
+  }
+
+  await refreshWorkOrderMirror(woId);
+  return { ok: true, entry };
+}
+
+/**
+ * Worker clicks "Done" on their own session. Closes the open entry
+ * (sets ended_at = now()); the GENERATED duration_minutes + the
+ * trigger-driven WO roll-up follow automatically. Does NOT flip the
+ * WO status — that's the lead's call via markWorkOrderDone().
+ *
+ * If the worker has no open entry, returns ok with entry=null so the
+ * UI can show "nothing to close".
+ */
+export async function completeWorkOrder(
+  woId: string,
+  userId: string,
+  note?: string,
+): Promise<{ ok: true; entry: WorkOrderTimeEntry | null } | { ok: false; error: string }> {
+  if (!woId)   return { ok: false, error: "Work order id is required." };
+  if (!userId) return { ok: false, error: "User id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const trimmed = note?.trim() || null;
+
+  const { data, error } = await supa.from("work_order_time_entries")
+    .update({ ended_at: new Date().toISOString(), note: trimmed })
+    .eq("work_order_id", woId)
+    .eq("user_id", userId)
+    .is("ended_at", null)
+    .select("id, work_order_id, user_id, started_at, ended_at, duration_minutes, note, created_at")
+    .maybeSingle();
+
+  if (error) return { ok: false, error: error.message };
+  if (!data) return { ok: true, entry: null };
+
+  const entry = rowToEntry(data as TimeEntryRow);
+  db.WORK_ORDER_TIME_ENTRIES[entry.id] = entry;
+  await refreshWorkOrderMirror(woId);
+  return { ok: true, entry };
+}
+
+/**
+ * Lead/manager closes the WO outright. Sets work_orders.completed_at
+ * + flips status='done'. Also closes any open time entries on this WO
+ * so a forgotten clock-in doesn't keep accruing (edge case 1: "Worker
+ * forgets to click Done"). Best-effort on the entries side; the WO
+ * status flip is what matters.
+ */
+export async function markWorkOrderDone(
+  woId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!woId) return { ok: false, error: "Work order id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const completedAt = new Date().toISOString();
+
+  // Close any dangling open entries first so manager-override doesn't
+  // leave timers running. We do this BEFORE the WO update so the
+  // trigger-computed duration_minutes is final when the WO row commits.
+  await supa.from("work_order_time_entries")
+    .update({ ended_at: completedAt })
+    .eq("work_order_id", woId)
+    .is("ended_at", null);
+
+  const { error } = await supa.from("work_orders")
+    .update({ status: "done", completed_at: completedAt })
+    .eq("id", woId);
+  if (error) return { ok: false, error: error.message };
+
+  // Mirror refresh: pull every closed entry for this WO so the history
+  // panel reflects the manager-override.
+  const { data: rows } = await supa.from("work_order_time_entries")
+    .select("id, work_order_id, user_id, started_at, ended_at, duration_minutes, note, created_at")
+    .eq("work_order_id", woId);
+  for (const r of (rows ?? []) as TimeEntryRow[]) {
+    db.WORK_ORDER_TIME_ENTRIES[r.id] = rowToEntry(r);
+  }
+  await refreshWorkOrderMirror(woId);
+  return { ok: true };
+}
+
+// ─────────────────────────────────────────────────────────
+// HOURS AGGREGATION HELPERS (pure reads off the mirror)
+// ─────────────────────────────────────────────────────────
+
+/** Total tracked minutes across every WO that belongs to the project,
+ *  using the trigger-computed wo.durationMinutes (so it includes every
+ *  worker, not just whatever entries the current role can see). */
+export function getProjectTotalHours(projectId: string): number {
+  if (!projectId) return 0;
+  let minutes = 0;
+  for (const w of Object.values(db.WORK_ORDERS)) {
+    if (w.source.kind !== "project" || w.source.id !== projectId) continue;
+    minutes += w.durationMinutes;
+  }
+  return minutes / 60;
+}
+
+/** Hours a specific user logged on a specific project, summed from
+ *  individual time entries (so the breakdown is per-person rather than
+ *  per-WO). NOTE: workers / drivers / subcontractors will only see
+ *  their own entries due to RLS — the number is accurate for "self"
+ *  reports but may under-count when called for another user from a
+ *  field-role session. */
+export function getUserHoursOnProject(userId: string, projectId: string): number {
+  if (!userId || !projectId) return 0;
+  const woIds = new Set<string>();
+  for (const w of Object.values(db.WORK_ORDERS)) {
+    if (w.source.kind === "project" && w.source.id === projectId) woIds.add(w.id);
+  }
+  let minutes = 0;
+  for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+    if (e.userId !== userId) continue;
+    if (!woIds.has(e.workOrderId)) continue;
+    minutes += e.durationMinutes;
+  }
+  return minutes / 60;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1534,4 +2173,440 @@ export async function cancelReplacement(id: string, reason: string, currentStatu
     status: "cancelled",
     rejection_reason: trimmed,  // overloaded reason field
   });
+}
+
+// ─────────────────────────────────────────────────────────
+// SUB-CONTRACTORS  (migration 0023)
+//
+// External-contractor directory + per-WO assignments + time tracking.
+// All writes are gated by RLS:
+//   • sub_contractors.write           md / admin / manager
+//   • work_order_sub_contractors.write  md / admin / manager
+//                                       + lead_worker on their own WO
+// The helpers below mirror the row into db.SUB_CONTRACTORS /
+// db.WORK_ORDER_SUB_CONTRACTORS on success so the next render shows
+// the change without waiting for a full re-hydration.
+// ─────────────────────────────────────────────────────────
+
+export interface SubContractorInput {
+  name: string;
+  phone?: string | null;
+  emirates_id?: string | null;
+  company?: string | null;
+  notes?: string | null;
+}
+
+interface SubContractorRow {
+  id: string;
+  name: string;
+  phone: string | null;
+  emirates_id: string | null;
+  company: string | null;
+  notes: string | null;
+  is_active: boolean;
+  created_at: string;
+  created_by: string | null;
+}
+
+function subRowToType(r: SubContractorRow): SubContractor {
+  return {
+    id:          r.id,
+    name:        r.name,
+    phone:       r.phone,
+    emiratesId:  r.emirates_id,
+    company:     r.company,
+    notes:       r.notes,
+    isActive:    r.is_active,
+    createdAt:   r.created_at,
+    createdBy:   r.created_by,
+  };
+}
+
+export async function createSubContractor(
+  input: SubContractorInput,
+  createdBy?: string,
+): Promise<{ ok: true; sub: SubContractor } | { ok: false; error: string }> {
+  if (!input.name?.trim()) return { ok: false, error: "Name is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("sub_contractors").insert({
+    name:        input.name.trim(),
+    phone:       input.phone?.trim() || null,
+    emirates_id: input.emirates_id?.trim() || null,
+    company:     input.company?.trim() || null,
+    notes:       input.notes?.trim() || null,
+    created_by:  createdBy || null,
+  }).select("id, name, phone, emirates_id, company, notes, is_active, created_at, created_by")
+    .maybeSingle();
+
+  if (error) {
+    // Friendly message on the partial-unique Emirates-ID constraint.
+    if (/sub_uniq_emirates_id|duplicate key/i.test(error.message)) {
+      return { ok: false, error: "A sub-contractor with this Emirates ID already exists." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Sub-contractor row missing after insert." };
+
+  const sub = subRowToType(data as SubContractorRow);
+  db.SUB_CONTRACTORS[sub.id] = sub;
+  return { ok: true, sub };
+}
+
+export interface SubContractorPatch {
+  name?: string;
+  phone?: string | null;
+  emirates_id?: string | null;
+  company?: string | null;
+  notes?: string | null;
+  is_active?: boolean;
+}
+
+export async function updateSubContractor(
+  id: string,
+  patch: SubContractorPatch,
+): Promise<{ ok: true; sub: SubContractor } | { ok: false; error: string }> {
+  if (!id) return { ok: false, error: "Sub-contractor id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const body: Record<string, unknown> = {};
+  if (patch.name !== undefined)        body.name        = patch.name.trim();
+  if (patch.phone !== undefined)       body.phone       = patch.phone?.trim() || null;
+  if (patch.emirates_id !== undefined) body.emirates_id = patch.emirates_id?.trim() || null;
+  if (patch.company !== undefined)     body.company     = patch.company?.trim() || null;
+  if (patch.notes !== undefined)       body.notes       = patch.notes?.trim() || null;
+  if (patch.is_active !== undefined)   body.is_active   = patch.is_active;
+
+  if (Object.keys(body).length === 0) return { ok: false, error: "Nothing to update." };
+
+  const { data, error } = await supa.from("sub_contractors")
+    .update(body)
+    .eq("id", id)
+    .select("id, name, phone, emirates_id, company, notes, is_active, created_at, created_by")
+    .maybeSingle();
+
+  if (error) {
+    if (/sub_uniq_emirates_id|duplicate key/i.test(error.message)) {
+      return { ok: false, error: "A sub-contractor with this Emirates ID already exists." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Sub-contractor not found after update." };
+
+  const sub = subRowToType(data as SubContractorRow);
+  db.SUB_CONTRACTORS[sub.id] = sub;
+  return { ok: true, sub };
+}
+
+/** Soft-delete: flip is_active=false. Existing WO assignments stay
+ *  visible; the UI hides this profile from the "add to WO" picker. */
+export async function deactivateSubContractor(id: string) {
+  return updateSubContractor(id, { is_active: false });
+}
+
+// ─── Sub-contractor × Work Order assignment + time tracking ─
+
+interface WosRow {
+  id: string;
+  work_order_id: string;
+  sub_contractor_id: string;
+  assigned_at: string;
+  assigned_by: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_minutes: number;
+  note: string | null;
+}
+
+function wosRowToType(r: WosRow): WorkOrderSubContractor {
+  return {
+    id:                r.id,
+    workOrderId:       r.work_order_id,
+    subContractorId:   r.sub_contractor_id,
+    assignedAt:        r.assigned_at,
+    assignedBy:        r.assigned_by,
+    startedAt:         r.started_at,
+    completedAt:       r.completed_at,
+    durationMinutes:   r.duration_minutes ?? 0,
+    note:              r.note,
+  };
+}
+
+export async function assignSubContractorToWO(
+  woId: string,
+  subId: string,
+  assignedBy?: string,
+): Promise<{ ok: true; assignment: WorkOrderSubContractor } | { ok: false; error: string }> {
+  if (!woId)  return { ok: false, error: "Work order id is required." };
+  if (!subId) return { ok: false, error: "Sub-contractor id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("work_order_sub_contractors").insert({
+    work_order_id:     woId,
+    sub_contractor_id: subId,
+    assigned_by:       assignedBy || null,
+  }).select("id, work_order_id, sub_contractor_id, assigned_at, assigned_by, started_at, completed_at, duration_minutes, note")
+    .maybeSingle();
+
+  if (error) {
+    // wos_uniq_wo_sub — same sub already on this WO.
+    if (/wos_uniq_wo_sub|duplicate key/i.test(error.message)) {
+      return { ok: false, error: "This sub-contractor is already assigned to this work order." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Assignment row missing after insert." };
+
+  const assignment = wosRowToType(data as WosRow);
+  db.WORK_ORDER_SUB_CONTRACTORS[assignment.id] = assignment;
+  return { ok: true, assignment };
+}
+
+export async function removeSubContractorFromWO(
+  woId: string,
+  subId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!woId || !subId) return { ok: false, error: "Both ids required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { error } = await supa.from("work_order_sub_contractors")
+    .delete()
+    .eq("work_order_id", woId)
+    .eq("sub_contractor_id", subId);
+  if (error) return { ok: false, error: error.message };
+
+  // Drop from mirror.
+  for (const [k, v] of Object.entries(db.WORK_ORDER_SUB_CONTRACTORS)) {
+    if (v.workOrderId === woId && v.subContractorId === subId) {
+      delete db.WORK_ORDER_SUB_CONTRACTORS[k];
+    }
+  }
+  return { ok: true };
+}
+
+/** Stamp started_at = now() on the (wo, sub) row. The DB CHECK
+ *  constraint won't accept a completed_at without a started_at, so
+ *  this is always the first time-tracking write for a sub. */
+export async function startSubContractorWork(
+  woId: string,
+  subId: string,
+): Promise<{ ok: true; assignment: WorkOrderSubContractor } | { ok: false; error: string }> {
+  return updateSubAssignment(woId, subId, { started_at: new Date().toISOString() });
+}
+
+/** Stamp completed_at = now(). GENERATED duration_minutes follows. */
+export async function completeSubContractorWork(
+  woId: string,
+  subId: string,
+  note?: string,
+): Promise<{ ok: true; assignment: WorkOrderSubContractor } | { ok: false; error: string }> {
+  const patch: Record<string, unknown> = { completed_at: new Date().toISOString() };
+  if (note?.trim()) patch.note = note.trim();
+  return updateSubAssignment(woId, subId, patch);
+}
+
+async function updateSubAssignment(
+  woId: string,
+  subId: string,
+  body: Record<string, unknown>,
+): Promise<{ ok: true; assignment: WorkOrderSubContractor } | { ok: false; error: string }> {
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("work_order_sub_contractors")
+    .update(body)
+    .eq("work_order_id", woId)
+    .eq("sub_contractor_id", subId)
+    .select("id, work_order_id, sub_contractor_id, assigned_at, assigned_by, started_at, completed_at, duration_minutes, note")
+    .maybeSingle();
+
+  if (error) return { ok: false, error: error.message };
+  if (!data) return { ok: false, error: "Assignment not found." };
+
+  const assignment = wosRowToType(data as WosRow);
+  db.WORK_ORDER_SUB_CONTRACTORS[assignment.id] = assignment;
+  return { ok: true, assignment };
+}
+
+// ─────────────────────────────────────────────────────────
+// SUB-CONTRACTOR HOURS LOG  (migration 0026)
+//
+// Lead Tech / Manager / Admin records hours-per-day for each sub on
+// each WO. Multiple entries per (WO, sub, day) are allowed — a sub may
+// come and go through the day. The composite FK wosh_assignment_exists
+// guarantees the sub is already on the WO; we surface a friendly
+// message when callers try to log against an unassigned sub.
+//
+// The older startSubContractorWork / completeSubContractorWork helpers
+// in this file are intentionally untouched — they remain harmless dead
+// code we may revisit later. The hours log is the supported path.
+// ─────────────────────────────────────────────────────────
+
+interface WoshRow {
+  id: string;
+  work_order_id: string;
+  sub_contractor_id: string;
+  entry_date: string;
+  hours: number | string;
+  notes: string | null;
+  logged_by: string | null;
+  logged_at: string;
+}
+
+function woshRowToType(r: WoshRow): WorkOrderSubContractorHours {
+  // Supabase JS sometimes returns numeric columns as strings to
+  // preserve precision; numeric(5,2) is safely a JS number but we
+  // coerce defensively so callers always get a primitive.
+  const hours = typeof r.hours === "string" ? Number(r.hours) : r.hours;
+  return {
+    id:                r.id,
+    workOrderId:       r.work_order_id,
+    subContractorId:   r.sub_contractor_id,
+    entryDate:         r.entry_date.slice(0, 10),
+    hours,
+    notes:             r.notes,
+    loggedBy:          r.logged_by,
+    loggedAt:          r.logged_at,
+  };
+}
+
+export interface SubContractorHoursInput {
+  workOrderId: string;
+  subContractorId: string;
+  entryDate: string;            // YYYY-MM-DD
+  hours: number;                // 0.25 ≤ hours ≤ 24
+  notes?: string | null;
+}
+
+/**
+ * Insert one hours-log entry. Caller is responsible for the soft
+ * validations the spec keeps in the UI (no future dates, no dates
+ * before the sub's assignedAt). The DB CHECK and composite FK are the
+ * hard backstops; we translate their error messages here so the toast
+ * is actionable instead of raw Postgres.
+ *
+ * loggedBy is taken as a separate arg (matches the createSubContractor /
+ * assignSubContractorToWO pattern). For lead_worker the wosh_write RLS
+ * policy reads logged_by on UPDATE/DELETE — they can only edit rows
+ * where logged_by = themselves.
+ */
+export async function logSubContractorHours(
+  input: SubContractorHoursInput,
+  loggedBy?: string,
+): Promise<{ ok: true; entry: WorkOrderSubContractorHours } | { ok: false; error: string }> {
+  if (!input.workOrderId)     return { ok: false, error: "Work order id is required." };
+  if (!input.subContractorId) return { ok: false, error: "Sub-contractor id is required." };
+  if (!input.entryDate)       return { ok: false, error: "Entry date is required." };
+  if (!(input.hours > 0))     return { ok: false, error: "Hours must be greater than 0." };
+  if (input.hours > 24)       return { ok: false, error: "Hours cannot exceed 24." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("work_order_sub_contractor_hours").insert({
+    work_order_id:     input.workOrderId,
+    sub_contractor_id: input.subContractorId,
+    entry_date:        input.entryDate,
+    hours:             input.hours,
+    notes:             input.notes?.trim() || null,
+    logged_by:         loggedBy || null,
+  }).select("id, work_order_id, sub_contractor_id, entry_date, hours, notes, logged_by, logged_at")
+    .maybeSingle();
+
+  if (error) {
+    if (/wosh_assignment_exists/i.test(error.message)) {
+      return { ok: false, error: "This sub-contractor is not assigned to this work order." };
+    }
+    if (/wosh_chk_hours_range/i.test(error.message)) {
+      return { ok: false, error: "Hours must be between 0.25 and 24." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Hours entry row missing after insert." };
+
+  const entry = woshRowToType(data as WoshRow);
+  db.WORK_ORDER_SUB_CONTRACTOR_HOURS[entry.id] = entry;
+  return { ok: true, entry };
+}
+
+export interface SubContractorHoursPatch {
+  hours?: number;
+  notes?: string | null;
+  entryDate?: string;           // YYYY-MM-DD
+}
+
+/**
+ * Edit a previously-logged entry. Only hours / notes / entryDate are
+ * mutable — workOrderId, subContractorId and loggedBy are immutable
+ * (changing them would defeat the audit trail and the RLS check that
+ * lets a lead_worker edit only their own entries).
+ */
+export async function editSubContractorHoursEntry(
+  entryId: string,
+  patch: SubContractorHoursPatch,
+): Promise<{ ok: true; entry: WorkOrderSubContractorHours } | { ok: false; error: string }> {
+  if (!entryId) return { ok: false, error: "Entry id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const body: Record<string, unknown> = {};
+  if (patch.hours !== undefined) {
+    if (!(patch.hours > 0)) return { ok: false, error: "Hours must be greater than 0." };
+    if (patch.hours > 24)   return { ok: false, error: "Hours cannot exceed 24." };
+    body.hours = patch.hours;
+  }
+  if (patch.notes !== undefined)     body.notes = patch.notes?.trim() || null;
+  if (patch.entryDate !== undefined) {
+    if (!patch.entryDate) return { ok: false, error: "Entry date cannot be empty." };
+    body.entry_date = patch.entryDate;
+  }
+  if (Object.keys(body).length === 0) return { ok: false, error: "Nothing to update." };
+
+  const { data, error } = await supa.from("work_order_sub_contractor_hours")
+    .update(body)
+    .eq("id", entryId)
+    .select("id, work_order_id, sub_contractor_id, entry_date, hours, notes, logged_by, logged_at")
+    .maybeSingle();
+
+  if (error) {
+    if (/wosh_chk_hours_range/i.test(error.message)) {
+      return { ok: false, error: "Hours must be between 0.25 and 24." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Hours entry not found after update." };
+
+  const entry = woshRowToType(data as WoshRow);
+  db.WORK_ORDER_SUB_CONTRACTOR_HOURS[entry.id] = entry;
+  return { ok: true, entry };
+}
+
+/** Hard-delete the entry. RLS enforces who can delete: md/admin/manager
+ *  always; lead_worker only where they're the logger of this row AND
+ *  the lead on the parent WO. */
+export async function deleteSubContractorHoursEntry(
+  entryId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!entryId) return { ok: false, error: "Entry id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { error } = await supa.from("work_order_sub_contractor_hours")
+    .delete()
+    .eq("id", entryId);
+  if (error) return { ok: false, error: error.message };
+
+  delete db.WORK_ORDER_SUB_CONTRACTOR_HOURS[entryId];
+  return { ok: true };
 }

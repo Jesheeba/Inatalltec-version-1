@@ -16,7 +16,10 @@ import {
 
 export function WorkOrders() {
   const { openWO, go, openCreate, role, me } = useApp();
-  type FilterT = "all" | "today" | "live" | "scheduled" | "closed";
+  // "in_progress" is the new chip from Phase C — strictly WOs with
+  // status='in_progress' (the boss's "currently being worked on" view).
+  // Note: distinct from "live" which also includes waiting_material.
+  type FilterT = "all" | "today" | "live" | "in_progress" | "scheduled" | "closed";
   const [filter, setFilter] = useState<FilterT>("all");
   const [view, setView] = useState<"list" | "cards">("list");
   const [q, setQ] = useState("");
@@ -55,6 +58,7 @@ export function WorkOrders() {
     all: all.length,
     today: all.filter(w => w.scheduledStart.startsWith("2025-05-16")).length,
     live: all.filter(w => w.status === "in_progress" || w.status === "waiting_material").length,
+    in_progress: all.filter(w => w.status === "in_progress").length,
     scheduled: all.filter(w => w.status === "open" || w.status === "assigned").length,
     closed: all.filter(w => w.status === "done" || w.status === "closed" || w.status === "cancelled" || w.status === "pending_confirmation").length,
   };
@@ -62,6 +66,7 @@ export function WorkOrders() {
   let list = all;
   if (filter === "today") list = list.filter(w => w.scheduledStart.startsWith("2025-05-16"));
   if (filter === "live") list = list.filter(w => w.status === "in_progress" || w.status === "waiting_material");
+  if (filter === "in_progress") list = list.filter(w => w.status === "in_progress");
   if (filter === "scheduled") list = list.filter(w => w.status === "open" || w.status === "assigned");
   if (filter === "closed") list = list.filter(w => w.status === "done" || w.status === "closed" || w.status === "cancelled" || w.status === "pending_confirmation");
   if (q.trim()) {
@@ -117,6 +122,7 @@ export function WorkOrders() {
             { value: "all", label: "All", count: counts.all },
             { value: "today", label: "Today", count: counts.today },
             { value: "live", label: "Live", count: counts.live },
+            { value: "in_progress", label: "In Progress", count: counts.in_progress },
             { value: "scheduled", label: "Scheduled", count: counts.scheduled },
             { value: "closed", label: "Completed", count: counts.closed },
           ]} />
@@ -137,6 +143,7 @@ export function WorkOrders() {
                   <th className="hide-mobile">Customer</th>
                   <th className="hide-mobile" style={{ width: 140 }}>Window</th>
                   {showAssignedColumn && <th className="hide-mobile" style={{ width: 130 }}>Assigned</th>}
+                  <th className="hide-mobile" style={{ width: 110 }}>Duration</th>
                   <th style={{ width: 130 }}>Status</th>
                 </tr>
               </thead>
@@ -194,7 +201,27 @@ function WoTableRow({ wo, onClick, showAssigned = true }: { wo: WorkOrder; onCli
           </div>
         </td>
       )}
+      <td data-th="Duration" className="hide-mobile numeric"
+          style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+        {wo.durationMinutes > 0 ? formatDuration(wo.durationMinutes) : "-"}
+        {wo.actualWorkersCount > 1 && (
+          <div style={{ font: "var(--t-micro)", color: "var(--ink-quiet)", marginTop: 2 }}>
+            {wo.actualWorkersCount} workers
+          </div>
+        )}
+      </td>
       <td data-th="Status"><StatusBadge state={wo.status} /></td>
     </tr>
   );
+}
+
+/** "1h 30m" style. Pure presentation — duplicated locally to avoid
+ *  cross-file imports for a one-liner used only here. */
+function formatDuration(min: number): string {
+  if (!Number.isFinite(min) || min <= 0) return "-";
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
 }
