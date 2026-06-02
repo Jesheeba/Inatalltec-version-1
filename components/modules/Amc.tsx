@@ -817,7 +817,8 @@ export function AmcDetail({ id }: { id: string }) {
    The DB enforces the same via amc_freecalls_write policy. */
 const FREE_CALLS_INCLUDED = 10;
 function FreeCallsCard({ amc }: { amc: AmcContract }) {
-  const { role, openCreate, dataVersion } = useApp();
+  const { role, openCreate, openWO, dataVersion } = useApp();
+  const canCreateWo = can(role, "CREATE_WORK_ORDER");
   void dataVersion;
   const used = amc.freeCalls ?? 0;
   const entries = db.freeCallsForAmc(amc.id);
@@ -865,6 +866,7 @@ function FreeCallsCard({ amc }: { amc: AmcContract }) {
             const lines = fc.symptom.split(/\n+/);
             const description = lines[0] ?? "";
             const notes = lines.slice(1).join(" ").replace(/^Notes:\s*/, "");
+            const linkedWo = fc.workOrderId ? db.WORK_ORDERS[fc.workOrderId] : null;
             return (
               <div key={fc.id} className="row gap-3" style={{
                 padding: "10px 12px", borderRadius: "var(--r-md)",
@@ -875,6 +877,35 @@ function FreeCallsCard({ amc }: { amc: AmcContract }) {
                   {notes && (
                     <div className="truncate" style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 2 }}>
                       {notes}
+                    </div>
+                  )}
+                  {linkedWo && (
+                    <div className="row gap-2" style={{ marginTop: 6, alignItems: "center", flexWrap: "wrap" }}>
+                      <span className="numeric" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                        {linkedWo.code}
+                      </span>
+                      <StatusBadge state={linkedWo.status} />
+                      <button className="btn btn-ghost btn-sm" onClick={() => openWO(linkedWo.id)}
+                              style={{ padding: "2px 6px", font: "var(--t-micro)" }}>
+                        View <Icon name="arrowRight" size={11} />
+                      </button>
+                    </div>
+                  )}
+                  {!linkedWo && canCreateWo && (
+                    <div style={{ marginTop: 6 }}>
+                      <button className="btn btn-ghost btn-sm"
+                              onClick={() => openCreate("workorder", {
+                                customer_id: amc.customer,
+                                site_id: amc.site || undefined,
+                                assigned_lead: amc.leadTechId || undefined,
+                                source_kind: "amc",
+                                source_id: amc.id,
+                                title: `Free call: ${description}`,
+                                free_call_id: fc.id,
+                              })}
+                              style={{ padding: "2px 8px", font: "var(--t-micro)" }}>
+                        <Icon name="plus" size={11} /> Create Work Order
+                      </button>
                     </div>
                   )}
                 </div>

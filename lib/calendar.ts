@@ -44,6 +44,7 @@ export const CAL_COLORS = {
   work_order:        "#F59E0B", // amber/orange
   work_order_high:   "#EF4444", // red for high-priority
   work_order_done:   "#9CA3AF", // grey for done/closed/cancelled
+  free_call:         "#EA580C", // deep orange — auto-created WOs from AMC free calls
 } as const;
 
 /**
@@ -173,11 +174,23 @@ export function workOrderToCalendarEvent(w: WorkOrder): CalendarEvent | null {
   const customer = db.cust(w.customer);
   const site = db.site(w.site);
   const lead = w.assignedLead ? db.user(w.assignedLead) : null;
+  // v1.0.1 Phase C — free-call WOs are auto-created by createFreeCall
+  // with the title prefix "Free call:" and source=amc. Detect either
+  // signal so the calendar surfaces them with a distinct deep-orange
+  // bar and a 📞 prefix — they still participate in WO conflict
+  // detection because kind stays "work_order".
+  const isFreeCall = w.title?.startsWith("Free call:") === true
+    || (w.source?.kind === "amc" && w.title?.toLowerCase().includes("free call"));
   // Match the project/AMC title format ("<CODE> · <NAME>") so WOs read
   // consistently across all three event types in the bars + popovers.
-  const woTitle = w.code && w.title
+  const baseTitle = w.code && w.title
     ? `${w.code} · ${w.title}`
     : (w.title || w.code || "Untitled work order");
+  const woTitle = isFreeCall ? `📞 ${baseTitle}` : baseTitle;
+  const color = isFreeCall
+    && w.status !== "done" && w.status !== "closed" && w.status !== "cancelled"
+    ? CAL_COLORS.free_call
+    : getEventColor("work_order", w.status, w.priority);
   return {
     id:           `work_order:${w.id}`,
     kind:         "work_order",
@@ -192,9 +205,9 @@ export function workOrderToCalendarEvent(w: WorkOrder): CalendarEvent | null {
     leadTechName: lead?.name,
     assigneeIds:  w.assigned ?? [],
     status:       w.status,
-    color:        getEventColor("work_order", w.status, w.priority),
+    color,
     source:       { table: "work_orders", id: w.id },
-    metadata:     { code: w.code, type: w.type, priority: w.priority },
+    metadata:     { code: w.code, type: w.type, priority: w.priority, isFreeCall },
   };
 }
 

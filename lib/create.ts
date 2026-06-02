@@ -2696,6 +2696,34 @@ export async function createFreeCall(
   return { ok: true, freeCall };
 }
 
+/**
+ * Link an existing free call to an existing work order. Used by the
+ * "+ Create Work Order" button on the FreeCallsCard — after the user
+ * submits the WorkOrderForm, we run this to populate
+ * amc_free_calls.work_order_id and update the local mirror so the
+ * entry's view-WO link appears without a full re-hydrate.
+ */
+export async function linkFreeCallToWorkOrder(
+  freeCallId: string,
+  workOrderId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!freeCallId)   return { ok: false, error: "Free call id is required." };
+  if (!workOrderId)  return { ok: false, error: "Work order id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { error } = await supa
+    .from("amc_free_calls")
+    .update({ work_order_id: workOrderId })
+    .eq("id", freeCallId);
+  if (error) return { ok: false, error: error.message };
+
+  const cur = db.FREE_CALLS[freeCallId];
+  if (cur) db.FREE_CALLS[freeCallId] = { ...cur, workOrderId };
+  return { ok: true };
+}
+
 // ═════════════════════════════════════════════════════════════
 // PHASE 11 — QUOTATIONS (migration 0028)
 // ═════════════════════════════════════════════════════════════

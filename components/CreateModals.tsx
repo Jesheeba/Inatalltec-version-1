@@ -9,7 +9,7 @@
 //   - inline error toast + close + bump context for list refresh
 // ============================================================
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "./Icon";
 import { Modal } from "./shared";
 import { useApp, type CreateKind } from "@/lib/app-context";
@@ -25,7 +25,7 @@ import {
   createReplacementRequest, REPLACEMENT_CONTEXT_LABEL,
   createSubContractor, assignSubContractorToWO,
   logSubContractorHours, editSubContractorHoursEntry,
-  createFreeCall, createQuotation,
+  createFreeCall, createQuotation, linkFreeCallToWorkOrder,
   type ProjectStatus, type ProjectStage, type AmcPaymentMethod,
   type JobCategory, type ContractMeta,
 } from "@/lib/create";
@@ -262,14 +262,14 @@ function ConflictWarning({ workerName, conflicts }: {
   );
 }
 
-interface Opt { value: string; label: string }
+interface Opt { value: string; label: string; disabled?: boolean }
 function Select({ value, onChange, options, placeholder, required, disabled }:
   { value: string; onChange: (v: string) => void; options: Opt[]; placeholder?: string; required?: boolean; disabled?: boolean }) {
   return (
     <select className="select" value={value} required={required} disabled={disabled}
       onChange={e => onChange(e.target.value)}>
       {placeholder !== undefined && <option value="">{placeholder}</option>}
-      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      {options.map(o => <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>)}
     </select>
   );
 }
@@ -1369,10 +1369,13 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
       : initialSourceKind === "project" ? "PROJECT"
       : initialSourceKind === "repair" ? "REPAIR"
       : "PROJECT";
+  // Explicit title prefill (e.g. from the "+ Create Work Order" button
+  // on a free-call entry). Wins over the source-derived auto-title.
+  const prefillTitle = (create?.prefill?.title as string) || "";
   // Generate a sensible default title when the form was opened from a
   // detail page ("+ Create Work Order" buttons on project/AMC/repair
   // pages). Saves the user typing for the common case; still editable.
-  const initialTitle = (() => {
+  const initialTitle = prefillTitle || (() => {
     if (!initialSourceKind || !initialSourceId) return "";
     if (initialSourceKind === "project") {
       const p = db.proj(initialSourceId);
@@ -1390,11 +1393,17 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
     }
     return "";
   })();
+  // Lead Tech prefill (e.g. from the AMC's leadTechId when the
+  // "+ Create Work Order" button on a free-call entry is clicked).
+  const prefillLead = (create?.prefill?.assigned_lead as string) || "";
+  // Free-call id prefill — after createWorkOrder succeeds we link the
+  // new WO back to the originating free-call row.
+  const prefillFreeCallId = (create?.prefill?.free_call_id as string) || "";
   const [f, setF] = useState({
     title: initialTitle, type: initialType,
     customer_id: initialCustomer, site_id: initialSiteId,
     scheduled_start: fmt(now), scheduled_end: fmt(later),
-    assigned_lead: "", priority: "Standard",
+    assigned_lead: prefillLead, priority: "Standard",
     additional_workers: [] as string[],
     // Migration 0023: external sub-contractors assigned to this WO at
     // creation. Stored as sub_contractors.id; reconciled into the join
@@ -1424,25 +1433,53 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
     return [];
   }, [f.source_kind]);
 
-  // Conflict warnings (Fix 3) — recomputed whenever the time window or
+  // Conflict warnings — recomputed whenever the time window or
   // worker selection changes. Cheap O(n) over db.WORK_ORDERS each pass;
   // memoised so React doesn't re-render every keystroke unnecessarily.
   // No exclude id (this is a create form — the WO doesn't exist yet).
+  //
+  // v1.0.1 cleanup: Lead Techs are intentionally NOT availability-checked
+  // here. Business rule — leads supervise across sites and can overlap.
+  // We still surface a soft warning below the picker if the SELECTED lead
+  // has a conflict (informational only, doesn't block submit).
   const leadConflicts = useMemo(() =>
     f.assigned_lead && f.scheduled_start && f.scheduled_end
       ? getWorkerConflictsFor(f.assigned_lead, f.scheduled_start, f.scheduled_end)
       : [],
     [f.assigned_lead, f.scheduled_start, f.scheduled_end]);
   const workerConflicts = useMemo(() => {
-    if (!f.scheduled_start || !f.scheduled_end) return {} as Record<string, WorkerConflict[]>;
     const map: Record<string, WorkerConflict[]> = {};
-    for (const id of f.additional_workers) {
-      map[id] = getWorkerConflictsFor(id, f.scheduled_start, f.scheduled_end);
+    if (!f.scheduled_start || !f.scheduled_end) return map;
+    for (const u of workerOptions) {
+      map[u.id] = getWorkerConflictsFor(u.id, f.scheduled_start, f.scheduled_end);
     }
     return map;
-  }, [f.additional_workers, f.scheduled_start, f.scheduled_end]);
-  const totalWorkerConflictCount =
-    Object.values(workerConflicts).reduce((sum, l) => sum + l.length, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [f.scheduled_start, f.scheduled_end, workerOptions]);
+  const totalWorkerConflictCount = f.additional_workers
+    .reduce((sum, id) => sum + (workerConflicts[id]?.length ?? 0), 0);
+
+  // Re-validate worker selections after the user changes the time window.
+  // We only toast (don't auto-deselect) so the user keeps control. Skip
+  // the very first mount so prefilled forms don't toast immediately. Lead
+  // conflicts are intentionally excluded — leads are allowed to overlap.
+  const didMountTimeCheck = useRef(false);
+  useEffect(() => {
+    if (!didMountTimeCheck.current) { didMountTimeCheck.current = true; return; }
+    if (!f.scheduled_start || !f.scheduled_end) return;
+    const offenders: string[] = [];
+    for (const id of f.additional_workers) {
+      if ((workerConflicts[id]?.length ?? 0) > 0) {
+        offenders.push(db.user(id)?.name ?? "Worker");
+      }
+    }
+    if (offenders.length > 0) {
+      const names = offenders.slice(0, 3).join(", ")
+        + (offenders.length > 3 ? ` +${offenders.length - 3} more` : "");
+      fireToast(`Time changed — please re-check ${names}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [f.scheduled_start, f.scheduled_end]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault(); setErr(null);
@@ -1471,6 +1508,18 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
         subFailures.push(`${subName}: ${a.error}`);
       }
     }
+
+    // If this form was opened from a free-call entry, link the new WO
+    // back to the free call so the entry's "View →" row appears without
+    // a full re-hydrate. Best-effort: link failures don't abort.
+    if (prefillFreeCallId) {
+      const linkRes = await linkFreeCallToWorkOrder(prefillFreeCallId, res.id);
+      if (!linkRes.ok) {
+        // eslint-disable-next-line no-console
+        console.warn("[WorkOrderForm] free-call link failed:", linkRes.error);
+      }
+    }
+
     setBusy(false);
     if (subFailures.length > 0) {
       fireToast(`WO created; some sub-contractor assignments failed: ${subFailures.join("; ")}`);
@@ -1587,23 +1636,45 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             }}>
               {workerOptions.map(u => {
                 const checked = f.additional_workers.includes(u.id);
-                const hasConflict = checked && (workerConflicts[u.id]?.length ?? 0) > 0;
+                const conflicts = workerConflicts[u.id] ?? [];
+                const hasConflict = conflicts.length > 0;
+                // Block NEW selection of conflicted techs; allow toggling
+                // OFF an already-checked one so the user can fix mistakes.
+                const blockSelect = hasConflict && !checked;
+                const first = conflicts[0];
+                const busySub = first
+                  ? `Busy: ${first.code} ${first.scheduledStart.slice(11, 16)}-${first.scheduledEnd.slice(11, 16)}${conflicts.length > 1 ? ` +${conflicts.length - 1} more` : ""}`
+                  : "";
                 return (
                   <label key={u.id}
                     title={hasConflict
-                      ? `Time conflict: ${workerConflicts[u.id].map(c => c.code).join(", ")}`
+                      ? `Time conflict: ${conflicts.map(c => c.code).join(", ")}`
                       : undefined}
                     style={{
                       display: "flex", alignItems: "center", gap: 10,
                       padding: "8px 10px", borderRadius: "var(--r-sm)",
-                      cursor: "pointer", minHeight: 44,
+                      cursor: blockSelect ? "not-allowed" : "pointer",
+                      minHeight: 44,
                       background: checked ? "var(--pri-50)" : "transparent",
+                      opacity: blockSelect ? 0.55 : 1,
                     }}>
                     <input type="checkbox" checked={checked}
+                      disabled={blockSelect}
                       onChange={() => toggleWorker(u.id)}
-                      style={{ width: 18, height: 18, flexShrink: 0, cursor: "pointer" }} />
+                      style={{ width: 18, height: 18, flexShrink: 0,
+                               cursor: blockSelect ? "not-allowed" : "pointer" }} />
                     <span className={"avatar avatar-sm avatar-" + (u.tint || "primary")}>{u.initials}</span>
-                    <span style={{ flex: 1, font: "var(--t-body-md)" }} className="truncate">{u.name}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="truncate" style={{
+                        font: "var(--t-body-md)",
+                        textDecoration: blockSelect ? "line-through" : undefined,
+                      }}>{u.name}</div>
+                      {hasConflict && (
+                        <div className="truncate" style={{
+                          font: "var(--t-micro)", color: "var(--warn-700)", marginTop: 2,
+                        }}>{busySub}</div>
+                      )}
+                    </div>
                     {hasConflict && (
                       <Icon name="alertTriangle" size={14} style={{ color: "var(--warn-700)" }} />
                     )}
