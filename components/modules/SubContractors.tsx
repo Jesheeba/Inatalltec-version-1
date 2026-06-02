@@ -150,8 +150,13 @@ export function SubContractors() {
       </div>
 
       {list.length === 0 ? (
-        <EmptyState icon="users" title="No sub-contractors match"
-          sub="Try a different filter, clear the search, or add a new profile." />
+        Object.keys(db.SUB_CONTRACTORS).length === 0 ? (
+          <EmptyState icon="users" title="No sub-contractors yet"
+            sub="Click + Add sub-contractor to capture an external profile, or add one when assigning to a work order." />
+        ) : (
+          <EmptyState icon="users" title="No sub-contractors match"
+            sub="Try a different filter, clear the search, or add a new profile." />
+        )
       ) : (
         <div className="card" style={{ padding: 0, overflow: "hidden" }}>
           <div style={{ overflowX: "auto" }}>

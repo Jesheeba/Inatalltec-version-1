@@ -1008,9 +1008,34 @@ function FieldDashboard() {
           // RLS contract). We DON'T also call updateWorkOrder here so
           // we don't double-fire the status flip.
           if (next === "in_progress" && prev !== "in_progress") {
-            const r = await startWorkOrder(wo.id, me.id);
-            if (!r.ok) { fireToast(`Couldn't start: ${r.error}`); return; }
+            // eslint-disable-next-line no-console
+            console.log("[time tracking] startWorkOrder calling", { woId: wo.id, userId: me.id, role });
+            try {
+              const r = await startWorkOrder(wo.id, me.id);
+              // eslint-disable-next-line no-console
+              console.log("[time tracking] startWorkOrder result", r);
+              if (!r.ok) {
+                // eslint-disable-next-line no-console
+                console.error("[time tracking] startWorkOrder failed:", r.error);
+                fireToast(`Couldn't start timer: ${r.error}`);
+              }
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.error("[time tracking] startWorkOrder threw:", e);
+              fireToast("Couldn't start timer (see console).");
+            }
+            // Flip status regardless of time-entry success — the boss
+            // wants the workflow to keep moving even if RLS rejects the
+            // entry insert. Mirror first, then DB.
+            db.WORK_ORDERS[wo.id] = { ...wo, status: next };
             bumpData();
+            const rs = await updateWorkOrder(wo.id, { status: next });
+            if (!rs.ok) {
+              db.WORK_ORDERS[wo.id] = { ...wo, status: prev };
+              bumpData();
+              fireToast(`Couldn't update status: ${rs.error}`);
+              return;
+            }
             fireToast(`${wo.code} started`);
             return;
           }
@@ -1019,19 +1044,38 @@ function FieldDashboard() {
           // Covers: in_progress → pending_confirmation / done
           if (prev === "in_progress"
               && (next === "pending_confirmation" || next === "done")) {
-            const r1 = await completeWorkOrder(wo.id, me.id);
-            if (!r1.ok) { fireToast(`Couldn't close timer: ${r1.error}`); return; }
-            // Now flip status. Optimistic mirror update + revert on fail.
+            let hoursLabel: string | null = null;
+            // eslint-disable-next-line no-console
+            console.log("[time tracking] completeWorkOrder calling", { woId: wo.id, userId: me.id, role });
+            try {
+              const r1 = await completeWorkOrder(wo.id, me.id);
+              // eslint-disable-next-line no-console
+              console.log("[time tracking] completeWorkOrder result", r1);
+              if (!r1.ok) {
+                // eslint-disable-next-line no-console
+                console.error("[time tracking] completeWorkOrder failed:", r1.error);
+                fireToast(`Couldn't close timer: ${r1.error}`);
+              } else if (r1.entry?.durationMinutes != null) {
+                hoursLabel = (r1.entry.durationMinutes / 60).toFixed(1);
+              }
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.error("[time tracking] completeWorkOrder threw:", e);
+              fireToast("Couldn't close timer (see console).");
+            }
+            // Flip status regardless — see comment above.
             db.WORK_ORDERS[wo.id] = { ...wo, status: next };
             bumpData();
             const r2 = await updateWorkOrder(wo.id, { status: next });
             if (!r2.ok) {
               db.WORK_ORDERS[wo.id] = { ...wo, status: prev };
               bumpData();
-              fireToast(`Timer closed but couldn't update status: ${r2.error}`);
+              fireToast(`Couldn't update status: ${r2.error}`);
               return;
             }
-            fireToast(`${wo.code} → ${WO_STATUS_LABEL[next]}`);
+            fireToast(hoursLabel
+              ? `${wo.code} → ${WO_STATUS_LABEL[next]} (${hoursLabel} hrs)`
+              : `${wo.code} → ${WO_STATUS_LABEL[next]}`);
             return;
           }
 
@@ -1254,7 +1298,7 @@ function SupportDashboard() {
 
 /* ─── Accounts dashboard ────────────────────────────────── */
 function AccountsDashboard() {
-  const { fmtMoney } = useApp();
+  const { fmtMoney, go } = useApp();
   // Note: accounts role can't auto-pause (RLS rejects), so no
   // useAutoPauseExpiredAmcs hook here — they only consume the alert.
   return (
@@ -1269,8 +1313,11 @@ function AccountsDashboard() {
         <KPI label="AMC due billing" value="11" sub={fmtMoney(384_000, { compact: true })} />
         <KPI label="Approval queue" value="4" />
       </div>
-      <EmptyState icon="receipt" title="Accountant module — Coming soon"
-        sub="AR aging, payment reconciliation against AMC contracts, free-call to invoice conversion, and the AMC reactivation queue will be available in the next release." />
+      <EmptyState icon="receipt" title="Open the Accountant workspace"
+        sub="AR aging report and outstanding-balance KPIs across every unpaid AMC contract."
+        action={<button className="btn btn-primary" onClick={() => go("accountant")}>
+          <Icon name="receipt" size={14} /> Open Accountant
+        </button>} />
     </div>
   );
 }

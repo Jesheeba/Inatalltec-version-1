@@ -9,8 +9,8 @@
 // ============================================================
 
 import type {
-  AmcContract, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem,
-  InventoryItem, Notification, Organization, Project, RepairTicket,
+  AmcContract, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
+  InventoryItem, Notification, Organization, Project, Quotation, RepairTicket,
   ReplacementRequest, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry,
@@ -173,6 +173,12 @@ export const WORK_ORDER_SUB_CONTRACTORS: Record<string, WorkOrderSubContractor> 
 // selectors below all read from here.
 export const WORK_ORDER_SUB_CONTRACTOR_HOURS: Record<string, WorkOrderSubContractorHours> = {};
 
+// Phase 8 — AMC free calls (table from migration 0009b).
+export const FREE_CALLS: Record<string, FreeCall> = {};
+
+// Phase 11 — quotations (migration 0028).
+export const QUOTATIONS: Record<string, Quotation> = {};
+
 // ── APPROVALS / FEED / NOTIFICATIONS / RISKS ───────────────
 export const APPROVALS: Record<string, Approval> = {};
 export const REPLACEMENTS: Record<string, ReplacementRequest> = {};
@@ -207,6 +213,7 @@ export const db = {
   CUSTOMERS, SITES, PROJECTS, AMCS, AMC_SERVICE_SCHEDULE, REPAIRS, WORK_ORDERS,
   WORK_ORDER_TIME_ENTRIES,
   SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTOR_HOURS,
+  FREE_CALLS, QUOTATIONS,
   APPROVALS, REPLACEMENTS,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
@@ -274,4 +281,15 @@ export const db = {
     }
     return total;
   },
+
+  // Phase 8 — free call selectors.
+  freeCallsForAmc: (amcId: string): FreeCall[] =>
+    Object.values(FREE_CALLS)
+      .filter(f => f.amcContractId === amcId)
+      .sort((a, b) => b.reportedAt.localeCompare(a.reportedAt)),
+
+  // Phase 11 — quotation selectors.
+  quotation: (id: string): Quotation | null => QUOTATIONS[id] ?? null,
+  quotationsForCustomer: (cid: string): Quotation[] =>
+    Object.values(QUOTATIONS).filter(q => q.customerId === cid),
 };

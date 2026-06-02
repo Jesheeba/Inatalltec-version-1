@@ -25,6 +25,7 @@ import {
   createReplacementRequest, REPLACEMENT_CONTEXT_LABEL,
   createSubContractor, assignSubContractorToWO,
   logSubContractorHours, editSubContractorHoursEntry,
+  createFreeCall, createQuotation,
   type ProjectStatus, type ProjectStage, type AmcPaymentMethod,
   type JobCategory, type ContractMeta,
 } from "@/lib/create";
@@ -85,6 +86,8 @@ export function CreateModalsHost() {
       )}
       {create.kind === "sub_contractor" && <SubContractorForm />}
       {create.kind === "sub_hours" && <LogSubHoursForm />}
+      {create.kind === "free_call" && <FreeCallForm />}
+      {create.kind === "quotation_v2" && <QuotationFormV2 />}
     </Modal>
   );
 }
@@ -2660,4 +2663,136 @@ function formatYmd(yyyyMmDd: string): string {
   const [y, m, d] = yyyyMmDd.split("-").map(Number);
   if (!y || !m || !d) return yyyyMmDd;
   return formatMonthDay(new Date(y, m - 1, d, 12, 0, 0));
+}
+
+// ─── Free call (Phase 8) ──────────────────────────────────
+function FreeCallForm() {
+  const { closeCreate, fireToast, bumpData, create, me } = useApp();
+  const prefill = (create?.prefill ?? {}) as Record<string, unknown>;
+  const amc_id = String(prefill.amc_id ?? "");
+  const code   = String(prefill.code   ?? "");
+
+  const todayIso = useMemo(() => new Date().toISOString().slice(0, 16), []);
+  const [date, setDate]    = useState(todayIso);
+  const [desc, setDesc]    = useState("");
+  const [notes, setNotes]  = useState("");
+  const [busy, setBusy]    = useState(false);
+  const [err, setErr]      = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    if (!desc.trim()) { setErr("Description is required."); return; }
+    if (!amc_id) { setErr("Missing AMC contract id."); return; }
+    setBusy(true);
+    const res = await createFreeCall({
+      amc_contract_id: amc_id,
+      description: desc,
+      reported_at: new Date(date).toISOString(),
+      notes: notes || null,
+    });
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    fireToast(`Free call logged for ${code || "AMC"}`);
+    bumpData();
+    closeCreate();
+  };
+
+  return (
+    <FormShell icon="phone" title="Log free call"
+      sub={code ? `Against ${code}` : undefined}
+      busy={busy} error={err} onSubmit={submit} submitLabel="Log call">
+      <Section title="Call details">
+        <Field label="Description" required hint="What did the customer report?">
+          <input className="input" required value={desc}
+                 onChange={e => setDesc(e.target.value)} autoFocus
+                 placeholder="e.g. Camera 7 not responding · main lobby" />
+        </Field>
+        <Row>
+          <Field label="Date / time" required>
+            <input className="input" type="datetime-local" required value={date}
+                   onChange={e => setDate(e.target.value)} />
+          </Field>
+          <Field label="Logged by">
+            <input className="input" value={me.name} disabled
+                   style={{ background: "var(--bg-muted)", color: "var(--ink-mute)" }} />
+          </Field>
+        </Row>
+        <Field label="Notes" hint="Optional — additional context for the technician">
+          <textarea className="textarea" rows={3} value={notes}
+                    onChange={e => setNotes(e.target.value)}
+                    placeholder="e.g. Customer requested visit between 09:00-12:00" />
+        </Field>
+      </Section>
+    </FormShell>
+  );
+}
+
+// ─── Quotation v2 (Phase 11) ──────────────────────────────
+// Renamed to QuotationFormV2 to avoid colliding with the legacy
+// placeholder QuotationForm that still exists under create.kind === "quotation".
+function QuotationFormV2() {
+  const { closeCreate, fireToast, bumpData, currentOrg, me } = useApp();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState<string | null>(null);
+  const [f, setF] = useState({
+    title: "", customer_id: "", value_aed: "",
+    valid_until: "", notes: "",
+  });
+  const customers = Object.values(db.CUSTOMERS);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    if (!f.title.trim()) { setErr("Title is required."); return; }
+    setBusy(true);
+    const res = await createQuotation({
+      title: f.title,
+      customer_id: f.customer_id || null,
+      value_aed: f.value_aed ? Number(f.value_aed) : 0,
+      valid_until: f.valid_until || null,
+      notes: f.notes || null,
+    }, me.id);
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    fireToast(`Quotation ${res.quotation.code} created`);
+    bumpData();
+    closeCreate();
+  };
+
+  return (
+    <FormShell icon="fileText" title="New quotation"
+      sub="Quick tracker — title, customer, value"
+      busy={busy} error={err} onSubmit={submit} submitLabel="Create quotation">
+      <Section title="Headline">
+        <Field label="Title" required>
+          <input className="input" required value={f.title}
+                 onChange={e => setF({ ...f, title: e.target.value })}
+                 placeholder="e.g. 24-camera CCTV upgrade — Bay Gate Tower" />
+        </Field>
+        <Row>
+          <Field label="Customer">
+            <Select value={f.customer_id} onChange={v => setF({ ...f, customer_id: v })}
+              placeholder="- Select -"
+              options={customers.map(c => ({ value: c.id, label: c.name }))} />
+          </Field>
+          <Field label={`Value (${currencySymbol(currentOrg)})`}>
+            <input className="input numeric" type="number" min={0} step="0.01"
+                   value={f.value_aed}
+                   onChange={e => setF({ ...f, value_aed: e.target.value })}
+                   placeholder="0" />
+          </Field>
+        </Row>
+        <Field label="Valid until" hint="Optional — when does this quote expire?">
+          <input className="input" type="date" value={f.valid_until}
+                 onChange={e => setF({ ...f, valid_until: e.target.value })} />
+        </Field>
+        <Field label="Notes" hint="Optional — scope summary, payment terms, anything important">
+          <textarea className="textarea" rows={3} value={f.notes}
+                    onChange={e => setF({ ...f, notes: e.target.value })}
+                    placeholder="e.g. Includes design, supply, T&C. 30-day payment terms." />
+        </Field>
+      </Section>
+    </FormShell>
+  );
 }

@@ -711,7 +711,9 @@ export function AmcDetail({ id }: { id: string }) {
         <KPI label="Expires" value={c.expiresAt} />
       </div>
 
-      <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)" }}>
+      <FreeCallsCard amc={c} />
+
+      <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", marginTop: 20 }}>
         <AmcServiceScheduleCard
           rows={schedule}
           error={scheduleError}
@@ -806,6 +808,87 @@ export function AmcDetail({ id }: { id: string }) {
       <AmcPaymentsCard amcId={id} reloadKey={dataVersion} />
       <AmcStatusHistory amcId={id} reloadKey={historyTick + dataVersion} />
     </div>
+  );
+}
+
+/* ─── Free Calls card (Phase 8) ───────────────────────────
+   Renders a count + threshold widget plus a list of logged calls.
+   Admin / md / manager / lead_worker can log new ones.
+   The DB enforces the same via amc_freecalls_write policy. */
+const FREE_CALLS_INCLUDED = 10;
+function FreeCallsCard({ amc }: { amc: AmcContract }) {
+  const { role, openCreate, dataVersion } = useApp();
+  void dataVersion;
+  const used = amc.freeCalls ?? 0;
+  const entries = db.freeCallsForAmc(amc.id);
+  const thresholdHit = used >= FREE_CALLS_INCLUDED;
+  const canLog = role === "admin" || role === "md" || role === "manager" || role === "lead_worker" || role === "accounts";
+
+  if (typeof window !== "undefined") {
+    // eslint-disable-next-line no-console
+    console.log("[FreeCallsCard] rendering for AMC", amc?.code,
+      "used=", used, "included=", FREE_CALLS_INCLUDED,
+      "role=", role, "canLog=", canLog, "entries=", entries.length);
+  }
+
+  return (
+    <section className="card card-pad" data-testid="free-calls-card" style={{ marginTop: 20 }}>
+      <CardHead
+        title="Free calls"
+        sub={`${used} of ${FREE_CALLS_INCLUDED} included`}
+        right={canLog ? (
+          <button className="btn btn-primary btn-sm"
+                  onClick={() => openCreate("free_call", { amc_id: amc.id, code: amc.code })}>
+            <Icon name="plus" size={13} /> Log free call
+          </button>
+        ) : undefined}
+      />
+      {thresholdHit && (
+        <div className="row gap-2" style={{
+          alignItems: "center", padding: "8px 12px", marginBottom: 12,
+          borderRadius: "var(--r-md)",
+          background: "var(--warn-100)", color: "var(--warn-700)",
+          font: "var(--t-small)",
+        }}>
+          <Icon name="alertTriangle" size={14} />
+          Threshold reached — consider invoicing further visits.
+        </div>
+      )}
+      {entries.length === 0 ? (
+        <EmptyState icon="phone" title="No free calls logged yet"
+          sub={canLog
+            ? "Click 'Log free call' when a customer requests a call-out under their AMC."
+            : "Free calls will appear here once the technician logs one."} />
+      ) : (
+        <div className="col gap-2">
+          {entries.map(fc => {
+            const lines = fc.symptom.split(/\n+/);
+            const description = lines[0] ?? "";
+            const notes = lines.slice(1).join(" ").replace(/^Notes:\s*/, "");
+            return (
+              <div key={fc.id} className="row gap-3" style={{
+                padding: "10px 12px", borderRadius: "var(--r-md)",
+                background: "var(--bg-muted)", border: "1px solid var(--border)",
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="truncate" style={{ font: "var(--t-body-md)" }}>{description}</div>
+                  {notes && (
+                    <div className="truncate" style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 2 }}>
+                      {notes}
+                    </div>
+                  )}
+                </div>
+                <span className="numeric" style={{
+                  font: "var(--t-small)", color: "var(--ink-mute)", flexShrink: 0,
+                }}>
+                  {formatRelativeDate(fc.reportedAt.slice(0, 10))}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 

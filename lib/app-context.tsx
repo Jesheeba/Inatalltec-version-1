@@ -23,6 +23,10 @@ export type RouteName =
   | "sub-contractors"
   | "customers" | "sites" | "team" | "reports" | "admin" | "notifications"
   | "organizations" | "admins"
+  // Phase 10 — Accountant module (AR aging + outstanding balances).
+  | "accountant"
+  // Phase 11 — Quotations tracker.
+  | "quotations"
   // pseudo-route - sidebar item opens the Notes slide-out panel instead
   // of navigating; no /notes page exists.
   | "notes";
@@ -36,7 +40,7 @@ export type CreateKind =
   | "workorder" | "repair" | "material_request" | "delivery"
   | "team_member" | "quotation" | "organization" | "note"
   | "amc_payment" | "replacement_request" | "sub_contractor"
-  | "sub_hours";
+  | "sub_hours" | "free_call" | "quotation_v2";
 export interface CreateState { kind: CreateKind; prefill?: Record<string, unknown> }
 
 interface Ctx {
@@ -138,7 +142,7 @@ const NAME_FROM_PATH = (path: string): RouteName => {
   // first hyphen and silently fell back to "dashboard".
   const m = path.match(/^\/([a-z-]+)/);
   const name = (m ? m[1] : "dashboard") as RouteName;
-  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "growth-plan", "sub-contractors", "customers", "sites", "team", "reports", "admin", "notifications", "organizations", "admins"];
+  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "growth-plan", "sub-contractors", "customers", "sites", "team", "reports", "accountant", "quotations", "admin", "notifications", "organizations", "admins"];
   return known.includes(name) ? name : "dashboard";
 };
 
@@ -184,6 +188,8 @@ export function AppProvider({
       for (const s of initialBundle.subContractors) db.SUB_CONTRACTORS[s.id] = s;
       for (const j of initialBundle.workOrderSubContractors) db.WORK_ORDER_SUB_CONTRACTORS[j.id] = j;
       for (const h of initialBundle.workOrderSubContractorHours) db.WORK_ORDER_SUB_CONTRACTOR_HOURS[h.id] = h;
+      for (const fc of initialBundle.freeCalls) db.FREE_CALLS[fc.id] = fc;
+      for (const q of initialBundle.quotations) db.QUOTATIONS[q.id] = q;
       for (const a of initialBundle.approvals) db.APPROVALS[a.id] = a;
       for (const r of initialBundle.replacements) db.REPLACEMENTS[r.id] = r;
     }

@@ -349,6 +349,21 @@ export interface WorkOrderSubContractor {
   note: string | null;
 }
 
+// Free call (migration 0009b). Existing schema only carries
+// `symptom`, `reported_by_customer_at`, `work_order_id`. We map
+// `symptom` as the user-facing description on the form. Technician
+// and notes fields shown on the form are display-only — not
+// persisted, to avoid touching the schema this round.
+export interface FreeCall {
+  id: string;
+  amcContractId: string;
+  reportedAt: string;          // timestamptz, ISO
+  symptom: string;             // user-entered description
+  workOrderId: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
 // One row per logged session for a sub-contractor on a work order
 // (migration 0026). Layered on top of the assignment row in
 // work_order_sub_contractors — the composite FK guarantees the sub is
@@ -364,6 +379,29 @@ export interface WorkOrderSubContractorHours {
   notes: string | null;
   loggedBy: string | null; // users.id who entered it; null if user was deleted
   loggedAt: string;        // ISO timestamptz, server default now()
+}
+
+// Quotation (migration 0028). Light-weight tracker — title, value,
+// customer + a status machine. No line items, no PDF, no tax — that's
+// out of scope for v1. Convert flips status to 'converted' and points
+// at the resulting project or AMC.
+export type QuotationStatus =
+  | "draft" | "sent" | "accepted" | "rejected" | "converted";
+
+export interface Quotation {
+  id: string;
+  code: string;
+  customerId: string | null;
+  title: string;
+  valueAed: number;
+  status: QuotationStatus;
+  validUntil: string | null;        // YYYY-MM-DD
+  convertedToProjectId: string | null;
+  convertedToAmcId: string | null;
+  notes: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // ============================================================

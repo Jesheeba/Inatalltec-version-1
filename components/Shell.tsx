@@ -79,6 +79,8 @@ const NAV_GROUPS: NavGroup[] = [
       // workers see them on the WO detail page, not via a sidebar entry.
       { id: "sub-contractors", label: "Sub-contractors", icon: "users", roles: ["admin", "md", "manager"] },
       { id: "reports", label: "Reports", icon: "chartBar", roles: ["admin", "md", "manager", "accounts"] },
+      { id: "accountant", label: "Accountant", icon: "receipt", roles: ["admin", "md", "manager", "accounts"] },
+      { id: "quotations", label: "Quotations", icon: "fileText", roles: ["admin", "md", "manager", "sales"] },
     ]
   },
   {
@@ -181,6 +183,8 @@ const TITLE_MAP: Record<RouteName, string> = {
   "sub-contractors": "Sub-contractors",
   team: "Team",
   reports: "Reports",
+  accountant: "Accountant",
+  quotations: "Quotations",
   admin: "Admin · Users",
   notifications: "Notifications",
   organizations: "Organizations",

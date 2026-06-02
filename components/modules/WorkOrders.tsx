@@ -130,7 +130,13 @@ export function WorkOrders() {
       </div>
 
       {list.length === 0 ? (
-        <EmptyState icon="briefcase" title="No work orders match" sub="Try a different filter or clear the search." />
+        Object.keys(db.WORK_ORDERS).length === 0 ? (
+          <EmptyState icon="briefcase" title="No work orders yet"
+            sub="Click + Create on the top bar to schedule your first one." />
+        ) : (
+          <EmptyState icon="briefcase" title="No work orders match"
+            sub="Try a different filter or clear the search." />
+        )
       ) : view === "list" ? (
         <div className="card" style={{ overflow: "hidden" }}>
           <div style={{ overflowX: "auto" }}>

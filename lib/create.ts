@@ -23,9 +23,9 @@
 import { supabaseBrowser } from "./supabase/client";
 import { db } from "./db";
 import type {
-  AmcContract, AmcStatus, Approval, Customer, Organization, Project, ProjectPhase, RepairTicket,
-  ReplacementContext, ReplacementRequest, ReplacementStatus,
-  Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
+  AmcContract, AmcStatus, Approval, Customer, FreeCall, Organization, Project, ProjectPhase,
+  Quotation, QuotationStatus, RepairTicket, ReplacementContext, ReplacementRequest,
+  ReplacementStatus, Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType,
 } from "./types";
 
@@ -2609,4 +2609,258 @@ export async function deleteSubContractorHoursEntry(
 
   delete db.WORK_ORDER_SUB_CONTRACTOR_HOURS[entryId];
   return { ok: true };
+}
+
+// ═════════════════════════════════════════════════════════════
+// PHASE 8 — AMC FREE CALLS (table from 0009b)
+// ═════════════════════════════════════════════════════════════
+//
+// The 0009b schema only has symptom + reported_by_customer_at — no
+// dedicated description, technician_id, or notes columns. The UI
+// gathers description + notes; we concat them into `symptom` with
+// a separator so the data survives without touching the schema.
+// Technician is shown on the form for context (auto-filled from
+// session) but not persisted — the demo's "free_calls_used"
+// counter on amc_contracts is the headline metric.
+
+export interface FreeCallInput {
+  amc_contract_id: string;
+  description: string;      // required, lands in symptom
+  reported_at?: string;     // ISO; defaults to now()
+  notes?: string | null;    // optional, appended to symptom
+}
+
+interface FreeCallRow {
+  id: string;
+  amc_contract_id: string;
+  reported_by_customer_at: string;
+  symptom: string | null;
+  work_order_id: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+function freeCallRowToType(r: FreeCallRow): FreeCall {
+  return {
+    id:              r.id,
+    amcContractId:   r.amc_contract_id,
+    reportedAt:      r.reported_by_customer_at,
+    symptom:         r.symptom ?? "",
+    workOrderId:     r.work_order_id,
+    completedAt:     r.completed_at,
+    createdAt:       r.created_at,
+  };
+}
+
+export async function createFreeCall(
+  input: FreeCallInput,
+): Promise<{ ok: true; freeCall: FreeCall } | { ok: false; error: string }> {
+  if (!input.amc_contract_id) return { ok: false, error: "AMC contract is required." };
+  if (!input.description?.trim()) return { ok: false, error: "Description is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const symptom = input.notes?.trim()
+    ? `${input.description.trim()}\n\nNotes: ${input.notes.trim()}`
+    : input.description.trim();
+  const reportedAt = input.reported_at || new Date().toISOString();
+
+  const { data, error } = await supa.from("amc_free_calls").insert({
+    amc_contract_id:         input.amc_contract_id,
+    reported_by_customer_at: reportedAt,
+    symptom,
+  }).select("id, amc_contract_id, reported_by_customer_at, symptom, work_order_id, completed_at, created_at")
+    .maybeSingle();
+
+  if (error)   return { ok: false, error: error.message };
+  if (!data)   return { ok: false, error: "Free-call row missing after insert." };
+
+  const freeCall = freeCallRowToType(data as FreeCallRow);
+  db.FREE_CALLS[freeCall.id] = freeCall;
+
+  // Best-effort: increment amc_contracts.free_calls_used. Failure
+  // (e.g. RLS) is non-fatal — the count refreshes on next hydrate.
+  const cur = db.AMCS[input.amc_contract_id];
+  if (cur) {
+    const nextCount = (cur.freeCalls || 0) + 1;
+    const { error: incErr } = await supa
+      .from("amc_contracts")
+      .update({ free_calls_used: nextCount })
+      .eq("id", input.amc_contract_id);
+    if (!incErr) {
+      db.AMCS[input.amc_contract_id] = { ...cur, freeCalls: nextCount };
+    }
+  }
+
+  return { ok: true, freeCall };
+}
+
+// ═════════════════════════════════════════════════════════════
+// PHASE 11 — QUOTATIONS (migration 0028)
+// ═════════════════════════════════════════════════════════════
+
+export interface QuotationInput {
+  code?: string;
+  customer_id?: string | null;
+  title: string;
+  value_aed?: number;
+  valid_until?: string | null;
+  notes?: string | null;
+}
+
+interface QuotationRow {
+  id: string;
+  code: string;
+  customer_id: string | null;
+  title: string;
+  value_aed: number | string;
+  status: string;
+  valid_until: string | null;
+  converted_to_project_id: string | null;
+  converted_to_amc_id: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function quotationRowToType(r: QuotationRow): Quotation {
+  const v = typeof r.value_aed === "number" ? r.value_aed : Number(r.value_aed);
+  return {
+    id:                    r.id,
+    code:                  r.code,
+    customerId:            r.customer_id,
+    title:                 r.title,
+    valueAed:              Number.isFinite(v) ? v : 0,
+    status:                (r.status as QuotationStatus) ?? "draft",
+    validUntil:            r.valid_until,
+    convertedToProjectId:  r.converted_to_project_id,
+    convertedToAmcId:      r.converted_to_amc_id,
+    notes:                 r.notes,
+    createdBy:             r.created_by,
+    createdAt:             r.created_at,
+    updatedAt:             r.updated_at,
+  };
+}
+
+export async function createQuotation(
+  input: QuotationInput,
+  createdBy?: string,
+): Promise<{ ok: true; quotation: Quotation } | { ok: false; error: string }> {
+  if (!input.title?.trim()) return { ok: false, error: "Title is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const code = input.code?.trim() || `QTN-${new Date().getFullYear()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+
+  const { data, error } = await supa.from("quotations").insert({
+    code,
+    customer_id: input.customer_id || null,
+    title:       input.title.trim(),
+    value_aed:   input.value_aed ?? 0,
+    valid_until: input.valid_until || null,
+    notes:       input.notes?.trim() || null,
+    created_by:  createdBy || null,
+  })
+  .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+  .maybeSingle();
+
+  if (error) {
+    if (/duplicate key/i.test(error.message)) {
+      return { ok: false, error: "A quotation with this code already exists." };
+    }
+    return { ok: false, error: error.message };
+  }
+  if (!data) return { ok: false, error: "Quotation row missing after insert." };
+
+  const quotation = quotationRowToType(data as QuotationRow);
+  db.QUOTATIONS[quotation.id] = quotation;
+  return { ok: true, quotation };
+}
+
+export async function updateQuotationStatus(
+  id: string,
+  status: QuotationStatus,
+): Promise<{ ok: true; quotation: Quotation } | { ok: false; error: string }> {
+  if (!id) return { ok: false, error: "Quotation id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("quotations")
+    .update({ status })
+    .eq("id", id)
+    .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+    .maybeSingle();
+  if (error) return { ok: false, error: error.message };
+  if (!data) return { ok: false, error: "Quotation not found." };
+
+  const quotation = quotationRowToType(data as QuotationRow);
+  db.QUOTATIONS[quotation.id] = quotation;
+  return { ok: true, quotation };
+}
+
+/**
+ * Convert a quotation. Creates a downstream project OR AMC contract
+ * using the quotation's title + value + customer, then UPDATEs the
+ * quotation row to status='converted' with the appropriate FK.
+ *
+ * Both downstream creates go through the same helpers normal users use
+ * (createProject / createAmc), so they inherit all RLS gating and
+ * downstream triggers (e.g. AMC service-1 seeding from 0027).
+ */
+export async function convertQuotation(
+  id: string,
+  target: "project" | "amc",
+): Promise<{ ok: true; targetId: string; quotation: Quotation } | { ok: false; error: string }> {
+  const q = db.QUOTATIONS[id];
+  if (!q) return { ok: false, error: "Quotation not found." };
+  if (q.status === "converted") return { ok: false, error: "Quotation already converted." };
+  if (!q.customerId) return { ok: false, error: "Set a customer on the quotation before converting." };
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  let targetId: string | null = null;
+  const patch: Record<string, unknown> = { status: "converted" };
+
+  if (target === "project") {
+    const today = new Date().toISOString().slice(0, 10);
+    const due   = new Date(); due.setMonth(due.getMonth() + 6);
+    const res = await createProject({
+      name: q.title,
+      customer_id: q.customerId,
+      value_aed: q.valueAed,
+      started_at: today,
+      due_at: due.toISOString().slice(0, 10),
+    });
+    if (!res.ok) return { ok: false, error: `Project create failed: ${res.error}` };
+    targetId = res.id;
+    patch.converted_to_project_id = targetId;
+  } else {
+    const exp = new Date(); exp.setFullYear(exp.getFullYear() + 1);
+    const res = await createAmc({
+      customer_id: q.customerId,
+      value_aed: q.valueAed,
+      expires_at: exp.toISOString().slice(0, 10),
+    });
+    if (!res.ok) return { ok: false, error: `AMC create failed: ${res.error}` };
+    targetId = res.id;
+    patch.converted_to_amc_id = targetId;
+  }
+
+  const { data, error } = await supa.from("quotations")
+    .update(patch)
+    .eq("id", id)
+    .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+    .maybeSingle();
+  if (error) return { ok: false, error: `Created ${target} but couldn't flip quotation: ${error.message}` };
+  if (!data) return { ok: false, error: "Quotation update returned no row." };
+
+  const quotation = quotationRowToType(data as QuotationRow);
+  db.QUOTATIONS[quotation.id] = quotation;
+  return { ok: true, targetId: targetId!, quotation };
 }

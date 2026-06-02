@@ -10,10 +10,10 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
-  AmcContract, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, Milestone,
-  Project, ProjectPhase, RepairTicket, ReplacementContext, ReplacementRequest, ReplacementStatus,
-  Site, SubContractor, Team, WorkOrder, WorkOrderSubContractor, WorkOrderSubContractorHours,
-  WorkOrderTimeEntry, WoStatus, WoType,
+  AmcContract, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
+  Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
+  ReplacementRequest, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
+  WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType,
 } from "./types";
 import { formatShortDate } from "./dates";
 
@@ -48,6 +48,12 @@ export interface HydrationBundle {
   // this WO"; the hours log says "and worked these sessions on these
   // days". Lead Tech writes via lib/create.logSubContractorHours.
   workOrderSubContractorHours: WorkOrderSubContractorHours[];
+  // Phase 8 — AMC free calls. Existing table from 0009b. The detail
+  // page renders the count + a Log button.
+  freeCalls: FreeCall[];
+  // Phase 11 — quotations (migration 0028). Independent module; rows
+  // power the /quotations list + convert flow.
+  quotations: Quotation[];
   approvals: Approval[];
   replacements: ReplacementRequest[];
 }
@@ -314,6 +320,39 @@ function mapWorkOrderSubContractorHours(r: Row): WorkOrderSubContractorHours {
   };
 }
 
+function mapFreeCall(r: Row): FreeCall {
+  return {
+    id:              asString(r.id),
+    amcContractId:   asString(r.amc_contract_id),
+    reportedAt:      asString(r.reported_by_customer_at),
+    symptom:         asString(r.symptom),
+    workOrderId:    (r.work_order_id as string | null) ?? null,
+    completedAt:    (r.completed_at  as string | null) ?? null,
+    createdAt:       asString(r.created_at),
+  };
+}
+
+function mapQuotation(r: Row): Quotation {
+  const rawVal = r.value_aed;
+  const value = typeof rawVal === "number" ? rawVal
+              : typeof rawVal === "string" ? Number(rawVal) : 0;
+  return {
+    id:                    asString(r.id),
+    code:                  asString(r.code),
+    customerId:           (r.customer_id as string | null) ?? null,
+    title:                 asString(r.title),
+    valueAed:              value,
+    status:               ((r.status as QuotationStatus) ?? "draft"),
+    validUntil:           (r.valid_until as string | null) ?? null,
+    convertedToProjectId: (r.converted_to_project_id as string | null) ?? null,
+    convertedToAmcId:     (r.converted_to_amc_id     as string | null) ?? null,
+    notes:                (r.notes      as string | null) ?? null,
+    createdBy:            (r.created_by as string | null) ?? null,
+    createdAt:             asString(r.created_at),
+    updatedAt:             asString(r.updated_at),
+  };
+}
+
 function mapReplacement(r: Row): ReplacementRequest {
   return {
     id:               asString(r.id),
@@ -389,6 +428,7 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     customersRaw, sitesRaw, teamsRaw, projectsRaw, milestonesRaw,
     amcsRaw, amcServicesRaw, repairsRaw, workOrdersRaw, woAssignRaw, approvalsRaw, approvalStepsRaw, usersRaw,
     replacementsRaw, woTimeEntriesRaw, subContractorsRaw, woSubContractorsRaw, woSubHoursRaw,
+    freeCallsRaw, quotationsRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -408,6 +448,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "sub_contractors"),
     fetchAll(admin, "work_order_sub_contractors"),
     fetchAll(admin, "work_order_sub_contractor_hours"),
+    fetchAll(admin, "amc_free_calls"),
+    fetchAll(admin, "quotations"),
   ]);
 
   // Group milestones by project_id.
@@ -470,6 +512,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     subContractors: subContractorsRaw.map(mapSubContractor),
     workOrderSubContractors: woSubContractorsRaw.map(mapWorkOrderSubContractor),
     workOrderSubContractorHours: woSubHoursRaw.map(mapWorkOrderSubContractorHours),
+    freeCalls: freeCallsRaw.map(mapFreeCall),
+    quotations: quotationsRaw.map(mapQuotation),
     approvals: approvalsRaw.map(r => mapApproval(r, stepsByApproval.get(asString(r.id)) ?? [])),
     replacements: replacementsRaw.map(mapReplacement),
   };
