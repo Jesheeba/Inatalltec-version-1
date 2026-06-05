@@ -13,11 +13,15 @@
 // quote_write policy from migration 0028.
 // ============================================================
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
 import { db } from "@/lib/db";
-import { updateQuotationStatus, convertQuotation } from "@/lib/create";
+import {
+  updateQuotationStatus, convertQuotation,
+  updateQuotation, downloadQuotationFile,
+} from "@/lib/create";
 import {
   EmptyState, FilterBar, KPI, PageHeader, SignOutButton,
 } from "../shared";
@@ -58,6 +62,16 @@ export function Quotations() {
   const [filter, setFilter] = useState<Filter>("all");
   const [q, setQ] = useState("");
   const [convertTarget, setConvertTarget] = useState<{ id: string; target: "project" | "amc" } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  // Deep-link from elsewhere in the app: /quotations?open=<id> opens
+  // the editor on mount. Used by the Project detail "Open quotation"
+  // button so Sales can jump straight to the auto-generated draft.
+  const searchParams = useSearchParams();
+  useEffect(() => {
+    const openId = searchParams?.get("open");
+    if (openId) setEditingId(openId);
+  }, [searchParams]);
 
   const all = useMemo(
     () => Object.values(db.QUOTATIONS).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
@@ -171,7 +185,7 @@ export function Quotations() {
                   <th style={{ textAlign: "right" }}>Value</th>
                   <th>Status</th>
                   <th>Valid until</th>
-                  <th style={{ width: 200 }}>Actions</th>
+                  <th style={{ width: 160 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -203,28 +217,78 @@ export function Quotations() {
                         {x.validUntil ?? "—"}
                       </td>
                       <td>
-                        {canWrite && x.status === "accepted" && !x.convertedToProjectId && !x.convertedToAmcId && (
-                          <div className="row gap-1">
-                            <button className="btn btn-primary btn-sm"
-                                    onClick={() => setConvertTarget({ id: x.id, target: "project" })}>
-                              → Project
-                            </button>
-                            <button className="btn btn-ghost btn-sm"
-                                    onClick={() => setConvertTarget({ id: x.id, target: "amc" })}>
-                              → AMC
-                            </button>
-                          </div>
-                        )}
-                        {x.convertedToProjectId && (
-                          <button className="btn btn-ghost btn-sm" onClick={() => openProject(x.convertedToProjectId!)}>
-                            View project <Icon name="arrowRight" size={12} />
+                        {/* Icon-only horizontal action bar. Each button
+                            carries a native `title` so hover shows the
+                            label. nowrap keeps the strip on one line; if
+                            the screen is too narrow, the table column
+                            scrolls horizontally (the parent already wraps
+                            with overflowX: auto). */}
+                        <div className="row gap-1" style={{ flexWrap: "nowrap", alignItems: "center" }}>
+                          <button
+                            title="Open / edit"
+                            aria-label="Open / edit"
+                            className="btn btn-ghost btn-sm"
+                            style={{ padding: "4px 8px" }}
+                            onClick={() => setEditingId(x.id)}>
+                            <Icon name="pen" size={13} />
                           </button>
-                        )}
-                        {x.convertedToAmcId && (
-                          <button className="btn btn-ghost btn-sm" onClick={() => openAmc(x.convertedToAmcId!)}>
-                            View AMC <Icon name="arrowRight" size={12} />
+                          <button
+                            title="Download PDF"
+                            aria-label="Download PDF"
+                            className="btn btn-ghost btn-sm"
+                            style={{ padding: "4px 8px" }}
+                            onClick={() => downloadQuotationFile(x, "pdf")}>
+                            <Icon name="fileText" size={13} />
                           </button>
-                        )}
+                          <button
+                            title="Download Word"
+                            aria-label="Download Word"
+                            className="btn btn-ghost btn-sm"
+                            style={{ padding: "4px 8px" }}
+                            onClick={() => downloadQuotationFile(x, "word")}>
+                            <Icon name="arrowDown" size={13} />
+                          </button>
+                          {canWrite && x.status === "accepted" && !x.convertedToProjectId && !x.convertedToAmcId && (
+                            <>
+                              <button
+                                title="Convert to Project"
+                                aria-label="Convert to Project"
+                                className="btn btn-primary btn-sm"
+                                style={{ padding: "4px 8px" }}
+                                onClick={() => setConvertTarget({ id: x.id, target: "project" })}>
+                                <Icon name="briefcase" size={13} />
+                              </button>
+                              <button
+                                title="Convert to AMC"
+                                aria-label="Convert to AMC"
+                                className="btn btn-primary btn-sm"
+                                style={{ padding: "4px 8px" }}
+                                onClick={() => setConvertTarget({ id: x.id, target: "amc" })}>
+                                <Icon name="refresh" size={13} />
+                              </button>
+                            </>
+                          )}
+                          {x.convertedToProjectId && (
+                            <button
+                              title="View linked project"
+                              aria-label="View linked project"
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: "4px 8px" }}
+                              onClick={() => openProject(x.convertedToProjectId!)}>
+                              <Icon name="externalLink" size={13} />
+                            </button>
+                          )}
+                          {x.convertedToAmcId && (
+                            <button
+                              title="View linked AMC"
+                              aria-label="View linked AMC"
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: "4px 8px" }}
+                              onClick={() => openAmc(x.convertedToAmcId!)}>
+                              <Icon name="externalLink" size={13} />
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -257,6 +321,223 @@ export function Quotations() {
           </div>
         </div>
       )}
+
+      {editingId && (
+        <QuotationEditor
+          quotationId={editingId}
+          canEdit={canWrite}
+          onClose={() => setEditingId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ─── Migration 0035 — Quotation editor modal ──────────────
+ *
+ * Opens when the user clicks "Open" on a row. Six editable fields
+ * (Title, Customer-readonly, Value, Valid-until, Scope, Terms,
+ * Notes). The auto-generate hook on createProject seeds placeholder
+ * text for Scope and Terms — Sales replaces them here.
+ *
+ * Header carries the Download PDF / Download Word buttons. PDF goes
+ * via the browser print dialog (Save as PDF); Word downloads a .doc
+ * file with Word-friendly HTML — no PDF/DOCX library is in the bundle.
+ * ─────────────────────────────────────────────────────────── */
+function QuotationEditor({
+  quotationId, canEdit, onClose,
+}: {
+  quotationId: string;
+  canEdit: boolean;
+  onClose: () => void;
+}) {
+  const { fireToast, bumpData, dataVersion } = useApp();
+  void dataVersion;
+  const q = db.QUOTATIONS[quotationId];
+  // Initialize from mirror; subsequent edits live in form state.
+  const [title, setTitle]       = useState(q?.title ?? "");
+  const [value, setValue]       = useState<string>(String(q?.valueAed ?? 0));
+  const [validUntil, setValid]  = useState(q?.validUntil ?? "");
+  const [desc, setDesc]         = useState(q?.description ?? "");
+  const [terms, setTerms]       = useState(q?.terms ?? "");
+  const [notes, setNotes]       = useState(q?.notes ?? "");
+  const [busy, setBusy]         = useState(false);
+  const [err, setErr]           = useState<string | null>(null);
+
+  if (!q) {
+    return (
+      <div className="modal-back" onClick={onClose}>
+        <div className="modal" onClick={e => e.stopPropagation()}
+             style={{ maxWidth: 480, padding: 24 }}>
+          <div style={{ font: "var(--t-h3)", marginBottom: 8 }}>Quotation not found</div>
+          <div style={{ font: "var(--t-body)", color: "var(--ink-mute)", marginBottom: 16 }}>
+            It may have been deleted or you may not have permission to view it.
+          </div>
+          <div className="row" style={{ justifyContent: "flex-end" }}>
+            <button className="btn btn-ghost" onClick={onClose}>Close</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const customer = q.customerId ? db.cust(q.customerId)?.name ?? "—" : "—";
+
+  const onSave = async () => {
+    setErr(null);
+    const parsedValue = Number(value);
+    if (!title.trim())          { setErr("Title is required."); return; }
+    if (!Number.isFinite(parsedValue) || parsedValue < 0) {
+      setErr("Value must be a non-negative number.");
+      return;
+    }
+    setBusy(true);
+    const res = await updateQuotation(quotationId, {
+      title,
+      value_aed:   parsedValue,
+      valid_until: validUntil || null,
+      description: desc,
+      terms,
+      notes,
+    });
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    fireToast(`${q.code} saved`);
+    bumpData();
+  };
+
+  const onDownload = (format: "pdf" | "word") => {
+    // Pull the freshest version (mirror was just updated by onSave).
+    const current = db.QUOTATIONS[quotationId] ?? q;
+    downloadQuotationFile(current, format);
+  };
+
+  return (
+    <div className="modal-back" onClick={onClose}>
+      <div
+        className="modal"
+        onClick={e => e.stopPropagation()}
+        style={{ maxWidth: 720, width: "calc(100vw - 32px)", padding: 0 }}
+      >
+        <div style={{
+          padding: "16px 24px",
+          borderBottom: "1px solid var(--border)",
+          display: "flex", alignItems: "center", gap: 12,
+        }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Quotation · {q.code}
+            </div>
+            <div className="truncate" style={{ font: "var(--t-h3)" }}>{title || "(untitled)"}</div>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={() => onDownload("pdf")}>
+            <Icon name="fileText" size={13} /> PDF
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={() => onDownload("word")}>
+            <Icon name="fileText" size={13} /> Word
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>
+            <Icon name="x" size={13} />
+          </button>
+        </div>
+
+        <div style={{ padding: 24, maxHeight: "70vh", overflowY: "auto" }}>
+          <div style={{
+            display: "grid", gap: 12,
+            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            marginBottom: 16,
+          }}>
+            <FormField label="Customer">
+              <div style={{ font: "var(--t-body-md)", padding: "8px 0" }}>{customer}</div>
+            </FormField>
+            <FormField label="Value (AED)">
+              <input className="input input-md" type="number" min="0" step="0.01"
+                     value={value} disabled={!canEdit || busy}
+                     onChange={e => setValue(e.target.value)} />
+            </FormField>
+            <FormField label="Valid until">
+              <input className="input input-md" type="date"
+                     value={validUntil} disabled={!canEdit || busy}
+                     onChange={e => setValid(e.target.value)} />
+            </FormField>
+          </div>
+
+          <FormField label="Title">
+            <input className="input input-md" value={title}
+                   disabled={!canEdit || busy}
+                   onChange={e => setTitle(e.target.value)} />
+          </FormField>
+
+          <div style={{ marginTop: 16 }}>
+            <FormField label="Scope of work">
+              <textarea
+                className="input"
+                value={desc}
+                disabled={!canEdit || busy}
+                rows={8}
+                placeholder="Describe the scope of work…"
+                onChange={e => setDesc(e.target.value)}
+                style={{ resize: "vertical", fontFamily: "inherit", lineHeight: 1.5 }} />
+            </FormField>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <FormField label="Terms">
+              <textarea
+                className="input"
+                value={terms}
+                disabled={!canEdit || busy}
+                rows={6}
+                placeholder="Payment terms…"
+                onChange={e => setTerms(e.target.value)}
+                style={{ resize: "vertical", fontFamily: "inherit", lineHeight: 1.5 }} />
+            </FormField>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <FormField label="Notes (optional)">
+              <textarea
+                className="input"
+                value={notes}
+                disabled={!canEdit || busy}
+                rows={3}
+                placeholder="Internal notes or extra conditions…"
+                onChange={e => setNotes(e.target.value)}
+                style={{ resize: "vertical", fontFamily: "inherit", lineHeight: 1.5 }} />
+            </FormField>
+          </div>
+
+          {err && (
+            <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginTop: 12 }}>
+              {err}
+            </div>
+          )}
+        </div>
+
+        <div style={{
+          padding: "12px 24px",
+          borderTop: "1px solid var(--border)",
+          display: "flex", justifyContent: "flex-end", gap: 8,
+        }}>
+          <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Close</button>
+          {canEdit && (
+            <button className="btn btn-primary" onClick={onSave} disabled={busy}>
+              {busy ? "Saving…" : "Save changes"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FormField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="col" style={{ gap: 4 }}>
+      <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        {label}
+      </label>
+      {children}
     </div>
   );
 }

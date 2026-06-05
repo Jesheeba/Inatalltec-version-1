@@ -34,6 +34,7 @@ export type PermissionAction =
   | "CREATE_MATERIAL_REQUEST"
   | "CREATE_REPLACEMENT"
   | "CREATE_USER"
+  | "CREATE_TEAM_MEMBER"
   | "CREATE_QUOTATION"
   | "CREATE_ORGANIZATION"
   // "View all" gates — when false, the page either hides or scopes
@@ -58,7 +59,13 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   // Drivers explicitly excluded — they don't do replacements (spec).
   // Sales / Accounts / Service Support also excluded (not field-execution roles).
   CREATE_REPLACEMENT:       ["admin", "md", "manager", "lead_worker", "worker", "subcontractor"],
+  // Full system-user creation (any role, incl. office/admin staff) — admin only.
   CREATE_USER:              ["admin"],
+  // Adding field-execution staff (worker / lead / driver / subcontractor) to the
+  // Team roster. Lead Technicians assign work orders, so they need to be able to
+  // onboard the subcontractors and crew they assign. Office/admin roles cannot be
+  // minted through this path — that stays CREATE_USER (admin only).
+  CREATE_TEAM_MEMBER:       ["admin", "md", "manager", "lead_worker"],
   CREATE_QUOTATION:         ["admin", "md", "manager", "sales"],
   CREATE_ORGANIZATION:      [], // super_admin only — handled separately
 
@@ -97,6 +104,7 @@ export function canCreateAnything(role: Role): boolean {
     can(role, "CREATE_WORK_ORDER") ||
     can(role, "CREATE_MATERIAL_REQUEST") ||
     can(role, "CREATE_USER") ||
+    can(role, "CREATE_TEAM_MEMBER") ||
     can(role, "CREATE_QUOTATION")
   );
 }

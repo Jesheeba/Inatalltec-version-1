@@ -5,12 +5,13 @@
 // (Ported from modules/misc.jsx)
 // ============================================================
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
 import { db, ROLE_LABELS, isCoreOperationalRole } from "@/lib/db";
 import { can, listScopeFor } from "@/lib/permissions";
+import { hasWorkerConflict } from "@/lib/conflicts";
 import {
   deleteUser, updateProject,
   PROJECT_STATUSES, PROJECT_STAGES,
@@ -29,11 +30,37 @@ import {
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
-  const { openWO, openCreate, role } = useApp();
+  const { openWO, openCreate, role, dataVersion } = useApp();
+  void dataVersion; // re-render the board whenever WO mirrors change
   const hours: number[] = [];
   for (let h = 7; h <= 19; h++) hours.push(h);
-  const wos = Object.values(db.WORK_ORDERS).filter(w => w.scheduledStart.startsWith("2025-05-16"));
+
+  // Live date scoping — the board keys off the wall clock instead of a
+  // hard-coded demo date, so "today" always means the current day. Mirrors
+  // the pattern used by the field Dashboard (Dashboard.tsx).
+  const now = new Date();
+  const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const eyebrowText = `Today · ${formatMonthDay(now)}`;
+
+  const wos = Object.values(db.WORK_ORDERS).filter(w => w.scheduledStart.startsWith(todayKey));
   const leads = Array.from(new Set(wos.map(w => w.assignedLead)));
+
+  // Distinct on-duty crew today = every lead + assignee on a scheduled WO.
+  const crew = new Set<string>();
+  for (const w of wos) {
+    if (w.assignedLead) crew.add(w.assignedLead);
+    for (const a of w.assigned ?? []) crew.add(a);
+  }
+
+  // Delivery orders = WOs whose type is DELIVERY (no separate entity exists).
+  const deliveries = wos.filter(w => w.type === "DELIVERY");
+
+  // Real conflict count — a WO is in conflict when its assigned lead is
+  // double-booked over an overlapping window (see lib/conflicts.ts). Counts
+  // each conflicting WO once; excludes itself from the overlap check.
+  const conflictCount = wos.filter(w =>
+    w.assignedLead && hasWorkerConflict(w.assignedLead, w.scheduledStart, w.scheduledEnd, w.id)
+  ).length;
 
   const colorMap = (type: string) => {
     if (type === "AMC") return { bg: "var(--pri-100)", bar: "var(--pri-500)", ink: "var(--pri-700)" };
@@ -46,7 +73,7 @@ export function Scheduling() {
 
   return (
     <div className="main-pad">
-      <PageHeader eyebrow="Today · 16 May" title="Scheduling & dispatch"
+      <PageHeader eyebrow={eyebrowText} title="Scheduling & dispatch"
         sub="Unified calendar · drag-drop on desktop, tap-to-select on mobile · conflict detection live."
         right={
           <div className="row gap-2">
@@ -65,8 +92,9 @@ export function Scheduling() {
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Today" value={wos.length} sub="scheduled WOs" />
         <KPI label="In progress" value={wos.filter(w => w.status === "in_progress").length} />
-        <KPI label="Crew on duty" value={leads.length} sub={leads.length + " leads · 7 techs"} />
-        <KPI label="Conflicts" value="0" sub="all clear" trend="up" />
+        <KPI label="Deliveries" value={deliveries.length} sub={deliveries.length === 1 ? "delivery order" : "delivery orders"} />
+        <KPI label="Crew on duty" value={crew.size} sub={leads.length + (leads.length === 1 ? " lead · " : " leads · ") + crew.size + " on duty"} />
+        <KPI label="Conflicts" value={conflictCount} sub={conflictCount === 0 ? "all clear" : "needs attention"} trend={conflictCount === 0 ? "up" : "down"} />
       </div>
 
       <div className="card card-pad">
@@ -523,6 +551,8 @@ export function ProjectDetail({ id }: { id: string }) {
         <ProjectManpowerKpi projectId={id} />
       </div>
 
+      <ProjectQuotationLink projectId={id} />
+
       <div style={{ display: "grid", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
         <section className="card card-pad">
           <CardHead title="Milestones" sub="Standard UAE payment-term ladder" />
@@ -583,17 +613,30 @@ export function ProjectDetail({ id }: { id: string }) {
         <CardHead
           title={"Work orders · " + wos.length}
           right={canCreateWo ? (
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => openCreate("workorder", {
-                source_kind: "project",
-                source_id: id,
-                customer_id: p.customer,
-                site_id: p.site || undefined,
-              })}
-            >
-              <Icon name="plus" size={13} /> Create Work Order
-            </button>
+            <div className="row gap-2">
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => openCreate("workorder", {
+                  source_kind: "project",
+                  source_id: id,
+                  customer_id: p.customer,
+                  site_id: p.site || undefined,
+                })}
+              >
+                <Icon name="plus" size={13} /> Create Work Order
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => openCreate("delivery", {
+                  source_kind: "project",
+                  source_id: id,
+                  customer_id: p.customer,
+                  site_id: p.site || undefined,
+                })}
+              >
+                <Icon name="truck" size={13} /> Schedule Delivery
+              </button>
+            </div>
           ) : undefined}
         />
         <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))" }}>
@@ -603,17 +646,30 @@ export function ProjectDetail({ id }: { id: string }) {
               icon="briefcase"
               title="No work orders yet"
               action={canCreateWo ? (
-                <button
-                  className="btn btn-primary"
-                  onClick={() => openCreate("workorder", {
-                    source_kind: "project",
-                    source_id: id,
-                    customer_id: p.customer,
-                    site_id: p.site || undefined,
-                  })}
-                >
-                  <Icon name="plus" size={14} /> Create Work Order
-                </button>
+                <div className="row gap-2">
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => openCreate("workorder", {
+                      source_kind: "project",
+                      source_id: id,
+                      customer_id: p.customer,
+                      site_id: p.site || undefined,
+                    })}
+                  >
+                    <Icon name="plus" size={14} /> Create Work Order
+                  </button>
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => openCreate("delivery", {
+                      source_kind: "project",
+                      source_id: id,
+                      customer_id: p.customer,
+                      site_id: p.site || undefined,
+                    })}
+                  >
+                    <Icon name="truck" size={14} /> Schedule Delivery
+                  </button>
+                </div>
               ) : undefined}
             />
           )}
@@ -659,6 +715,41 @@ function ProjectManHoursKpi({ projectId }: { projectId: string }) {
   return (
     <KPI label="Total man-hours" value={`${total.toFixed(1)} hrs`}
       sub={`${workerHrs.toFixed(1)} worker · ${subHrs.toFixed(1)} sub`} />
+  );
+}
+
+// Migration 0035 — surfaces the auto-generated quotation that was
+// created alongside this project (project_id FK on quotations).
+// Shows nothing when the project pre-dates 0035 or RLS hides the row.
+// Clicking "Open" navigates to /quotations?open=<id> which auto-opens
+// the editor on mount.
+function ProjectQuotationLink({ projectId }: { projectId: string }) {
+  const { go, dataVersion } = useApp();
+  void dataVersion;
+  const quotation = useMemo(
+    () => Object.values(db.QUOTATIONS).find(q => q.projectId === projectId) ?? null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, dataVersion],
+  );
+  if (!quotation) return null;
+  return (
+    <section className="card card-pad" style={{ marginBottom: 20 }}>
+      <div className="row gap-3" style={{ alignItems: "center" }}>
+        <Icon name="fileText" size={18} style={{ color: "var(--pri-700)", flexShrink: 0 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+            Quotation · {quotation.code}
+          </div>
+          <div className="truncate" style={{ font: "var(--t-body-md)", fontWeight: 600 }}>
+            {quotation.title}
+          </div>
+        </div>
+        <button className="btn btn-primary btn-sm"
+                onClick={() => go("quotations", { open: quotation.id })}>
+          Open quotation <Icon name="arrowRight" size={12} />
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -1115,16 +1206,28 @@ export function RepairDetail({ id }: { id: string }) {
         <CardHead
           title={`Work orders · ${wos.length}`}
           right={canCreateWo ? (
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => openCreate("workorder", {
-                source_kind: "repair",
-                source_id: id,
-                customer_id: t.customer,
-                site_id: t.site || undefined,
-              })}>
-              <Icon name="plus" size={13} /> Create Work Order
-            </button>
+            <div className="row gap-2">
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => openCreate("workorder", {
+                  source_kind: "repair",
+                  source_id: id,
+                  customer_id: t.customer,
+                  site_id: t.site || undefined,
+                })}>
+                <Icon name="plus" size={13} /> Create Work Order
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => openCreate("delivery", {
+                  source_kind: "repair",
+                  source_id: id,
+                  customer_id: t.customer,
+                  site_id: t.site || undefined,
+                })}>
+                <Icon name="truck" size={13} /> Schedule Delivery
+              </button>
+            </div>
           ) : undefined} />
         <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))" }}>
           {wos.map(w => <WoCard key={w.id} wo={w} compact onClick={() => openWO(w.id)} />)}
@@ -1133,16 +1236,28 @@ export function RepairDetail({ id }: { id: string }) {
               icon="briefcase"
               title="No work orders yet"
               action={canCreateWo ? (
-                <button
-                  className="btn btn-primary"
-                  onClick={() => openCreate("workorder", {
-                    source_kind: "repair",
-                    source_id: id,
-                    customer_id: t.customer,
-                    site_id: t.site || undefined,
-                  })}>
-                  <Icon name="plus" size={14} /> Create Work Order
-                </button>
+                <div className="row gap-2">
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => openCreate("workorder", {
+                      source_kind: "repair",
+                      source_id: id,
+                      customer_id: t.customer,
+                      site_id: t.site || undefined,
+                    })}>
+                    <Icon name="plus" size={14} /> Create Work Order
+                  </button>
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => openCreate("delivery", {
+                      source_kind: "repair",
+                      source_id: id,
+                      customer_id: t.customer,
+                      site_id: t.site || undefined,
+                    })}>
+                    <Icon name="truck" size={14} /> Schedule Delivery
+                  </button>
+                </div>
               ) : undefined} />
           )}
         </div>
@@ -1202,8 +1317,12 @@ export function Inventory() {
 
 /* ─── Logistics ───────────────────────────────────────── */
 export function Logistics() {
-  const { openWO, openCreate, role } = useApp();
+  const { openWO, openCreate, role, dataVersion } = useApp();
   const deliveries = Object.values(db.WORK_ORDERS).filter(w => w.type === "DELIVERY");
+  const drivers = useMemo(
+    () => Object.values(db.USERS).filter(u => u.role === "driver"),
+    [dataVersion],
+  );
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Drivers & vehicles" title="Logistics"
@@ -1214,7 +1333,7 @@ export function Logistics() {
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="In transit" value={deliveries.filter(d => d.status === "in_progress").length} />
         <KPI label="Today's deliveries" value={deliveries.length} />
-        <KPI label="Vehicles" value="3" sub="2 active" />
+        <KPI label="Drivers present" value={drivers.length} />
         <KPI label="On time %" value="96%" trend="up" />
       </div>
       <div className="card card-pad">
@@ -1228,11 +1347,58 @@ export function Logistics() {
 }
 
 /* ─── Team ────────────────────────────────────────────── */
-function UserCard({ u }: { u: User }) {
+// Monday 00:00 of the current week, as an ISO string. Used to scope
+// the per-user "Xh this week" totals on the Team page cards.
+function startOfThisWeekIso(): string {
+  const d = new Date();
+  const day = d.getDay(); // 0=Sun … 6=Sat
+  const diff = day === 0 ? -6 : 1 - day; // back to Monday
+  d.setDate(d.getDate() + diff);
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+function formatHoursShort(h: number): string {
+  if (h <= 0) return "0h";
+  if (h >= 10) return `${Math.round(h)}h`;
+  // 7.5 → "7.5h", 8.0 → "8h"
+  const s = h.toFixed(1);
+  return s.endsWith(".0") ? `${s.slice(0, -2)}h` : `${s}h`;
+}
+
+// Roles allowed to drill into a technician's hours log on the Team page.
+// Workers / drivers / subcontractors see the cards but the card click
+// is a no-op for them (their own hours show up on their Dashboard).
+const TECH_DETAIL_ROLES = new Set<string>(["admin", "md", "manager", "lead_worker"]);
+
+function UserCard({ u, selected, canOpen, onOpen }: {
+  u: User;
+  selected: boolean;
+  canOpen: boolean;
+  onOpen: () => void;
+}) {
   const myWOs = Object.values(db.WORK_ORDERS).filter(w => w.assigned && w.assigned.includes(u.id));
   const activeWO = myWOs.find(w => w.status === "in_progress");
+  // Real per-user hours this week — sums durationMinutes (trigger-computed
+  // in work_order_time_entries) for every closed entry whose endedAt is on
+  // or after this Monday 00:00. Replaces the hardcoded "32h" mock.
+  const weekStartIso = startOfThisWeekIso();
+  const weekMinutes = Object.values(db.WORK_ORDER_TIME_ENTRIES)
+    .filter(e => e.userId === u.id && e.endedAt && e.endedAt >= weekStartIso)
+    .reduce((sum, e) => sum + (e.durationMinutes || 0), 0);
+  const weekHoursLabel = formatHoursShort(weekMinutes / 60);
   return (
-    <div className="card card-hover card-pad">
+    <div
+      className="card card-hover card-pad"
+      onClick={canOpen ? onOpen : undefined}
+      role={canOpen ? "button" : undefined}
+      tabIndex={canOpen ? 0 : undefined}
+      onKeyDown={canOpen ? (e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }) : undefined}
+      style={{
+        cursor: canOpen ? "pointer" : "default",
+        outline: selected ? "2px solid var(--pri-500)" : undefined,
+        outlineOffset: selected ? "2px" : undefined,
+      }}>
       <div className="row gap-3">
         <span className={"avatar avatar-lg avatar-" + (u.tint || "primary")}>{u.initials}</span>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1249,14 +1415,18 @@ function UserCard({ u }: { u: User }) {
         </div>
       )}
       <div className="row between" style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--divider)" }}>
-        <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{myWOs.length} WOs · 32h this week</span>
-        <button className="btn btn-ghost btn-icon btn-sm"><Icon name="messageCircle" size={13} /></button>
+        <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{myWOs.length} WOs · {weekHoursLabel} this week</span>
+        <button
+          className="btn btn-ghost btn-icon btn-sm"
+          onClick={e => e.stopPropagation()}>
+          <Icon name="messageCircle" size={13} />
+        </button>
       </div>
     </div>
   );
 }
 export function Team() {
-  const { openCreate, dataVersion } = useApp();
+  const { openCreate, dataVersion, role } = useApp();
   void dataVersion;
   // Operational workforce only — see lib/db.ts for the CORE/OPTIONAL/PLATFORM
   // breakdown. Filters out super_admin (platform role) AND optional roles
@@ -1268,11 +1438,18 @@ export function Team() {
     [dataVersion],
   );
   const subcontractors = users.filter(u => u.role === "subcontractor").length;
+  // Click-to-drill state. Gated by role so workers/drivers don't see
+  // each other's hours logs (they get their own on the field dashboard).
+  const canDrill = TECH_DETAIL_ROLES.has(role);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const selectedUser = selectedUserId ? db.user(selectedUserId) : null;
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Workforce" title="Team"
         sub="Skill tags · availability calendar · capacity heatmap."
-        right={<button className="btn btn-primary" onClick={() => openCreate("team_member")}><Icon name="plus" size={14} /> Add member</button>} />
+        right={can(role, "CREATE_TEAM_MEMBER")
+          ? <button className="btn btn-primary" onClick={() => openCreate("team_member")}><Icon name="plus" size={14} /> Add member</button>
+          : undefined} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Active staff" value={users.length} />
@@ -1281,10 +1458,321 @@ export function Team() {
         <KPI label="On leave today" value="0" />
       </div>
 
-      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" }}>
-        {users.map(u => <UserCard key={u.id} u={u} />)}
+      <div style={{
+        display: "grid", gap: 14,
+        // 200px floor lets two cards sit side-by-side on ~414px phones
+        // and four-up on desktop. The global @media (max-width: 520px)
+        // KPI rule already handles the KPI strip above.
+        gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 200px), 1fr))",
+      }}>
+        {users.map(u => (
+          <UserCard
+            key={u.id}
+            u={u}
+            selected={u.id === selectedUserId}
+            canOpen={canDrill}
+            onOpen={() => setSelectedUserId(prev => (prev === u.id ? null : u.id))} />
+        ))}
       </div>
+
+      {canDrill && selectedUser && (
+        <TechnicianDetail
+          user={selectedUser}
+          onClose={() => setSelectedUserId(null)} />
+      )}
     </div>
+  );
+}
+
+/* ─── Technician detail (Team drill-down) ────────────────
+ *
+ * Opens below the team grid when an Admin / MD / Operations Manager /
+ * Lead Technician clicks a member card. Shows the user's full info
+ * plus a hours log filtered by project (any container — project,
+ * AMC contract, or repair ticket) and a date range.
+ *
+ * Data source: WORK_ORDER_TIME_ENTRIES filtered by userId. We sum
+ * durationMinutes and join the WorkOrder.source { kind, id } against
+ * the in-memory mirror to label the container in the table.
+ *
+ * No backend round-trip; everything reads from the hydration mirror.
+ * ─────────────────────────────────────────────────────── */
+interface TechSessionRow {
+  id: string;
+  date: string;            // YYYY-MM-DD from endedAt or startedAt
+  startedAt: string;
+  endedAt: string | null;
+  durationMinutes: number;
+  workOrderId: string;
+  woCode: string;
+  woTitle: string;
+  containerKind: "project" | "amc" | "repair";
+  containerId: string;
+  containerLabel: string;  // human-friendly: "PRJ-2026-001 · Tower-A"
+  note: string | null;
+}
+
+function describeContainer(kind: "project" | "amc" | "repair", id: string): string {
+  if (kind === "project") {
+    const p = db.proj(id);
+    return p ? `${p.code} · ${p.name}` : "Project (deleted)";
+  }
+  if (kind === "amc") {
+    const a = db.amc(id);
+    if (!a) return "AMC (deleted)";
+    const cust = a.customer ? db.cust(a.customer)?.name : null;
+    return cust ? `${a.code} · ${cust}` : a.code;
+  }
+  const r = db.REPAIRS[id];
+  return r ? `${r.code} · ${r.title}` : "Repair (deleted)";
+}
+
+function TechnicianDetail({
+  user, onClose,
+}: {
+  user: User;
+  onClose: () => void;
+}) {
+  const { dataVersion, openWO, fmtMoney } = useApp();
+  void dataVersion;
+  void fmtMoney;
+
+  // ── Filters ───────────────────────────────────────────
+  // containerFilter = "all" | "<kind>:<id>"
+  const [containerFilter, setContainerFilter] = useState<string>("all");
+  const [from, setFrom] = useState<string>("");
+  const [to,   setTo]   = useState<string>("");
+
+  // ── All rows for this user (unfiltered) ───────────────
+  const allRows = useMemo<TechSessionRow[]>(() => {
+    const rows: TechSessionRow[] = [];
+    for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+      if (e.userId !== user.id) continue;
+      const wo = db.wo(e.workOrderId);
+      if (!wo) continue;
+      const dateRef = e.endedAt ?? e.startedAt;
+      rows.push({
+        id: e.id,
+        date: dateRef ? dateRef.slice(0, 10) : "—",
+        startedAt: e.startedAt,
+        endedAt: e.endedAt,
+        durationMinutes: e.durationMinutes || 0,
+        workOrderId: wo.id,
+        woCode: wo.code,
+        woTitle: wo.title,
+        containerKind: wo.source.kind,
+        containerId: wo.source.id,
+        containerLabel: describeContainer(wo.source.kind, wo.source.id),
+        note: e.note,
+      });
+    }
+    rows.sort((a, b) => b.date.localeCompare(a.date) || b.startedAt.localeCompare(a.startedAt));
+    return rows;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user.id, dataVersion]);
+
+  // ── Distinct containers the user has worked on (for the filter) ──
+  const containerOptions = useMemo(() => {
+    const seen = new Map<string, { key: string; label: string; kind: string }>();
+    for (const r of allRows) {
+      const key = `${r.containerKind}:${r.containerId}`;
+      if (!seen.has(key)) {
+        seen.set(key, { key, label: r.containerLabel, kind: r.containerKind });
+      }
+    }
+    return Array.from(seen.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [allRows]);
+
+  // ── Apply filters ──────────────────────────────────────
+  const filtered = useMemo(() => {
+    return allRows.filter(r => {
+      if (containerFilter !== "all") {
+        const key = `${r.containerKind}:${r.containerId}`;
+        if (key !== containerFilter) return false;
+      }
+      if (from && r.date < from) return false;
+      if (to   && r.date > to)   return false;
+      return true;
+    });
+  }, [allRows, containerFilter, from, to]);
+
+  const totalMinutes = filtered.reduce((s, r) => s + r.durationMinutes, 0);
+  const totalHours   = totalMinutes / 60;
+  const distinctWos  = new Set(filtered.map(r => r.workOrderId)).size;
+
+  const onClearFilters = () => {
+    setContainerFilter("all");
+    setFrom("");
+    setTo("");
+  };
+
+  const formatDuration = (mins: number): string => {
+    if (mins <= 0) return "—";
+    const h = Math.floor(mins / 60);
+    const m = mins - h * 60;
+    if (h === 0) return `${m}m`;
+    if (m === 0) return `${h}h`;
+    return `${h}h ${m}m`;
+  };
+
+  return (
+    <section
+      className="card card-pad"
+      style={{ marginTop: 24, scrollMarginTop: 80 }}>
+      <div className="row gap-3" style={{
+        alignItems: "flex-start",
+        marginBottom: 16,
+        flexWrap: "wrap",
+      }}>
+        <span className={"avatar avatar-lg avatar-" + (user.tint || "primary")}>{user.initials}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: "var(--t-h3)" }} className="truncate">{user.name}</div>
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", wordBreak: "break-word" }}>
+            {ROLE_LABELS[user.role]}
+            {user.email   ? ` · ${user.email}`   : ""}
+            {user.phone   ? ` · ${user.phone}`   : ""}
+          </div>
+          {user.skills.length > 0 && (
+            <div className="row gap-2" style={{ marginTop: 8, flexWrap: "wrap" }}>
+              {user.skills.map(s => <span key={s} className="badge">{s}</span>)}
+            </div>
+          )}
+        </div>
+        <button
+          className="btn btn-ghost btn-sm"
+          aria-label="Close"
+          onClick={onClose}
+          style={{ padding: "4px 8px", flexShrink: 0 }}>
+          <Icon name="x" size={13} />
+        </button>
+      </div>
+
+      {/* Filters — switch to grid so each control gets a full-width
+          row on phones (no horizontal scroll), then flows into a 3-up
+          layout once the parent has ~640px or more of breathing room. */}
+      <div className="card card-pad" style={{ marginBottom: 16, background: "var(--bg-muted)" }}>
+        <div style={{
+          display: "grid",
+          gap: 12,
+          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+          alignItems: "flex-end",
+        }}>
+          <div className="col" style={{ minWidth: 0 }}>
+            <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>
+              Project / AMC / Repair
+            </label>
+            <select
+              className="input input-sm"
+              value={containerFilter}
+              style={{ width: "100%" }}
+              onChange={e => setContainerFilter(e.target.value)}>
+              <option value="all">All ({containerOptions.length})</option>
+              {containerOptions.map(c => (
+                <option key={c.key} value={c.key}>{c.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col" style={{ minWidth: 0 }}>
+            <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>From</label>
+            <input
+              className="input input-sm" type="date"
+              value={from} max={to || undefined}
+              style={{ width: "100%" }}
+              onChange={e => setFrom(e.target.value)} />
+          </div>
+          <div className="col" style={{ minWidth: 0 }}>
+            <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>To</label>
+            <input
+              className="input input-sm" type="date"
+              value={to} min={from || undefined}
+              style={{ width: "100%" }}
+              onChange={e => setTo(e.target.value)} />
+          </div>
+        </div>
+        {(containerFilter !== "all" || from || to) && (
+          <div style={{ marginTop: 10, textAlign: "right" }}>
+            <button className="btn btn-ghost btn-sm" onClick={onClearFilters}>
+              Clear filters
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Totals */}
+      <div style={{
+        display: "grid", gap: 12,
+        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+        marginBottom: 16,
+      }}>
+        <KPI label="Total hours" value={formatHoursShort(totalHours)}
+             sub={`${filtered.length} session${filtered.length === 1 ? "" : "s"}`} />
+        <KPI label="Work orders" value={distinctWos}
+             sub={containerFilter === "all" ? "across all jobs" : "in filter"} />
+        <KPI label="Date range"
+             value={from || to ? `${from || "—"} → ${to || "—"}` : "All time"}
+             sub={containerFilter === "all" ? "all jobs" : "filtered job"} />
+      </div>
+
+      {/* Session table */}
+      {filtered.length === 0 ? (
+        <EmptyState icon="clock" title="No sessions in this range"
+          sub={allRows.length === 0
+            ? `${user.name} has no logged hours yet.`
+            : "Try widening the date range or clearing the project filter."} />
+      ) : (
+        <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th style={{ width: 110 }}>Date</th>
+                  <th style={{ width: 120 }}>Job code</th>
+                  <th>Project / AMC / Repair</th>
+                  <th>Work order</th>
+                  <th className="numeric" style={{ textAlign: "right", width: 110 }}>Duration</th>
+                  <th style={{ width: 40 }} aria-label="Open" />
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(r => (
+                  <tr key={r.id}>
+                    <td data-th="Date" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+                      {r.date}
+                    </td>
+                    <td data-th="Job code" style={{ font: "var(--t-small)", fontWeight: 600 }}>
+                      <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>
+                        {r.containerKind === "project" ? "Project" : r.containerKind === "amc" ? "AMC" : "Repair"}
+                      </span>
+                    </td>
+                    <td data-th="Container" style={{ font: "var(--t-small)" }}>
+                      {r.containerLabel}
+                    </td>
+                    <td data-th="Work order" style={{ font: "var(--t-small)" }}>
+                      <span style={{ fontWeight: 600 }}>{r.woCode}</span>
+                      <span style={{ color: "var(--ink-mute)" }}> · {r.woTitle}</span>
+                    </td>
+                    <td data-th="Duration" className="numeric"
+                        style={{ textAlign: "right", fontWeight: 600 }}>
+                      {formatDuration(r.durationMinutes)}
+                    </td>
+                    <td>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        title="Open work order"
+                        aria-label="Open work order"
+                        onClick={() => openWO(r.workOrderId)}
+                        style={{ padding: "4px 8px" }}>
+                        <Icon name="externalLink" size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1491,6 +1979,16 @@ function ProjectReport() {
   const [showAll, setShowAll] = useState(false);
   const [sortKey, setSortKey] = useState<ProjectSortKey>("totalHrs");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const toggleExpand = (containerId: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(containerId)) next.delete(containerId);
+      else next.add(containerId);
+      return next;
+    });
+  };
 
   const rows = useMemo<ProjectReportRow[]>(() => {
     return buildProjectRows(from, to);
@@ -1580,6 +2078,7 @@ function ProjectReport() {
           <table className="table">
             <thead>
               <tr>
+                <th style={{ width: 32 }}></th>
                 <th>Type</th>
                 <SortHead<ProjectSortKey> k="code"      current={sortKey} dir={sortDir} onSort={onSort}>Code</SortHead>
                 <SortHead<ProjectSortKey> k="title"     current={sortKey} dir={sortDir} onSort={onSort}>Title</SortHead>
@@ -1594,25 +2093,47 @@ function ProjectReport() {
             </thead>
             <tbody>
               {sorted.length === 0 ? (
-                <tr><td colSpan={10} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
+                <tr><td colSpan={11} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
                   No hours in this date range
                 </td></tr>
-              ) : sorted.map(r => (
-                <tr key={r.containerId}>
-                  <td data-th="Type">
-                    <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>{TYPE_LABEL[r.type]}</span>
-                  </td>
-                  <td data-th="Code" style={{ font: "var(--t-small)", fontWeight: 600 }}>{r.code}</td>
-                  <td data-th="Title" style={{ font: "var(--t-small)" }}>{r.title}</td>
-                  <td data-th="Status" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{r.status}</td>
-                  <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs > 0 ? r.totalHrs.toFixed(1) : "—"}</td>
-                  <td data-th="Worker hrs" className="numeric" style={{ textAlign: "right" }}>{r.workerHrs > 0 ? r.workerHrs.toFixed(1) : "—"}</td>
-                  <td data-th="Sub hrs" className="numeric" style={{ textAlign: "right" }}>{r.subHrs > 0 ? r.subHrs.toFixed(1) : "—"}</td>
-                  <td data-th="Manpower" className="numeric" style={{ textAlign: "right" }}>{r.manpower > 0 ? r.manpower : "—"}</td>
-                  <td data-th="# Workers" className="numeric" style={{ textAlign: "right" }}>{r.workers > 0 ? r.workers : "—"}</td>
-                  <td data-th="# Subs" className="numeric" style={{ textAlign: "right" }}>{r.subs > 0 ? r.subs : "—"}</td>
-                </tr>
-              ))}
+              ) : sorted.map(r => {
+                const isOpen = expanded.has(r.containerId);
+                const canExpand = r.totalHrs > 0;
+                return (
+                  <Fragment key={r.containerId}>
+                    <tr onClick={() => canExpand && toggleExpand(r.containerId)}
+                        style={{
+                          cursor: canExpand ? "pointer" : "default",
+                          background: isOpen ? "var(--bg-muted)" : undefined,
+                        }}>
+                      <td data-th="" style={{ textAlign: "center", color: "var(--ink-mute)" }}>
+                        {canExpand && (
+                          <Icon name={isOpen ? "chevronDown" : "chevronRight"} size={14} />
+                        )}
+                      </td>
+                      <td data-th="Type">
+                        <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>{TYPE_LABEL[r.type]}</span>
+                      </td>
+                      <td data-th="Code" style={{ font: "var(--t-small)", fontWeight: 600 }}>{r.code}</td>
+                      <td data-th="Title" style={{ font: "var(--t-small)" }}>{r.title}</td>
+                      <td data-th="Status" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{r.status}</td>
+                      <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs > 0 ? r.totalHrs.toFixed(1) : "—"}</td>
+                      <td data-th="Worker hrs" className="numeric" style={{ textAlign: "right" }}>{r.workerHrs > 0 ? r.workerHrs.toFixed(1) : "—"}</td>
+                      <td data-th="Sub hrs" className="numeric" style={{ textAlign: "right" }}>{r.subHrs > 0 ? r.subHrs.toFixed(1) : "—"}</td>
+                      <td data-th="Manpower" className="numeric" style={{ textAlign: "right" }}>{r.manpower > 0 ? r.manpower : "—"}</td>
+                      <td data-th="# Workers" className="numeric" style={{ textAlign: "right" }}>{r.workers > 0 ? r.workers : "—"}</td>
+                      <td data-th="# Subs" className="numeric" style={{ textAlign: "right" }}>{r.subs > 0 ? r.subs : "—"}</td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={11} style={{ padding: 0, background: "var(--bg-muted)" }}>
+                          <ProjectBreakdownPanel containerId={r.containerId} from={from} to={to} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1703,6 +2224,160 @@ function buildProjectRows(from: string, to: string): ProjectReportRow[] {
     });
   }
   return rows;
+}
+
+interface BreakdownWorker {
+  userId: string;
+  name: string;
+  role: string;
+  hrs: number;
+  wos: number;
+}
+interface BreakdownSub {
+  subId: string;
+  name: string;
+  company: string;
+  hrs: number;
+  wos: number;
+}
+
+function buildContainerBreakdown(containerId: string, from: string, to: string): { workers: BreakdownWorker[]; subs: BreakdownSub[] } {
+  const [k, id] = containerId.split(":") as ["p" | "a" | "r", string];
+  const kind = k === "p" ? "project" : k === "a" ? "amc" : "repair";
+  const woIds = new Set<string>();
+  for (const w of Object.values(db.WORK_ORDERS)) {
+    if (w.source.kind === kind && w.source.id === id) woIds.add(w.id);
+  }
+
+  const workerAcc = new Map<string, { minutes: number; wos: Set<string> }>();
+  for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
+    if (!woIds.has(e.workOrderId)) continue;
+    if (!e.endedAt || !e.userId) continue;
+    const ymd = e.endedAt.slice(0, 10);
+    if (ymd < from || ymd > to) continue;
+    const cur = workerAcc.get(e.userId) ?? { minutes: 0, wos: new Set<string>() };
+    cur.minutes += e.durationMinutes;
+    cur.wos.add(e.workOrderId);
+    workerAcc.set(e.userId, cur);
+  }
+
+  const subAcc = new Map<string, { hrs: number; wos: Set<string> }>();
+  for (const e of Object.values(db.WORK_ORDER_SUB_CONTRACTOR_HOURS)) {
+    if (!woIds.has(e.workOrderId)) continue;
+    if (e.entryDate < from || e.entryDate > to) continue;
+    const cur = subAcc.get(e.subContractorId) ?? { hrs: 0, wos: new Set<string>() };
+    cur.hrs += e.hours;
+    cur.wos.add(e.workOrderId);
+    subAcc.set(e.subContractorId, cur);
+  }
+
+  const workers: BreakdownWorker[] = Array.from(workerAcc, ([userId, v]) => {
+    const u = db.user(userId);
+    return {
+      userId,
+      name: u?.name ?? "Unknown",
+      role: (u?.role && ROLE_LABELS[u.role]) || u?.role || "—",
+      hrs: v.minutes / 60,
+      wos: v.wos.size,
+    };
+  }).sort((a, b) => b.hrs - a.hrs);
+
+  const subs: BreakdownSub[] = Array.from(subAcc, ([subId, v]) => {
+    const s = db.subContractor(subId);
+    return {
+      subId,
+      name: s?.name ?? "Unknown",
+      company: s?.company ?? "—",
+      hrs: v.hrs,
+      wos: v.wos.size,
+    };
+  }).sort((a, b) => b.hrs - a.hrs);
+
+  return { workers, subs };
+}
+
+function ProjectBreakdownPanel({ containerId, from, to }: { containerId: string; from: string; to: string }) {
+  const { dataVersion } = useApp();
+  void dataVersion;
+  const { workers, subs } = useMemo(
+    () => buildContainerBreakdown(containerId, from, to),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [containerId, from, to, dataVersion],
+  );
+
+  return (
+    <div style={{ padding: 16, display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+      <div>
+        <div className="row gap-2" style={{ alignItems: "center", marginBottom: 8 }}>
+          <Icon name="users" size={14} style={{ color: "var(--ink-mute)" }} />
+          <span style={{ font: "var(--t-small)", fontWeight: 600 }}>
+            Workers ({workers.length})
+          </span>
+        </div>
+        {workers.length === 0 ? (
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: "8px 0" }}>
+            No worker hours logged in this range.
+          </div>
+        ) : (
+          <table className="table" style={{ font: "var(--t-small)" }}>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Role</th>
+                <th className="numeric" style={{ textAlign: "right" }}>Hours</th>
+                <th className="numeric" style={{ textAlign: "right" }}>WOs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {workers.map(w => (
+                <tr key={w.userId}>
+                  <td style={{ fontWeight: 600 }}>{w.name}</td>
+                  <td style={{ color: "var(--ink-mute)" }}>{w.role}</td>
+                  <td className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{w.hrs.toFixed(1)}</td>
+                  <td className="numeric" style={{ textAlign: "right" }}>{w.wos}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div>
+        <div className="row gap-2" style={{ alignItems: "center", marginBottom: 8 }}>
+          <Icon name="briefcase" size={14} style={{ color: "var(--ink-mute)" }} />
+          <span style={{ font: "var(--t-small)", fontWeight: 600 }}>
+            Sub-contractors ({subs.length})
+          </span>
+        </div>
+        {subs.length === 0 ? (
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: "8px 0" }}>
+            No sub-contractor hours logged in this range.
+          </div>
+        ) : (
+          <table className="table" style={{ font: "var(--t-small)" }}>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Company</th>
+                <th className="numeric" style={{ textAlign: "right" }}>Hours</th>
+                <th className="numeric" style={{ textAlign: "right" }}>WOs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {subs.map(s => (
+                <tr key={s.subId}>
+                  <td style={{ fontWeight: 600 }}>{s.name}</td>
+                  <td style={{ color: "var(--ink-mute)" }}>{s.company}</td>
+                  <td className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{s.hrs.toFixed(1)}</td>
+                  <td className="numeric" style={{ textAlign: "right" }}>{s.wos}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function isProjectActive(s: string): boolean {

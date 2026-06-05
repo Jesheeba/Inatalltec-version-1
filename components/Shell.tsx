@@ -4,7 +4,7 @@
 // (Ported from prototype/shell.jsx)
 // ============================================================
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Icon } from "./Icon";
 import { useApp, type RouteName } from "@/lib/app-context";
@@ -75,9 +75,10 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "sites", label: "Sites", icon: "mapPin", roles: ["admin", "md", "manager", "lead_worker"] },
       { id: "team", label: "Team", icon: "users", roles: ["admin", "md", "manager", "lead_worker"] },
       // Sub-contractors directory (migration 0023) — external profiles
-      // with HR/compliance fields + per-WO hours. Managed by Ops only;
-      // workers see them on the WO detail page, not via a sidebar entry.
-      { id: "sub-contractors", label: "Sub-contractors", icon: "users", roles: ["admin", "md", "manager"] },
+      // with HR/compliance fields + per-WO hours. Managed by Ops and the
+      // Lead Technicians who assign WOs to subs; workers see them on the
+      // WO detail page, not via a sidebar entry.
+      { id: "sub-contractors", label: "Sub-contractors", icon: "users", roles: ["admin", "md", "manager", "lead_worker"] },
       { id: "reports", label: "Reports", icon: "chartBar", roles: ["admin", "md", "manager", "accounts"] },
       { id: "accountant", label: "Accountant", icon: "receipt", roles: ["admin", "md", "manager", "accounts"] },
       { id: "quotations", label: "Quotations", icon: "fileText", roles: ["admin", "md", "manager", "sales"] },
@@ -98,11 +99,36 @@ function navForRole(role: Role): NavGroup[] {
 }
 
 /* ─── Sidebar ───────────────────────────────────────────── */
+const FIELD_ROLES: ReadonlySet<Role> = new Set<Role>([
+  "worker", "lead_worker", "driver", "subcontractor",
+]);
+
 export function Sidebar() {
-  const { route, go, me, role, currentOrg, notesOpen, setNotesOpen } = useApp();
+  const { route, go, me, role, currentOrg, notesOpen, setNotesOpen, dataVersion } = useApp();
   const groups = navForRole(role);
   const brandTitle = currentOrg?.display_name ?? "Installtec";
   const brandSub = currentOrg?.tagline ?? "Operations";
+
+  // Live sidebar badge counts. KPI_OPS in lib/db.ts was a static snapshot
+  // that nothing ever updates — so every count rendered as 0. Compute the
+  // ones we actually surface in the nav off the hydrated mirrors instead.
+  // Field roles (worker / lead_worker / driver / subcontractor) see their
+  // own queue; everyone else sees the org-wide open count.
+  const liveCounts = useMemo(() => {
+    const isField = FIELD_ROLES.has(role);
+    const openWoCount = Object.values(db.WORK_ORDERS).filter(w => {
+      if (w.status === "done" || w.status === "closed" || w.status === "cancelled") return false;
+      if (!isField) return true;
+      return (w.assigned ?? []).includes(me.id) || w.assignedLead === me.id;
+    }).length;
+    // An approval is "open" if any step in its chain is still pending or
+    // queued (not yet approved). Matches the Approvals page's filter.
+    const openApprovalsCount = Object.values(db.APPROVALS)
+      .filter(a => (a.chain ?? []).some(s => s.state === "pending" || s.state === "queued"))
+      .length;
+    return { open_wo: openWoCount, approvals_count: openApprovalsCount };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, me.id, dataVersion]);
 
   return (
     <aside className="side">
@@ -129,7 +155,10 @@ export function Sidebar() {
           <div key={g.label}>
             <div className="side-group">{g.label}</div>
             {g.items.map(i => {
-              const raw = i.countKey ? KPI_OPS[i.countKey] : null;
+              const liveRaw = i.countKey && i.countKey in liveCounts
+                ? (liveCounts as Record<string, number>)[i.countKey]
+                : null;
+              const raw = liveRaw ?? (i.countKey ? KPI_OPS[i.countKey] : null);
               const count = typeof raw === "number" ? raw : null;
               // "notes" is a pseudo-route - clicking opens the slide-out
               // instead of navigating. Active state mirrors the panel state.

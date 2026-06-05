@@ -6,7 +6,7 @@
 // ============================================================
 
 import { AppProvider, useApp } from "@/lib/app-context";
-import type { User } from "@/lib/types";
+import type { Notification, User } from "@/lib/types";
 import type { HydrationBundle } from "@/lib/hydrate";
 import { Sidebar, Topbar, BottomNav } from "./Shell";
 import {
@@ -16,14 +16,16 @@ import {
 import { CreateModalsHost } from "./CreateModals";
 import { NotesPanel } from "./notes";
 
-export function AppShell({ children, currentUser, initialUsers, initialBundle }: {
+export function AppShell({ children, currentUser, initialUsers, initialBundle, initialNotifications }: {
   children: React.ReactNode;
   currentUser?: User;
   initialUsers?: User[];
   initialBundle?: HydrationBundle;
+  initialNotifications?: Notification[];
 }) {
   return (
-    <AppProvider currentUser={currentUser} initialUsers={initialUsers} initialBundle={initialBundle}>
+    <AppProvider currentUser={currentUser} initialUsers={initialUsers}
+      initialBundle={initialBundle} initialNotifications={initialNotifications}>
       <AppShellInner>{children}</AppShellInner>
     </AppProvider>
   );

@@ -10,12 +10,14 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
-  AmcContract, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
+  AmcContract, AmcDocument, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
   Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
   ReplacementRequest, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
-  WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType,
+  WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
 } from "./types";
 import { formatShortDate } from "./dates";
+import { mapNotificationRow, NOTIFICATION_COLUMNS } from "./notifications";
+import type { Notification } from "./types";
 
 export interface HydrationBundle {
   customers: Customer[];
@@ -54,6 +56,14 @@ export interface HydrationBundle {
   // Phase 11 — quotations (migration 0028). Independent module; rows
   // power the /quotations list + convert flow.
   quotations: Quotation[];
+  // v1.1.0 — persisted WO checklist tasks (table from migration 0001).
+  // Previously the Tasks tab held a local-state checklist that vanished
+  // on refresh. Now hydrated like everything else.
+  woTasks: WoTask[];
+  // Migration 0034 — uploaded paperwork against AMC contracts. Optional
+  // per spec; rows here are metadata only (binaries in Storage bucket
+  // 'amc-documents'). Hydrated for everyone who can read amc_contracts.
+  amcDocuments: AmcDocument[];
   approvals: Approval[];
   replacements: ReplacementRequest[];
 }
@@ -187,6 +197,22 @@ function mapAmc(r: Row): AmcContract {
     resumedAt:         (r.resumed_at            as string | null) ?? null,
     firstPaymentDueAt: (r.first_payment_due_at  as string | null) ?? null,
     renewedFromId:     (r.renewed_from_id       as string | null) ?? null,
+    // Migration 0033 — OM-selected first visit date. NULL until booked.
+    firstVisitDate:    (r.first_visit_date      as string | null) ?? null,
+  };
+}
+
+// Migration 0034 — AMC document metadata row.
+function mapAmcDocument(r: Row): AmcDocument {
+  return {
+    id:            asString(r.id),
+    amcId:         asString(r.amc_id),
+    fileName:      asString(r.file_name),
+    filePath:      asString(r.file_path),
+    fileSizeBytes: (r.file_size_bytes as number | null) ?? null,
+    mimeType:      (r.mime_type as string | null) ?? null,
+    uploadedBy:    (r.uploaded_by as string | null) ?? null,
+    uploadedAt:    asString(r.uploaded_at),
   };
 }
 
@@ -332,6 +358,17 @@ function mapFreeCall(r: Row): FreeCall {
   };
 }
 
+function mapWoTask(r: Row): WoTask {
+  return {
+    id:           asString(r.id),
+    workOrderId:  asString(r.work_order_id),
+    label:        asString(r.label),
+    done:         Boolean(r.is_done),
+    position:     asNumber(r.position),
+    count:       (r.count_label as string | null) ?? undefined,
+  };
+}
+
 function mapQuotation(r: Row): Quotation {
   const rawVal = r.value_aed;
   const value = typeof rawVal === "number" ? rawVal
@@ -350,6 +387,10 @@ function mapQuotation(r: Row): Quotation {
     createdBy:            (r.created_by as string | null) ?? null,
     createdAt:             asString(r.created_at),
     updatedAt:             asString(r.updated_at),
+    // Migration 0035 — quotation template fields.
+    projectId:            (r.project_id  as string | null) ?? null,
+    description:          (r.description as string | null) ?? null,
+    terms:                (r.terms       as string | null) ?? null,
   };
 }
 
@@ -422,13 +463,31 @@ function relativeOpenedAt(iso: string): string {
   return formatShortDate(new Date(iso));
 }
 
+// Fetch one user's recent notifications. Scoped explicitly by user_id —
+// the service-role client bypasses RLS, so we must NOT fetch all rows here
+// (that would leak every user's notifications). Newest first, capped.
+export async function fetchNotifications(
+  admin: SupabaseClient,
+  userId: string,
+): Promise<Notification[]> {
+  if (!userId) return [];
+  const { data, error } = await admin
+    .from("notifications")
+    .select(NOTIFICATION_COLUMNS)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  if (error || !data) return [];
+  return (data as Row[]).map(mapNotificationRow);
+}
+
 export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle> {
   // Fan out all reads in parallel - these are independent.
   const [
     customersRaw, sitesRaw, teamsRaw, projectsRaw, milestonesRaw,
     amcsRaw, amcServicesRaw, repairsRaw, workOrdersRaw, woAssignRaw, approvalsRaw, approvalStepsRaw, usersRaw,
     replacementsRaw, woTimeEntriesRaw, subContractorsRaw, woSubContractorsRaw, woSubHoursRaw,
-    freeCallsRaw, quotationsRaw,
+    freeCallsRaw, quotationsRaw, woTasksRaw, amcDocumentsRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -450,6 +509,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "work_order_sub_contractor_hours"),
     fetchAll(admin, "amc_free_calls"),
     fetchAll(admin, "quotations"),
+    fetchAll(admin, "work_order_tasks"),
+    fetchAll(admin, "amc_documents"),
   ]);
 
   // Group milestones by project_id.
@@ -514,6 +575,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     workOrderSubContractorHours: woSubHoursRaw.map(mapWorkOrderSubContractorHours),
     freeCalls: freeCallsRaw.map(mapFreeCall),
     quotations: quotationsRaw.map(mapQuotation),
+    woTasks: woTasksRaw.map(mapWoTask),
+    amcDocuments: amcDocumentsRaw.map(mapAmcDocument),
     approvals: approvalsRaw.map(r => mapApproval(r, stepsByApproval.get(asString(r.id)) ?? [])),
     replacements: replacementsRaw.map(mapReplacement),
   };

@@ -4,20 +4,23 @@
 // (Ported from modules/amc.jsx)
 // ============================================================
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
 import { db, ROLE_LABELS } from "@/lib/db";
 import {
   updateAmc, AMC_STATUSES, AMC_STATUS_LABEL, AMC_PAYMENT_METHOD_LABEL,
   pauseAmc, resumeAmc, calculateDaysUntilPause,
+  bookAmcFirstVisitDate,
+  uploadAmcDocument, deleteAmcDocument, getAmcDocumentDownloadUrl,
+  AMC_DOC_MAX_BYTES,
   type AmcPaymentMethod,
 } from "@/lib/create";
 import { RenewAmcModal } from "../RenewAmcModal";
 import { can, listScopeFor } from "@/lib/permissions";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import { formatLongDate, formatLongDateTime } from "@/lib/dates";
-import type { AmcContract, AmcStatus, User } from "@/lib/types";
+import type { AmcContract, AmcDocument, AmcStatus, User } from "@/lib/types";
 import {
   CardHead, ChoicePill, EmptyState, FilterBar, KPI, PageHeader, StatusBadge, WoCard,
 } from "../shared";
@@ -110,7 +113,15 @@ export function AmcList() {
   // "Hidden" roles get an empty-state below.
   const all = useMemo(() => {
     if (scope === "hidden") return [];
-    const everything = Object.values(db.AMCS);
+    // Sort by code so the row order is identical on every render. Without
+    // this, Object.values() iterates the db.AMCS mirror in insertion
+    // order — which differs between SSR (mirror starts empty, populates
+    // from the hydration bundle in fetch order) and CSR (mirror may
+    // already hold rows from prior navigation or runtime createAmc).
+    // Different first-row contract code → React hydration mismatch.
+    const everything = Object.values(db.AMCS)
+      .slice()
+      .sort((a, b) => a.code.localeCompare(b.code));
     if (scope === "all") return everything;
     const myAmcIds = new Set(
       Object.values(db.WORK_ORDERS)
@@ -534,6 +545,26 @@ export function AmcDetail({ id }: { id: string }) {
   // no pressure yet.
   const showPaymentDueInfo = daysToPause !== null && daysToPause > 10 && !!c.firstPaymentDueAt;
 
+  // ── Migration 0033 — two-step activation gates ──
+  //
+  // firstVisitNotBooked: the post-create "Draft" UI state. Contract row
+  // exists, status is pending_payment, but the OM hasn't picked a first
+  // visit date yet. Until they do, no schedule rows exist and no payment
+  // timer is running. The big "Book first visit date" card replaces the
+  // schedule + payment-due banners during this state.
+  const firstVisitNotBooked =
+    !c.firstVisitDate && c.contract_status === "pending_payment";
+
+  // Tentative preview shows after the first visit IS booked but BEFORE
+  // payment commits the rest of the quarterly visits to the schedule.
+  const showTentativeVisits =
+    !!c.firstVisitDate && c.contract_status !== "active";
+
+  const canBookFirstVisit =
+    role === "admin" || role === "md" || role === "manager";
+  const canUploadDocs =
+    role === "admin" || role === "md" || role === "manager" || role === "sales";
+
   return (
     <div className="main-pad">
       <div style={{ marginBottom: 16 }}>
@@ -586,8 +617,15 @@ export function AmcDetail({ id }: { id: string }) {
             )}
             {/* Status pill: editable for md/admin/manager; read-only
                 StatusBadge for everyone else (technicians, accounts,
-                sales). Aligns with amc_write RLS gate. */}
-            {canEditStatus ? (
+                sales). Aligns with amc_write RLS gate.
+                Migration 0033: while first_visit_date is NULL, we render
+                a static "Draft" badge instead of the editable pill — the
+                only valid forward move is "Book first visit", and the
+                ChoicePill would otherwise let an admin skip the booking
+                step by flipping straight to Active. */}
+            {firstVisitNotBooked ? (
+              <StatusBadge state="draft" />
+            ) : canEditStatus ? (
               <ChoicePill<AmcStatus>
                 ariaLabel="AMC contract status"
                 value={c.contract_status}
@@ -700,6 +738,14 @@ export function AmcDetail({ id }: { id: string }) {
         </div>
       )}
 
+      {firstVisitNotBooked && (
+        <BookFirstDateCard
+          amcId={id}
+          canBook={canBookFirstVisit}
+          onBooked={() => { bumpData(); fireToast("First visit booked"); }}
+        />
+      )}
+
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI label="Annual value" value={fmtMoney(c.value, { compact: true })} />
         <KPI
@@ -712,6 +758,8 @@ export function AmcDetail({ id }: { id: string }) {
       </div>
 
       <FreeCallsCard amc={c} />
+
+      {showTentativeVisits && <TentativeVisitsCard amc={c} />}
 
       <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", marginTop: 20 }}>
         <AmcServiceScheduleCard
@@ -735,7 +783,9 @@ export function AmcDetail({ id }: { id: string }) {
             />
             <MetaRow k="Value" v={fmtMoney(c.value)} />
             <MetaRow k="Expires" v={c.expiresAt} />
-            <MetaRow k="Status" v={<StatusBadge state={c.contract_status} />} />
+            <MetaRow k="Status" v={
+              <StatusBadge state={firstVisitNotBooked ? "draft" : c.contract_status} />
+            } />
             {renewedFromContract && (
               <MetaRow
                 k="Renewed from"
@@ -765,28 +815,11 @@ export function AmcDetail({ id }: { id: string }) {
       <section className="card card-pad" style={{ marginTop: 20 }}>
         <CardHead
           title={"Linked work orders · " + wos.length}
-          sub="One WO per quarterly service · plus any free-call visits"
+          sub="One WO per quarterly service · plus any free-call visits · deliveries"
           right={canCreateWo ? (
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => openCreate("workorder", {
-                source_kind: "amc",
-                source_id: id,
-                customer_id: c.customer,
-                site_id: c.site || undefined,
-              })}
-            >
-              <Icon name="plus" size={13} /> Create Work Order
-            </button>
-          ) : undefined}
-        />
-        {wos.length === 0 ? (
-          <EmptyState
-            icon="briefcase"
-            title="No work orders linked yet"
-            action={canCreateWo ? (
+            <div className="row gap-2">
               <button
-                className="btn btn-primary"
+                className="btn btn-primary btn-sm"
                 onClick={() => openCreate("workorder", {
                   source_kind: "amc",
                   source_id: id,
@@ -794,9 +827,26 @@ export function AmcDetail({ id }: { id: string }) {
                   site_id: c.site || undefined,
                 })}
               >
-                <Icon name="plus" size={14} /> Create Work Order
+                <Icon name="plus" size={13} /> Create Work Order
               </button>
-            ) : undefined}
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => openCreate("delivery", {
+                  source_kind: "amc",
+                  source_id: id,
+                  customer_id: c.customer,
+                  site_id: c.site || undefined,
+                })}
+              >
+                <Icon name="truck" size={13} /> Schedule Delivery
+              </button>
+            </div>
+          ) : undefined}
+        />
+        {wos.length === 0 ? (
+          <EmptyState
+            icon="briefcase"
+            title="No work orders linked yet"
           />
         ) : (
           <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
@@ -806,8 +856,280 @@ export function AmcDetail({ id }: { id: string }) {
       </section>
 
       <AmcPaymentsCard amcId={id} reloadKey={dataVersion} />
+      <AmcDocumentsCard amcId={id} canUpload={canUploadDocs} />
       <AmcStatusHistory amcId={id} reloadKey={historyTick + dataVersion} />
     </div>
+  );
+}
+
+/* ─── Migration 0033 — Book first visit date card ──────────
+ *
+ * Replaces the empty "Pending Payment" state with an explicit CTA
+ * the moment a contract is created. The OM picks a date, we UPDATE
+ * amc_contracts.first_visit_date; DB triggers populate
+ * first_payment_due_at and seed service 1. UI flips to the regular
+ * "Pending Payment" header on the next paint.
+ *
+ * Permission: admin · md · manager (canBook prop is computed in
+ * AmcDetail). When canBook is false, we render the same explainer
+ * with a polite "ask the Operations Manager" note instead of the
+ * picker.
+ * ──────────────────────────────────────────────────────────── */
+function BookFirstDateCard({
+  amcId, canBook, onBooked,
+}: {
+  amcId: string;
+  canBook: boolean;
+  onBooked: () => void;
+}) {
+  const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const [date, setDate] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onSubmit = async () => {
+    setErr(null);
+    if (!date) { setErr("Pick a date for the first visit."); return; }
+    setBusy(true);
+    const res = await bookAmcFirstVisitDate(amcId, date);
+    setBusy(false);
+    if (!res.ok) { setErr(res.error || "Could not save."); return; }
+    onBooked();
+  };
+
+  return (
+    <div className="card card-pad" style={{
+      marginBottom: 20,
+      background: "var(--bg-elev)",
+      borderColor: "var(--pri-500)",
+    }}>
+      <div className="row gap-2" style={{ alignItems: "flex-start" }}>
+        <Icon name="calendar" size={20}
+          style={{ color: "var(--pri-700)", marginTop: 4, flexShrink: 0 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: "var(--t-h3)", color: "var(--ink)", marginBottom: 4 }}>
+            Draft — first visit not booked
+          </div>
+          <div style={{ font: "var(--t-body)", color: "var(--ink-soft)", marginBottom: 12 }}>
+            Pick the first PPM visit date to begin the contract. The customer&apos;s
+            30-day payment window starts from this date, and visits at +3 / +6 / +9
+            months will appear as tentative until payment is recorded.
+          </div>
+          {canBook ? (
+            <>
+              <div className="row gap-2" style={{ flexWrap: "wrap", alignItems: "center" }}>
+                <input
+                  type="date"
+                  className="input input-md"
+                  value={date}
+                  min={today}
+                  disabled={busy}
+                  onChange={e => setDate(e.target.value)}
+                  style={{ minWidth: 180 }}
+                />
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || !date}
+                  onClick={onSubmit}>
+                  {busy ? "Saving…" : "Book first visit"}
+                </button>
+              </div>
+              {err && (
+                <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginTop: 8 }}>
+                  {err}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>
+              The Operations Manager or Admin will book the first visit.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Migration 0033 — Tentative upcoming visits card ──────
+ *
+ * Once first_visit_date is set but the contract isn't yet active
+ * (no payment), Q2/Q3/Q4 are computed client-side from
+ * first_visit_date + (i × 12/services_per_year) months and shown
+ * as TENTATIVE. They don't exist in amc_service_schedule yet, so
+ * the main calendar doesn't see them. Once payment lands, the
+ * payment trigger commits them and this card hides.
+ *
+ * services.total carries the schedule length (default 4). If the
+ * total is 1 or unset, this card is a no-op.
+ * ────────────────────────────────────────────────────────── */
+function TentativeVisitsCard({ amc }: { amc: AmcContract }) {
+  const dates = useMemo(() => {
+    if (!amc.firstVisitDate) return [];
+    const total = amc.services.total > 0 ? amc.services.total : 4;
+    if (total <= 1) return [];
+    const step = Math.max(1, Math.floor(12 / total));
+    const start = new Date(amc.firstVisitDate + "T00:00:00");
+    const out: { number: number; date: string }[] = [];
+    for (let i = 1; i < total; i++) {
+      const d = new Date(start);
+      d.setMonth(d.getMonth() + i * step);
+      const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      out.push({ number: i + 1, date: ymd });
+    }
+    return out;
+  }, [amc.firstVisitDate, amc.services.total]);
+
+  if (dates.length === 0) return null;
+
+  return (
+    <section className="card card-pad" style={{
+      marginTop: 20,
+      background: "var(--warn-100)",
+      borderColor: "var(--warn-100)",
+    }}>
+      <CardHead
+        title="Upcoming visits (tentative)"
+        sub="Anchored on the first visit date. These dates lock into the main calendar once payment is received." />
+      <div style={{
+        display: "grid", gap: 12, marginTop: 12,
+        gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+      }}>
+        {dates.map(d => (
+          <div key={d.number} className="card card-pad"
+               style={{ background: "var(--bg-elev)" }}>
+            <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+              Visit {d.number}
+            </div>
+            <div style={{ font: "var(--t-body-md)", fontWeight: 600, marginTop: 4 }}>
+              {d.date}
+            </div>
+            <div style={{ font: "var(--t-micro)", color: "var(--warn-700)", marginTop: 4 }}>
+              Tentative — pending payment
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/* ─── Migration 0034 — Documents card ──────────────────────
+ *
+ * Optional uploaded paperwork against the AMC contract. Open to
+ * upload anytime — there's no business rule that requires uploading
+ * before activation.
+ *
+ * Permission: admin · md · manager · sales (mirrored in RLS on
+ * amc_documents + storage.objects). Reads are open to anyone who
+ * can read the parent contract.
+ *
+ * Binaries are private; download opens a 60-second signed URL in
+ * a new tab.
+ * ────────────────────────────────────────────────────────── */
+function AmcDocumentsCard({ amcId, canUpload }: { amcId: string; canUpload: boolean }) {
+  const { dataVersion, fireToast, bumpData, me } = useApp();
+  void dataVersion;
+  const docs = db.docsForAmc(amcId);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const onUpload = async (file: File) => {
+    setErr(null); setBusy(true);
+    const res = await uploadAmcDocument(amcId, file, me.id);
+    setBusy(false);
+    if (!res.ok) { setErr(res.error || "Upload failed"); return; }
+    bumpData();
+    fireToast(`Uploaded ${file.name}`);
+  };
+
+  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (f) void onUpload(f);
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  const onDownload = async (doc: AmcDocument) => {
+    const res = await getAmcDocumentDownloadUrl(doc.filePath, 60);
+    if (!res.ok) { fireToast(`Couldn't open: ${res.error}`); return; }
+    window.open(res.url, "_blank", "noopener");
+  };
+
+  const onDelete = async (doc: AmcDocument) => {
+    if (!window.confirm(`Delete ${doc.fileName}?`)) return;
+    const res = await deleteAmcDocument(doc.id);
+    if (!res.ok) { fireToast(`Couldn't delete: ${res.error}`); return; }
+    bumpData();
+    fireToast(`Deleted ${doc.fileName}`);
+  };
+
+  return (
+    <section className="card card-pad" style={{ marginTop: 20 }}>
+      <CardHead
+        title={`Documents · ${docs.length}`}
+        sub="Signed contract, scans, paperwork — optional, upload anytime"
+        right={canUpload ? (
+          <>
+            <input
+              ref={inputRef}
+              type="file"
+              style={{ display: "none" }}
+              onChange={onPickFile}
+              disabled={busy} />
+            <button className="btn btn-primary btn-sm"
+                    disabled={busy}
+                    onClick={() => inputRef.current?.click()}>
+              <Icon name="paperclip" size={13} /> {busy ? "Uploading…" : "Upload document"}
+            </button>
+          </>
+        ) : undefined}
+      />
+      {err && (
+        <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginBottom: 8 }}>
+          {err}
+        </div>
+      )}
+      {docs.length === 0 ? (
+        <EmptyState
+          icon="fileText"
+          title="No documents uploaded"
+          sub={canUpload ? `Up to ${Math.round(AMC_DOC_MAX_BYTES / 1024 / 1024)} MB per file` : undefined} />
+      ) : (
+        <div className="col gap-2">
+          {docs.map(d => {
+            const uploader = d.uploadedBy ? db.user(d.uploadedBy) : null;
+            const sizeKb = d.fileSizeBytes != null ? Math.round(d.fileSizeBytes / 1024) : null;
+            return (
+              <div key={d.id} className="row gap-3" style={{
+                alignItems: "center", padding: "8px 12px",
+                borderRadius: "var(--r-md)", background: "var(--bg-muted)",
+              }}>
+                <Icon name="fileText" size={16} style={{ color: "var(--ink-mute)" }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="truncate" style={{ font: "var(--t-body-md)", fontWeight: 600 }}>
+                    {d.fileName}
+                  </div>
+                  <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                    {sizeKb != null ? `${sizeKb} KB · ` : ""}
+                    {d.uploadedAt.slice(0, 10)}
+                    {uploader ? ` · ${uploader.name}` : ""}
+                  </div>
+                </div>
+                <button className="btn btn-ghost btn-sm" onClick={() => onDownload(d)}>
+                  <Icon name="externalLink" size={13} /> Download
+                </button>
+                {canUpload && (
+                  <button className="btn btn-ghost btn-sm" onClick={() => onDelete(d)}>
+                    <Icon name="trash" size={13} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 

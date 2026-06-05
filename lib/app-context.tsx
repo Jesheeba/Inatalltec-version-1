@@ -9,6 +9,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { db, DEFAULT_ORG_ID, NOTIFICATIONS } from "./db";
+import { supabaseBrowser } from "./supabase/client";
+import { mapNotificationRow, NOTIFICATION_COLUMNS } from "./notifications";
 import { formatCurrency, type CurrencyOptions } from "./format";
 import type { HydrationBundle } from "./hydrate";
 import type { Notification, Organization, Role, User } from "./types";
@@ -152,12 +154,14 @@ export function AppProvider({
   currentUser,
   initialUsers,
   initialBundle,
+  initialNotifications,
 }: {
   children: React.ReactNode;
   initialUserId?: string;
   currentUser?: User;
   initialUsers?: User[];
   initialBundle?: HydrationBundle;
+  initialNotifications?: Notification[];
 }) {
   const router = useRouter();
   const pathname = usePathname() ?? "/dashboard";
@@ -190,6 +194,8 @@ export function AppProvider({
       for (const h of initialBundle.workOrderSubContractorHours) db.WORK_ORDER_SUB_CONTRACTOR_HOURS[h.id] = h;
       for (const fc of initialBundle.freeCalls) db.FREE_CALLS[fc.id] = fc;
       for (const q of initialBundle.quotations) db.QUOTATIONS[q.id] = q;
+      for (const t of initialBundle.woTasks) db.WO_TASKS[t.id] = t;
+      for (const d of initialBundle.amcDocuments) db.AMC_DOCUMENTS[d.id] = d;
       for (const a of initialBundle.approvals) db.APPROVALS[a.id] = a;
       for (const r of initialBundle.replacements) db.REPLACEMENTS[r.id] = r;
     }
@@ -204,18 +210,25 @@ export function AppProvider({
   const [notesVersion, setNotesVersion] = useState(0);
   const bumpNotes = useCallback(() => setNotesVersion(v => v + 1), []);
 
-  // Sidebar collapse - read persisted preference; fall back to viewport-aware
-  // default (open ≥1024px, closed below). Read once on mount; subsequent
-  // changes are written back from the setter wrapper below.
-  const [sidebarCollapsed, setSidebarCollapsedRaw] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
+  // Sidebar collapse. IMPORTANT: the initial value MUST be the same on the
+  // server and on the client's first render, otherwise React throws a
+  // hydration mismatch (the Topbar toggle's aria-label and the AppShell
+  // backdrop both depend on this). So we seed the SSR default (`false`) and
+  // apply the persisted / viewport-aware preference in an effect after mount.
+  const [sidebarCollapsed, setSidebarCollapsedRaw] = useState<boolean>(false);
+  useEffect(() => {
+    let initial: boolean;
     try {
       const stored = window.localStorage.getItem("sidebar_collapsed");
-      if (stored === "true") return true;
-      if (stored === "false") return false;
-    } catch { /* private mode etc. - silent fallback */ }
-    return window.matchMedia("(max-width: 1024px)").matches;
-  });
+      if (stored === "true") initial = true;
+      else if (stored === "false") initial = false;
+      else initial = window.matchMedia("(max-width: 1024px)").matches;
+    } catch {
+      // private mode etc. - fall back to viewport-aware default
+      initial = window.matchMedia("(max-width: 1024px)").matches;
+    }
+    setSidebarCollapsedRaw(initial);
+  }, []);
   const setSidebarCollapsed = useCallback((next: boolean | ((o: boolean) => boolean)) => {
     setSidebarCollapsedRaw(prev => {
       const v = typeof next === "function" ? next(prev) : next;
@@ -229,7 +242,9 @@ export function AppProvider({
   const [create, setCreate] = useState<CreateState | null>(null);
   const [dataVersion, setDataVersion] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
-  const [notifications, setNotifications] = useState<Notification[]>(NOTIFICATIONS);
+  const [notifications, setNotifications] = useState<Notification[]>(
+    initialNotifications && initialNotifications.length > 0 ? initialNotifications : NOTIFICATIONS,
+  );
 
   // When a real signed-in user is passed from the server layout, that is the
   // source of truth for `me`. Otherwise we fall back to the mock dict lookup
@@ -320,8 +335,9 @@ export function AppProvider({
       case "project": return openProject(target.id);
       case "amc": return openAmc(target.id);
       case "repair": return go("repair", { id: target.id });
+      case "replacement": return openReplacement(target.id);
     }
-  }, [openWO, openApproval, openCustomer, openProject, openAmc, go]);
+  }, [openWO, openApproval, openCustomer, openProject, openAmc, openReplacement, go]);
 
   const fireToast = useCallback((msg: string) => {
     setToast(msg);
@@ -333,8 +349,46 @@ export function AppProvider({
   const closeCreate = useCallback(() => setCreate(null), []);
   const bumpData = useCallback(() => setDataVersion(v => v + 1), []);
 
-  const markAllRead = useCallback(() => setNotifications(ns => ns.map(n => ({ ...n, read: true }))), []);
-  const markRead = useCallback((id: string) => setNotifications(ns => ns.map(n => n.id === id ? { ...n, read: true } : n)), []);
+  // Persisted notifications live in Supabase (real UUID ids). Synthetic
+  // pending-confirmation rows ("pc_…") and optimistic pushes ("n_…") are
+  // client-only — never write those back to the DB.
+  const isPersisted = (id: string) => !id.startsWith("pc_") && !id.startsWith("n_");
+
+  // Pull the signed-in user's notifications fresh from Supabase. RLS plus an
+  // explicit user_id filter keep it to their own rows (admins can read all,
+  // so the filter is required). Best-effort — failures leave state as-is.
+  const refreshNotifications = useCallback(async () => {
+    if (!hasRealAuth || !me.id) return;
+    try {
+      const { data } = await supabaseBrowser()
+        .from("notifications")
+        .select(NOTIFICATION_COLUMNS)
+        .eq("user_id", me.id)
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (data) setNotifications(data.map(mapNotificationRow));
+    } catch { /* offline / not configured - keep current state */ }
+  }, [hasRealAuth, me.id]);
+
+  const markAllRead = useCallback(() => {
+    setNotifications(ns => ns.map(n => ({ ...n, read: true })));
+    if (!hasRealAuth || !me.id) return;
+    try {
+      void supabaseBrowser().from("notifications")
+        .update({ read_at: new Date().toISOString() })
+        .is("read_at", null).eq("user_id", me.id);
+    } catch { /* best-effort */ }
+  }, [hasRealAuth, me.id]);
+
+  const markRead = useCallback((id: string) => {
+    setNotifications(ns => ns.map(n => n.id === id ? { ...n, read: true } : n));
+    if (!hasRealAuth || !isPersisted(id)) return;
+    try {
+      void supabaseBrowser().from("notifications")
+        .update({ read_at: new Date().toISOString() }).eq("id", id);
+    } catch { /* best-effort */ }
+  }, [hasRealAuth]);
+
   const dismissNotification = useCallback((id: string) => setNotifications(ns => ns.filter(n => n.id !== id)), []);
   const pushNotification = useCallback((n: Omit<Notification, "id" | "read"> & { id?: string; read?: boolean }) => {
     setNotifications(ns => [
@@ -342,7 +396,90 @@ export function AppProvider({
       ...ns,
     ]);
   }, []);
-  const unreadCount = notifications.filter(n => !n.read).length;
+
+  // Keep the bell fresh: pull once on mount, then again each time the user
+  // opens the dropdown. This is the "you see them when you open the app"
+  // Phase-1 behaviour — live/push delivery is a later phase.
+  useEffect(() => { void refreshNotifications(); }, [refreshNotifications]);
+  useEffect(() => { if (notifOpen) void refreshNotifications(); }, [notifOpen, refreshNotifications]);
+
+  // v1.2 — Surface every pending-confirmation item as a live notification.
+  // Synthetic rows derived from the data mirror; they auto-vanish when the
+  // underlying WO / Replacement leaves pending_confirmation. They can't be
+  // dismissed manually — the only way out is to action them. That's the
+  // point of an actionable inbox.
+  const syntheticNotifications = useMemo<Notification[]>(() => {
+    const out: Notification[] = [];
+    const isManager = role === "admin" || role === "md" || role === "manager";
+    const rel = (iso: string): string => {
+      if (!iso) return "";
+      const then = new Date(iso).getTime();
+      if (Number.isNaN(then)) return "";
+      const ms = Date.now() - then;
+      if (ms < 60_000) return "just now";
+      if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+      if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+      return `${Math.floor(ms / 86_400_000)}d ago`;
+    };
+
+    for (const wo of Object.values(db.WORK_ORDERS)) {
+      if (wo.status !== "pending_confirmation") continue;
+      const isLead = wo.assignedLead === me.id;
+      if (!isLead && !isManager) continue;
+      // Find the most-recent closed time entry on this WO so we can name
+      // the worker and timestamp the moment they finished.
+      const entries = Object.values(db.WORK_ORDER_TIME_ENTRIES)
+        .filter(e => e.workOrderId === wo.id && e.endedAt);
+      entries.sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""));
+      const latest = entries[0];
+      const iso = latest?.endedAt ?? wo.scheduledEnd ?? wo.scheduledStart;
+      const workerName = latest?.userId ? db.user(latest.userId).name : "A worker";
+      out.push({
+        id:       `pc_wo_${wo.id}`,
+        t:        rel(iso),
+        iso,
+        read:     false,
+        kind:     "workorder",
+        title:    `${wo.code} ready for confirmation`,
+        body:     `${workerName} finished work on "${wo.title}" — review and mark done.`,
+        target:   { kind: "wo", id: wo.id },
+        priority: "normal",
+        actions:  ["view"],
+      });
+    }
+
+    for (const rr of Object.values(db.REPLACEMENTS)) {
+      if (rr.status !== "pending_confirmation") continue;
+      const isRequester = rr.requestedBy === me.id;
+      if (!isRequester && !isManager) continue;
+      const iso = rr.installedAt ?? rr.requestedAt;
+      const installerName = rr.installedBy ? db.user(rr.installedBy).name : "Installer";
+      out.push({
+        id:       `pc_rr_${rr.id}`,
+        t:        rel(iso),
+        iso,
+        read:     false,
+        kind:     "signoff",
+        title:    `${rr.code} installed — confirm`,
+        body:     `${installerName} installed ${rr.quantity}× ${rr.itemName} — confirm it's correct.`,
+        target:   { kind: "replacement", id: rr.id },
+        priority: "normal",
+        actions:  ["view"],
+      });
+    }
+
+    out.sort((a, b) => (b.iso ?? "").localeCompare(a.iso ?? ""));
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, me.id, dataVersion]);
+
+  // Merge synthetic (live) on top of persisted notifications. Synthetic
+  // IDs are namespaced (`pc_…`) so they can't collide with pushed ones.
+  const allNotifications = useMemo(
+    () => [...syntheticNotifications, ...notifications],
+    [syntheticNotifications, notifications],
+  );
+  const unreadCount = allNotifications.filter(n => !n.read).length;
 
   const value: Ctx = {
     me, userId, setUserId, role, hasRealAuth,
@@ -356,7 +493,7 @@ export function AppProvider({
     modal, setModal,
     create, openCreate, closeCreate, dataVersion, bumpData,
     toast, fireToast, dismissToast,
-    notifications, setNotifications, markAllRead, markRead, dismissNotification, pushNotification, unreadCount,
+    notifications: allNotifications, setNotifications, markAllRead, markRead, dismissNotification, pushNotification, unreadCount,
   };
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>;
 }

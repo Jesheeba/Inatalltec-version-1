@@ -26,7 +26,7 @@ import type {
   AmcContract, AmcStatus, Approval, Customer, FreeCall, Organization, Project, ProjectPhase,
   Quotation, QuotationStatus, RepairTicket, ReplacementContext, ReplacementRequest,
   ReplacementStatus, Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
-  WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType,
+  WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
 } from "./types";
 
 // Returns null when Supabase is configured, otherwise a Result-shaped
@@ -639,6 +639,15 @@ export async function createProject(input: ProjectInput): Promise<Result> {
   row.id = data.id;
 
   db.PROJECTS[row.id] = row;
+
+  // Migration 0035 — auto-generate a starter quotation linked to this
+  // project. Non-fatal: if quotation create fails (RLS, network), the
+  // project create still succeeds and Sales can author a quotation
+  // manually later. The caller's UI is unaffected by this side-effect.
+  void autoGenerateQuotationForProject(row).catch(err => {
+    console.warn("[createProject] auto-quotation failed:", err);
+  });
+
   return { ok: true, id: row.id };
 }
 
@@ -791,13 +800,13 @@ export async function createAmc(input: AmcInput): Promise<Result> {
 
   const code = input.code?.trim() || `AMC-${Math.floor(Math.random() * 900 + 100)}`;
 
-  // Post-0027 flow: amc_contracts.signed_at defaults to current_date,
-  // the BEFORE INSERT trigger populates first_payment_due_at, and the
-  // AFTER INSERT trigger trg_amc_seed_first_service seeds service 1
-  // anchored on signed_at. Services 2..N are created later when payment
-  // is recorded (fn_amc_payment_received). We therefore insert with
-  // initial status 'pending_payment' (signed, waiting for payment).
-  // contract_status flips to 'active' on the payment trigger.
+  // Post-0033 flow: amc_contracts.signed_at default is dropped and
+  // first_visit_date starts NULL. The contract sits in 'pending_payment'
+  // (UI labels it "Draft — first visit not booked" while first_visit_date
+  // IS NULL). The Operations Manager later clicks "Book first visit date"
+  // which calls bookAmcFirstVisitDate(); that UPDATE fires the seed and
+  // first_payment_due_at triggers and the contract becomes a proper
+  // "Pending Payment" until payment is recorded.
 
   const guard = ensureSupabase();
   if (guard) return guard;
@@ -811,12 +820,11 @@ export async function createAmc(input: AmcInput): Promise<Result> {
     value_aed: input.value_aed,
     expires_at: input.expires_at,
   })
-  .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+  .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
   .single();
   if (error) return { ok: false, error: error.message };
 
   const newId = data.id as string;
-  // Mirror the DB-populated row (signed_at default + triggers ran already).
   const row: AmcContract = {
     id:                newId,
     code:              (data.code as string) ?? code,
@@ -837,10 +845,196 @@ export async function createAmc(input: AmcInput): Promise<Result> {
     resumedAt:         (data.resumed_at as string | null) ?? null,
     firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? null,
     renewedFromId:     (data.renewed_from_id as string | null) ?? null,
+    firstVisitDate:    (data.first_visit_date as string | null) ?? null,
   };
 
   db.AMCS[row.id] = row;
   return { ok: true, id: row.id };
+}
+
+// ─────────────────────────────────────────────────────────
+// bookAmcFirstVisitDate — Step 1 of the post-0033 AMC flow.
+//
+// Sets amc_contracts.first_visit_date to a user-picked date. The DB
+// triggers populate first_payment_due_at and seed service 1 on the
+// schedule. Status stays 'pending_payment' (the UI label flips from
+// "Draft — first visit not booked" to "Pending Payment").
+//
+// Permission: admin · md · manager.
+// ─────────────────────────────────────────────────────────
+export async function bookAmcFirstVisitDate(
+  amcId: string,
+  date: string,        // YYYY-MM-DD
+): Promise<Result> {
+  if (!amcId) return { ok: false, error: "Contract id is required." };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return { ok: false, error: "Pick a valid date." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  // Optimistic mirror update so the UI flips immediately.
+  const prev = db.AMCS[amcId];
+  if (prev) {
+    db.AMCS[amcId] = { ...prev, firstVisitDate: date };
+  }
+
+  const { data, error } = await supabaseBrowser()
+    .from("amc_contracts")
+    .update({ first_visit_date: date })
+    .eq("id", amcId)
+    .select("first_visit_date, first_payment_due_at")
+    .single();
+
+  if (error || !data) {
+    if (prev) db.AMCS[amcId] = prev;
+    return { ok: false, error: error?.message || "Update failed." };
+  }
+
+  if (prev) {
+    db.AMCS[amcId] = {
+      ...prev,
+      firstVisitDate:    (data.first_visit_date as string | null) ?? date,
+      firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? prev.firstPaymentDueAt,
+    };
+  }
+  return { ok: true, id: amcId };
+}
+
+// ─────────────────────────────────────────────────────────
+// AMC document upload / delete
+//
+// Bucket: 'amc-documents' (private, created in migration 0034).
+// Permission: admin · md · manager · sales (enforced by RLS on
+// amc_documents + storage.objects).
+//
+// File constraints (client-side):
+//   • 25 MB cap
+//   • Any mime type
+//
+// Path convention: <amc_id>/<random>-<sanitized_name>
+// ─────────────────────────────────────────────────────────
+export const AMC_DOC_MAX_BYTES = 25 * 1024 * 1024;
+
+export interface UploadAmcDocResult {
+  ok: boolean;
+  doc?: import("./types").AmcDocument;
+  error?: string;
+}
+
+export async function uploadAmcDocument(
+  amcId: string,
+  file: File,
+  uploaderId: string | null,
+): Promise<UploadAmcDocResult> {
+  if (!amcId) return { ok: false, error: "Contract id is required." };
+  if (!file)  return { ok: false, error: "Pick a file to upload." };
+  if (file.size > AMC_DOC_MAX_BYTES) {
+    return { ok: false, error: `File is over the 25 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "document";
+  const random = Math.random().toString(36).slice(2, 10);
+  const filePath = `${amcId}/${random}-${safeName}`;
+
+  const supa = supabaseBrowser();
+  const { error: storageErr } = await supa.storage
+    .from("amc-documents")
+    .upload(filePath, file, {
+      contentType: file.type || undefined,
+      upsert: false,
+    });
+  if (storageErr) {
+    return { ok: false, error: `Upload failed: ${storageErr.message}` };
+  }
+
+  const { data, error: insertErr } = await supa
+    .from("amc_documents")
+    .insert({
+      amc_id:          amcId,
+      file_name:       file.name,
+      file_path:       filePath,
+      file_size_bytes: file.size,
+      mime_type:       file.type || null,
+      uploaded_by:     uploaderId,
+    })
+    .select("id, amc_id, file_name, file_path, file_size_bytes, mime_type, uploaded_by, uploaded_at")
+    .single();
+
+  if (insertErr || !data) {
+    // Rollback the storage upload so we don't orphan the blob.
+    await supa.storage.from("amc-documents").remove([filePath]);
+    return { ok: false, error: insertErr?.message || "Failed to record document." };
+  }
+
+  const doc: import("./types").AmcDocument = {
+    id:            data.id as string,
+    amcId:         data.amc_id as string,
+    fileName:      data.file_name as string,
+    filePath:      data.file_path as string,
+    fileSizeBytes: (data.file_size_bytes as number | null) ?? null,
+    mimeType:      (data.mime_type as string | null) ?? null,
+    uploadedBy:    (data.uploaded_by as string | null) ?? null,
+    uploadedAt:    data.uploaded_at as string,
+  };
+  db.AMC_DOCUMENTS[doc.id] = doc;
+  return { ok: true, doc };
+}
+
+export async function deleteAmcDocument(docId: string): Promise<Result> {
+  if (!docId) return { ok: false, error: "Document id is required." };
+  const doc = db.AMC_DOCUMENTS[docId];
+  if (!doc) return { ok: false, error: "Document not found." };
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  // Optimistic mirror delete.
+  delete db.AMC_DOCUMENTS[docId];
+
+  const { error: rowErr } = await supa
+    .from("amc_documents")
+    .delete()
+    .eq("id", docId);
+  if (rowErr) {
+    db.AMC_DOCUMENTS[docId] = doc; // revert
+    return { ok: false, error: rowErr.message };
+  }
+
+  // Best-effort Storage cleanup. If this fails the row is already gone,
+  // so we just log; an orphaned blob is not user-visible.
+  const { error: storageErr } = await supa.storage
+    .from("amc-documents")
+    .remove([doc.filePath]);
+  if (storageErr) {
+    console.warn("[deleteAmcDocument] storage cleanup failed:", storageErr.message);
+  }
+
+  return { ok: true, id: docId };
+}
+
+// Returns a short-lived signed URL for downloading a document. Bucket
+// is private so direct URLs don't work; a signed URL gives the browser
+// a one-time download link.
+export async function getAmcDocumentDownloadUrl(
+  filePath: string,
+  expiresInSeconds: number = 60,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!filePath) return { ok: false, error: "filePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+
+  const { data, error } = await supabaseBrowser()
+    .storage.from("amc-documents")
+    .createSignedUrl(filePath, expiresInSeconds);
+  if (error || !data?.signedUrl) {
+    return { ok: false, error: error?.message || "Could not create signed URL." };
+  }
+  return { ok: true, url: data.signedUrl };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -902,7 +1096,7 @@ export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true
 
   const { data, error } = await supabaseBrowser()
     .from("amc_contracts").update(body).eq("id", id)
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .single();
   if (error) return { ok: false, error: error.message };
 
@@ -916,6 +1110,7 @@ export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true
     leadTechId:        (data.lead_tech_id as string) ?? "",
     contract_status:   data.contract_status as AmcStatus,
     value:             (data.value_aed as number) ?? 0,
+    firstVisitDate:    (data.first_visit_date as string | null) ?? current?.firstVisitDate ?? null,
     services:          current?.services ?? { done: 0, total: 4 },
     nextDue:           (data.next_due_label as string) ?? "-",
     overdueDays:       (data.overdue_days as number) ?? 0,
@@ -1012,7 +1207,7 @@ export async function recordAmcPayment(
   //    when the payment trigger auto-resumes a paused contract.
   const { data: amcRow, error: amcErr } = await supa
     .from("amc_contracts")
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .eq("id", amcId)
     .single();
   if (amcErr || !amcRow) {
@@ -1031,6 +1226,7 @@ export async function recordAmcPayment(
     leadTechId:        (amcRow.lead_tech_id as string) ?? "",
     contract_status:   amcRow.contract_status as AmcContract["contract_status"],
     value:             (amcRow.value_aed as number) ?? 0,
+    firstVisitDate:    (amcRow.first_visit_date as string | null) ?? current?.firstVisitDate ?? null,
     services:          current?.services ?? { done: 0, total: 4 },
     nextDue:           (amcRow.next_due_label as string) ?? "-",
     overdueDays:       (amcRow.overdue_days as number) ?? 0,
@@ -1268,8 +1464,9 @@ export async function renewAmc(
     suspendedReason:   null,
     pausedBy:          null,
     resumedAt:         null,
-    firstPaymentDueAt: null, // server populated; UI re-fetches next paint
+    firstPaymentDueAt: null, // populated only after bookAmcFirstVisitDate fires (0033)
     renewedFromId:     previousAmcId,
+    firstVisitDate:    null, // renewal starts fresh; OM books a new first visit date
   };
   db.AMCS[newId] = newRow;
 
@@ -1286,7 +1483,7 @@ async function updateAmcWithExtras(
   const supa = supabaseBrowser();
   const { data, error } = await supa
     .from("amc_contracts").update(body).eq("id", amcId)
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .single();
   if (error) return { ok: false, error: error.message };
   const current = db.AMCS[amcId];
@@ -1310,6 +1507,7 @@ async function updateAmcWithExtras(
     resumedAt:         (data.resumed_at as string | null) ?? null,
     firstPaymentDueAt: (data.first_payment_due_at as string | null) ?? null,
     renewedFromId:     (data.renewed_from_id as string | null) ?? null,
+    firstVisitDate:    (data.first_visit_date as string | null) ?? current?.firstVisitDate ?? null,
   };
   db.AMCS[amcId] = next;
   return { ok: true, amc: next };
@@ -2725,6 +2923,103 @@ export async function linkFreeCallToWorkOrder(
 }
 
 // ═════════════════════════════════════════════════════════════
+// v1.1.0 — WO CHECKLIST TASKS (table from migration 0001)
+// ═════════════════════════════════════════════════════════════
+//
+// Three helpers — add, toggle, delete — that mirror the table's tiny
+// shape (id / work_order_id / label / is_done / position / count_label).
+// Each helper updates the mirror optimistically so the UI reflects the
+// change without waiting for the round-trip, then reverts on failure.
+
+interface WoTaskRow {
+  id: string;
+  work_order_id: string;
+  label: string;
+  is_done: boolean;
+  position: number;
+  count_label: string | null;
+}
+
+function woTaskRowToType(r: WoTaskRow): WoTask {
+  return {
+    id:          r.id,
+    workOrderId: r.work_order_id,
+    label:       r.label,
+    done:        r.is_done,
+    position:    r.position,
+    count:       r.count_label ?? undefined,
+  };
+}
+
+export async function addWoTask(
+  woId: string,
+  label: string,
+): Promise<{ ok: true; task: WoTask } | { ok: false; error: string }> {
+  if (!woId)             return { ok: false, error: "Work order id is required." };
+  if (!label.trim())     return { ok: false, error: "Task label is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const nextPos = db.tasksForWO(woId).reduce((m, t) => Math.max(m, t.position), -1) + 1;
+  const { data, error } = await supa
+    .from("work_order_tasks")
+    .insert({ work_order_id: woId, label: label.trim(), is_done: false, position: nextPos })
+    .select("id, work_order_id, label, is_done, position, count_label")
+    .maybeSingle();
+  if (error) return { ok: false, error: error.message };
+  if (!data) return { ok: false, error: "Task row missing after insert." };
+
+  const task = woTaskRowToType(data as WoTaskRow);
+  db.WO_TASKS[task.id] = task;
+  return { ok: true, task };
+}
+
+export async function toggleWoTask(
+  taskId: string,
+  nextDone: boolean,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!taskId) return { ok: false, error: "Task id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const cur = db.WO_TASKS[taskId];
+  // Optimistic local update so the checkbox flips instantly.
+  if (cur) db.WO_TASKS[taskId] = { ...cur, done: nextDone };
+  const { error } = await supa
+    .from("work_order_tasks")
+    .update({ is_done: nextDone })
+    .eq("id", taskId);
+  if (error) {
+    if (cur) db.WO_TASKS[taskId] = cur;
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
+}
+
+export async function deleteWoTask(
+  taskId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!taskId) return { ok: false, error: "Task id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const cur = db.WO_TASKS[taskId];
+  if (cur) delete db.WO_TASKS[taskId];
+  const { error } = await supa
+    .from("work_order_tasks")
+    .delete()
+    .eq("id", taskId);
+  if (error) {
+    if (cur) db.WO_TASKS[taskId] = cur;
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
+}
+
+// ═════════════════════════════════════════════════════════════
 // PHASE 11 — QUOTATIONS (migration 0028)
 // ═════════════════════════════════════════════════════════════
 
@@ -2751,7 +3046,18 @@ interface QuotationRow {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  // Migration 0035 — quotation template fields.
+  project_id?: string | null;
+  description?: string | null;
+  terms?: string | null;
 }
+
+// Column list shared by every SELECT that hydrates a Quotation row from
+// the DB. Migration 0035 added project_id / description / terms.
+const QUOTATION_SELECT_COLS =
+  "id, code, customer_id, title, value_aed, status, valid_until, " +
+  "converted_to_project_id, converted_to_amc_id, notes, created_by, " +
+  "created_at, updated_at, project_id, description, terms";
 
 function quotationRowToType(r: QuotationRow): Quotation {
   const v = typeof r.value_aed === "number" ? r.value_aed : Number(r.value_aed);
@@ -2769,6 +3075,9 @@ function quotationRowToType(r: QuotationRow): Quotation {
     createdBy:             r.created_by,
     createdAt:             r.created_at,
     updatedAt:             r.updated_at,
+    projectId:             r.project_id ?? null,
+    description:           r.description ?? null,
+    terms:                 r.terms ?? null,
   };
 }
 
@@ -2792,7 +3101,7 @@ export async function createQuotation(
     notes:       input.notes?.trim() || null,
     created_by:  createdBy || null,
   })
-  .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+  .select(QUOTATION_SELECT_COLS)
   .maybeSingle();
 
   if (error) {
@@ -2803,7 +3112,7 @@ export async function createQuotation(
   }
   if (!data) return { ok: false, error: "Quotation row missing after insert." };
 
-  const quotation = quotationRowToType(data as QuotationRow);
+  const quotation = quotationRowToType(data as unknown as QuotationRow);
   db.QUOTATIONS[quotation.id] = quotation;
   return { ok: true, quotation };
 }
@@ -2820,14 +3129,272 @@ export async function updateQuotationStatus(
   const { data, error } = await supa.from("quotations")
     .update({ status })
     .eq("id", id)
-    .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+    .select(QUOTATION_SELECT_COLS)
     .maybeSingle();
   if (error) return { ok: false, error: error.message };
   if (!data) return { ok: false, error: "Quotation not found." };
 
-  const quotation = quotationRowToType(data as QuotationRow);
+  const quotation = quotationRowToType(data as unknown as QuotationRow);
   db.QUOTATIONS[quotation.id] = quotation;
   return { ok: true, quotation };
+}
+
+// ─────────────────────────────────────────────────────────
+// updateQuotation — patch editable fields on the detail view.
+//
+// Covers the six fields Sales edits after the auto-generate hook:
+// title, value_aed, valid_until, description, terms, notes.
+// (Status changes still go through updateQuotationStatus; conversion
+// still goes through convertQuotation — those have their own rules.)
+// ─────────────────────────────────────────────────────────
+export interface QuotationPatch {
+  title?: string;
+  value_aed?: number;
+  valid_until?: string | null;
+  description?: string | null;
+  terms?: string | null;
+  notes?: string | null;
+}
+
+export async function updateQuotation(
+  id: string,
+  patch: QuotationPatch,
+): Promise<{ ok: true; quotation: Quotation } | { ok: false; error: string }> {
+  if (!id) return { ok: false, error: "Quotation id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+
+  const body: Record<string, unknown> = {};
+  if (patch.title       !== undefined) body.title       = patch.title.trim();
+  if (patch.value_aed   !== undefined) body.value_aed   = patch.value_aed;
+  if (patch.valid_until !== undefined) body.valid_until = patch.valid_until || null;
+  if (patch.description !== undefined) body.description = patch.description;
+  if (patch.terms       !== undefined) body.terms       = patch.terms;
+  if (patch.notes       !== undefined) body.notes       = patch.notes;
+  if (Object.keys(body).length === 0) {
+    const q = db.QUOTATIONS[id];
+    return q ? { ok: true, quotation: q } : { ok: false, error: "No changes." };
+  }
+
+  const supa = supabaseBrowser();
+  const prev = db.QUOTATIONS[id];
+
+  // Optimistic mirror update so the edit form reflects the save instantly.
+  if (prev) {
+    db.QUOTATIONS[id] = {
+      ...prev,
+      title:       patch.title       !== undefined ? patch.title.trim()  : prev.title,
+      valueAed:    patch.value_aed   !== undefined ? patch.value_aed     : prev.valueAed,
+      validUntil:  patch.valid_until !== undefined ? (patch.valid_until || null) : prev.validUntil,
+      description: patch.description !== undefined ? patch.description   : prev.description,
+      terms:       patch.terms       !== undefined ? patch.terms         : prev.terms,
+      notes:       patch.notes       !== undefined ? patch.notes         : prev.notes,
+    };
+  }
+
+  const { data, error } = await supa.from("quotations")
+    .update(body)
+    .eq("id", id)
+    .select(QUOTATION_SELECT_COLS)
+    .maybeSingle();
+  if (error || !data) {
+    if (prev) db.QUOTATIONS[id] = prev; // revert
+    return { ok: false, error: error?.message || "Update failed." };
+  }
+  const quotation = quotationRowToType(data as unknown as QuotationRow);
+  db.QUOTATIONS[quotation.id] = quotation;
+  return { ok: true, quotation };
+}
+
+// ─────────────────────────────────────────────────────────
+// autoGenerateQuotationForProject — Migration 0035.
+//
+// Side-effect of createProject: drops a starter quotation into the
+// quotations table linked to the freshly-created project. Pre-fills
+// title, value, validity (today + 30 days), and bullet-point
+// placeholder text for description + terms that Sales replaces.
+//
+// Non-fatal: createProject() catches rejections. If RLS denies the
+// insert (e.g. role doesn't have quote_write), the project still
+// lands; Sales can author the quotation manually.
+// ─────────────────────────────────────────────────────────
+const AUTO_QUOTE_VALIDITY_DAYS = 30;
+
+function placeholderDescription(projectName: string): string {
+  return (
+    `Scope of work for ${projectName}:\n\n` +
+    `• [Describe deliverable 1 — replace this text]\n` +
+    `• [Describe deliverable 2 — replace this text]\n` +
+    `• [Describe deliverable 3 — replace this text]\n\n` +
+    `Replace this placeholder with the actual scope before sending.`
+  );
+}
+
+function placeholderTerms(): string {
+  return (
+    `Payment terms:\n` +
+    `• 50% advance on contract signing\n` +
+    `• 40% on milestone delivery\n` +
+    `• 10% on project completion\n\n` +
+    `Validity: 30 days from quotation date.\n` +
+    `Replace this placeholder with the agreed commercial terms.`
+  );
+}
+
+async function autoGenerateQuotationForProject(
+  project: Project,
+): Promise<{ ok: true; quotation: Quotation } | { ok: false; error: string }> {
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const code = `QTN-${new Date().getFullYear()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+  const validUntil = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() + AUTO_QUOTE_VALIDITY_DAYS);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  const { data, error } = await supa.from("quotations").insert({
+    code,
+    customer_id: project.customer || null,
+    project_id:  project.id,
+    title:       `Quotation for ${project.name}`,
+    value_aed:   project.value ?? 0,
+    valid_until: validUntil,
+    description: placeholderDescription(project.name),
+    terms:       placeholderTerms(),
+    notes:       null,
+    status:      "draft",
+  })
+  .select(QUOTATION_SELECT_COLS)
+  .maybeSingle();
+
+  if (error) return { ok: false, error: error.message };
+  if (!data)  return { ok: false, error: "Quotation row missing after insert." };
+
+  const quotation = quotationRowToType(data as unknown as QuotationRow);
+  db.QUOTATIONS[quotation.id] = quotation;
+  return { ok: true, quotation };
+}
+
+// ─────────────────────────────────────────────────────────
+// downloadQuotationFile — Migration 0035.
+//
+// Browser-native export. No PDF/DOCX library in package.json:
+//   • "pdf"  → opens a print-styled HTML doc in a new window and
+//              auto-triggers window.print(). The user picks
+//              "Save as PDF" in the system print dialog.
+//   • "word" → downloads an .doc file containing Word-friendly HTML.
+//              Microsoft Word and LibreOffice both open .doc HTML
+//              natively without extra dependencies.
+//
+// The customer name is looked up from the in-memory mirror so the
+// printed document has a proper "To: Acme LLC" header instead of a
+// raw UUID. Falls back to "—" when the customer isn't on the mirror.
+// ─────────────────────────────────────────────────────────
+export type QuotationExportFormat = "pdf" | "word";
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function quotationToHtmlDocument(q: Quotation): string {
+  const customer = q.customerId ? db.cust(q.customerId)?.name ?? "—" : "—";
+  const total = (q.valueAed ?? 0).toLocaleString("en-AE", {
+    style: "currency", currency: "AED", maximumFractionDigits: 2,
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  const desc  = (q.description ?? "").trim() || "(no scope provided)";
+  const terms = (q.terms ?? "").trim() || "(no terms provided)";
+  const notes = (q.notes ?? "").trim();
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(q.code)} · ${escapeHtml(q.title)}</title>
+<style>
+  body { font: 14px/1.55 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         color: #1f2937; max-width: 760px; margin: 32px auto; padding: 0 32px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em;
+       color: #6b7280; margin: 28px 0 8px; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  .meta { display: grid; grid-template-columns: 120px 1fr; gap: 4px 16px;
+          font-size: 13px; margin: 16px 0 8px; }
+  .meta dt { color: #6b7280; }
+  .meta dd { margin: 0; font-weight: 600; }
+  pre { white-space: pre-wrap; font: inherit; margin: 0; }
+  .total { font-size: 18px; font-weight: 700; padding: 12px 16px;
+           background: #f3f4f6; border-radius: 8px; margin: 16px 0; }
+  @media print {
+    body { margin: 0; padding: 16mm; max-width: none; }
+    h2 { break-after: avoid; }
+  }
+</style></head><body>
+  <h1>${escapeHtml(q.title)}</h1>
+  <div style="color:#6b7280; font-size:13px;">Quotation · ${escapeHtml(q.code)}</div>
+
+  <dl class="meta">
+    <dt>Customer</dt>      <dd>${escapeHtml(customer)}</dd>
+    <dt>Date</dt>          <dd>${escapeHtml(today)}</dd>
+    <dt>Valid until</dt>   <dd>${escapeHtml(q.validUntil ?? "—")}</dd>
+    <dt>Status</dt>        <dd>${escapeHtml(q.status)}</dd>
+  </dl>
+
+  <h2>Scope of work</h2>
+  <pre>${escapeHtml(desc)}</pre>
+
+  <div class="total">Total: ${escapeHtml(total)}</div>
+
+  <h2>Terms</h2>
+  <pre>${escapeHtml(terms)}</pre>
+
+  ${notes ? `<h2>Notes</h2><pre>${escapeHtml(notes)}</pre>` : ""}
+</body></html>`;
+}
+
+export function downloadQuotationFile(
+  quotation: Quotation,
+  format: QuotationExportFormat,
+): void {
+  if (typeof window === "undefined") return;
+  const html = quotationToHtmlDocument(quotation);
+
+  if (format === "pdf") {
+    // Open in a new window so the user sees an unloaded document, then
+    // trigger the print dialog. They pick "Save as PDF" from the system.
+    const w = window.open("", "_blank", "noopener,width=820,height=900");
+    if (!w) {
+      // Pop-up blocked — fall back to opening as a data URL in the same tab.
+      const blob = new Blob([html], { type: "text/html" });
+      window.location.href = URL.createObjectURL(blob);
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    // Slight delay so the new window finishes parsing before printing.
+    setTimeout(() => { try { w.focus(); w.print(); } catch { /* ignore */ } }, 250);
+    return;
+  }
+
+  // Word: download as .doc — MS Word and LibreOffice both render HTML
+  // files served with this extension. No DOCX library needed.
+  const blob = new Blob(
+    ["﻿" + html],
+    { type: "application/msword;charset=utf-8" },
+  );
+  const url = URL.createObjectURL(blob);
+  const safeCode = quotation.code.replace(/[^\w\-]+/g, "_");
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${safeCode}.doc`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /**
@@ -2883,12 +3450,12 @@ export async function convertQuotation(
   const { data, error } = await supa.from("quotations")
     .update(patch)
     .eq("id", id)
-    .select("id, code, customer_id, title, value_aed, status, valid_until, converted_to_project_id, converted_to_amc_id, notes, created_by, created_at, updated_at")
+    .select(QUOTATION_SELECT_COLS)
     .maybeSingle();
   if (error) return { ok: false, error: `Created ${target} but couldn't flip quotation: ${error.message}` };
   if (!data) return { ok: false, error: "Quotation update returned no row." };
 
-  const quotation = quotationRowToType(data as QuotationRow);
+  const quotation = quotationRowToType(data as unknown as QuotationRow);
   db.QUOTATIONS[quotation.id] = quotation;
   return { ok: true, targetId: targetId!, quotation };
 }

@@ -34,7 +34,7 @@ import type {
   SubContractor, WorkOrderSubContractorHours,
 } from "@/lib/types";
 
-const ALLOWED_ROLES = new Set<string>(["admin", "md", "manager"]);
+const ALLOWED_ROLES = new Set<string>(["admin", "md", "manager", "lead_worker"]);
 
 // ── List page ───────────────────────────────────────────────
 
@@ -229,6 +229,12 @@ export function SubContractorDetail({ id }: { id: string }) {
   const [showFullNotes,  setShowFullNotes]  = useState(false);
   const [historyLimit,   setHistoryLimit]   = useState(50);
 
+  // ── Hours filters (project + timing) ─────────────────────
+  // "all" or a source key: "p:<projectId>" | "amc" | "repair" | "unknown".
+  const [projectF, setProjectF] = useState<string>("all");
+  const [fromD,    setFromD]    = useState<string>(""); // YYYY-MM-DD, "" = no bound
+  const [toD,      setToD]      = useState<string>("");
+
   if (!ALLOWED_ROLES.has(role)) {
     return (
       <div className="main-pad">
@@ -261,20 +267,76 @@ export function SubContractorDetail({ id }: { id: string }) {
     [id, dataVersion], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // Stable source key for an hours entry → drives both the project filter
+  // dropdown and the per-entry match. Mirrors the grouping logic below.
+  const sourceKeyFor = (woId: string): string => {
+    const wo = db.wo(woId);
+    if (!wo) return "unknown";
+    if (wo.source.kind === "project") return "p:" + wo.source.id;
+    return wo.source.kind; // "amc" | "repair"
+  };
+
+  // Project / job options for the filter, derived from the UNfiltered
+  // entries so any source the sub touched is always selectable.
+  const projectOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const e of entries) {
+      const key = sourceKeyFor(e.workOrderId);
+      if (map.has(key)) continue;
+      const wo = db.wo(e.workOrderId);
+      let label: string;
+      if (!wo) label = "Removed work orders";
+      else if (wo.source.kind === "project") {
+        const p = db.proj(wo.source.id);
+        label = p ? `${p.code} · ${p.name}` : "Removed project";
+      } else if (wo.source.kind === "amc") label = "AMC visits";
+      else label = "Repair jobs";
+      map.set(key, label);
+    }
+    return Array.from(map, ([value, label]) => ({ value, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries]);
+
+  // Apply project + date-range filters once; everything below reads this.
+  const filteredEntries = useMemo(() => {
+    return entries.filter(e => {
+      if (projectF !== "all" && sourceKeyFor(e.workOrderId) !== projectF) return false;
+      if (fromD && e.entryDate < fromD) return false;
+      if (toD && e.entryDate > toD) return false;
+      return true;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, projectF, fromD, toD]);
+
+  const filtersActive = projectF !== "all" || fromD !== "" || toD !== "";
+
+  // Highlight active filter controls in the brand green so the current
+  // selection is obvious at a glance.
+  const greenField = {
+    borderColor: "var(--pri-500)",
+    background: "var(--pri-50)",
+    boxShadow: "var(--shadow-glow)",
+  } as const;
+  const thisMonth = monthRange(0);
+  const lastMonth = monthRange(1);
+  const thisMonthActive = fromD === thisMonth.from && toD === thisMonth.to;
+  const lastMonthActive = fromD === lastMonth.from && toD === lastMonth.to;
+
   const totalHours = useMemo(
-    () => entries.reduce((s, e) => s + e.hours, 0),
-    [entries],
+    () => filteredEntries.reduce((s, e) => s + e.hours, 0),
+    [filteredEntries],
   );
 
   // Distinct PROJECT count (AMC visits / repair jobs aren't projects).
   const activeProjectCount = useMemo(() => {
     const set = new Set<string>();
-    for (const e of entries) {
+    for (const e of filteredEntries) {
       const wo = db.wo(e.workOrderId);
       if (wo?.source.kind === "project") set.add(wo.source.id);
     }
     return set.size;
-  }, [entries]);
+  }, [filteredEntries]);
 
   // Hours-by-source grouping. Projects each get their own group; AMC
   // visits and repair jobs roll up into a single "AMC visits" /
@@ -295,7 +357,7 @@ export function SubContractorDetail({ id }: { id: string }) {
     let amcHours = 0, amcCount = 0;
     let repairHours = 0, repairCount = 0;
     let unknownHours = 0, unknownCount = 0;
-    for (const e of entries) {
+    for (const e of filteredEntries) {
       const wo = db.wo(e.workOrderId);
       if (!wo) {
         unknownHours += e.hours;
@@ -338,11 +400,11 @@ export function SubContractorDetail({ id }: { id: string }) {
         totalHours: unknownHours, entryCount: unknownCount });
     }
     return out;
-  }, [entries]);
+  }, [filteredEntries]);
 
   // Newest first. Tie-break by loggedAt for multi-entry-per-day cases.
   const sortedHistory = useMemo(() => {
-    return [...entries].sort((a, b) => {
+    return [...filteredEntries].sort((a, b) => {
       if (a.entryDate !== b.entryDate) return a.entryDate < b.entryDate ? 1 : -1;
       return a.loggedAt < b.loggedAt ? 1 : -1;
     });
@@ -483,18 +545,65 @@ export function SubContractorDetail({ id }: { id: string }) {
         )}
       </section>
 
+      {/* ── A2. Hours filters (project + timing) ─────────── */}
+      {entries.length > 0 && (
+        <section className="card card-pad" style={{ marginBottom: 20 }}>
+          <div className="row gap-3" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div className="col" style={{ minWidth: 200 }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Project / job</label>
+              <select className="input input-sm" value={projectF}
+                      style={projectF !== "all" ? greenField : undefined}
+                      onChange={e => setProjectF(e.target.value)}>
+                <option value="all">All projects &amp; jobs</option>
+                {projectOptions.map(o => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="col" style={{ minWidth: 140 }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>From</label>
+              <input className="input input-sm" type="date" value={fromD}
+                     style={fromD ? greenField : undefined}
+                     max={toD || undefined} onChange={e => setFromD(e.target.value)} />
+            </div>
+            <div className="col" style={{ minWidth: 140 }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>To</label>
+              <input className="input input-sm" type="date" value={toD}
+                     style={toD ? greenField : undefined}
+                     min={fromD || undefined} onChange={e => setToD(e.target.value)} />
+            </div>
+            <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+              <button className={"btn btn-sm " + (thisMonthActive ? "btn-primary" : "btn-ghost")}
+                      onClick={() => { const r = monthRange(0); setFromD(r.from); setToD(r.to); }}>
+                This month
+              </button>
+              <button className={"btn btn-sm " + (lastMonthActive ? "btn-primary" : "btn-ghost")}
+                      onClick={() => { const r = monthRange(1); setFromD(r.from); setToD(r.to); }}>
+                Last month
+              </button>
+              {filtersActive && (
+                <button className="btn btn-ghost btn-sm" onClick={() => { setProjectF("all"); setFromD(""); setToD(""); }}>
+                  <Icon name="x" size={13} /> Clear
+                </button>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* ── B. Hours headline KPIs ───────────────────────── */}
       <div style={{
         display: "grid", gap: 16,
         gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
         marginBottom: 20,
       }}>
-        <KPI accent="primary" label="Total hours" value={`${totalHours.toFixed(1)} hrs`}
-             sub={`Logged across ${entries.length} session${entries.length === 1 ? "" : "s"}`} />
+        <KPI accent="primary" label={filtersActive ? "Hours (filtered)" : "Total hours"}
+             value={`${totalHours.toFixed(1)} hrs`}
+             sub={`Logged across ${filteredEntries.length} session${filteredEntries.length === 1 ? "" : "s"}`} />
         <KPI label="Active projects" value={activeProjectCount}
              sub={activeProjectCount === 1 ? "Distinct project" : "Distinct projects"} />
-        <KPI label="Total entries" value={entries.length}
-             sub={entries.length === 1 ? "Hours row logged" : "Hours rows logged"} />
+        <KPI label={filtersActive ? "Entries (filtered)" : "Total entries"} value={filteredEntries.length}
+             sub={filtersActive ? `of ${entries.length} total` : (entries.length === 1 ? "Hours row logged" : "Hours rows logged")} />
       </div>
 
       {/* ── C. Hours by project ───────────────────────────── */}
@@ -502,8 +611,11 @@ export function SubContractorDetail({ id }: { id: string }) {
         <CardHead title={`Hours by project · ${groups.length}`}
           sub="Click a project to drill into its work orders" />
         {groups.length === 0 ? (
-          <EmptyState icon="clock" title="No hours logged yet"
-            sub="Hours will appear here once they're logged from the WO Crew section." />
+          <EmptyState icon="clock"
+            title={filtersActive ? "No hours match these filters" : "No hours logged yet"}
+            sub={filtersActive
+              ? "Try a different project or widen the date range."
+              : "Hours will appear here once they're logged from the WO Crew section."} />
         ) : (
           <div className="col gap-2">
             {groups.map(g => (
@@ -551,11 +663,14 @@ export function SubContractorDetail({ id }: { id: string }) {
 
       {/* ── D. Work history (full receipts) ───────────────── */}
       <section className="card card-pad">
-        <CardHead title={`Work history · ${entries.length}`}
-          sub="Every hours entry, newest first" />
-        {entries.length === 0 ? (
-          <EmptyState icon="clock" title="No hours logged yet"
-            sub="Hours show up here as soon as the Lead Tech logs them on a WO." />
+        <CardHead title={`Work history · ${filteredEntries.length}`}
+          sub={filtersActive ? "Filtered hours entries, newest first" : "Every hours entry, newest first"} />
+        {filteredEntries.length === 0 ? (
+          <EmptyState icon="clock"
+            title={filtersActive ? "No hours match these filters" : "No hours logged yet"}
+            sub={filtersActive
+              ? "Try a different project or widen the date range."
+              : "Hours show up here as soon as the Lead Tech logs them on a WO."} />
         ) : (
           <>
             <div className="col gap-1">
@@ -644,6 +759,21 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }) 
       <div style={{ wordBreak: "break-word" }}>{children}</div>
     </div>
   );
+}
+
+// Local YYYY-MM-DD stamp (entry_date is a date-only column, so we compare
+// as strings — no timezone math needed).
+function ymdLocal(d: Date): string {
+  const p = (n: number) => (n < 10 ? `0${n}` : String(n));
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+// First→last day of a calendar month. monthsAgo=0 is the current month,
+// 1 is the previous month, etc.
+function monthRange(monthsAgo: number): { from: string; to: string } {
+  const now = new Date();
+  const first = new Date(now.getFullYear(), now.getMonth() - monthsAgo, 1);
+  const last  = new Date(now.getFullYear(), now.getMonth() - monthsAgo + 1, 0);
+  return { from: ymdLocal(first), to: ymdLocal(last) };
 }
 
 // Stable date-only formatter — anchor at noon to dodge timezone

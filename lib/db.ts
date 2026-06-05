@@ -9,11 +9,11 @@
 // ============================================================
 
 import type {
-  AmcContract, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
+  AmcContract, AmcDocument, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
   InventoryItem, Notification, Organization, Project, Quotation, RepairTicket,
   ReplacementRequest, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
-  WorkOrderSubContractorHours, WorkOrderTimeEntry,
+  WorkOrderSubContractorHours, WorkOrderTimeEntry, WoTask,
 } from "./types";
 
 // ── ORGANIZATIONS ──────────────────────────────────────────
@@ -176,8 +176,18 @@ export const WORK_ORDER_SUB_CONTRACTOR_HOURS: Record<string, WorkOrderSubContrac
 // Phase 8 — AMC free calls (table from migration 0009b).
 export const FREE_CALLS: Record<string, FreeCall> = {};
 
+// v1.1.0 — persisted WO checklist tasks (table from migration 0001).
+// Replaces the local-state checklist that was being thrown away on
+// every refresh. Keyed by task id; sort by position within a WO.
+export const WO_TASKS: Record<string, WoTask> = {};
+
 // Phase 11 — quotations (migration 0028).
 export const QUOTATIONS: Record<string, Quotation> = {};
+
+// Migration 0034 — AMC documents (optional uploaded paperwork against
+// each AMC contract). Binaries live in Supabase Storage; rows here are
+// metadata only. Keyed by document id.
+export const AMC_DOCUMENTS: Record<string, AmcDocument> = {};
 
 // ── APPROVALS / FEED / NOTIFICATIONS / RISKS ───────────────
 export const APPROVALS: Record<string, Approval> = {};
@@ -213,7 +223,7 @@ export const db = {
   CUSTOMERS, SITES, PROJECTS, AMCS, AMC_SERVICE_SCHEDULE, REPAIRS, WORK_ORDERS,
   WORK_ORDER_TIME_ENTRIES,
   SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTOR_HOURS,
-  FREE_CALLS, QUOTATIONS,
+  FREE_CALLS, QUOTATIONS, WO_TASKS, AMC_DOCUMENTS,
   APPROVALS, REPLACEMENTS,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
@@ -292,4 +302,17 @@ export const db = {
   quotation: (id: string): Quotation | null => QUOTATIONS[id] ?? null,
   quotationsForCustomer: (cid: string): Quotation[] =>
     Object.values(QUOTATIONS).filter(q => q.customerId === cid),
+
+  // v1.1.0 — WO checklist tasks. Sort by position so the list reads in
+  // the order the lead/manager put items in. Returns [] if nothing exists.
+  tasksForWO: (woId: string): WoTask[] =>
+    Object.values(WO_TASKS)
+      .filter(t => t.workOrderId === woId)
+      .sort((a, b) => a.position - b.position || a.label.localeCompare(b.label)),
+
+  // Migration 0034 — AMC documents for a contract, newest first.
+  docsForAmc: (amcId: string): AmcDocument[] =>
+    Object.values(AMC_DOCUMENTS)
+      .filter(d => d.amcId === amcId)
+      .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
 };

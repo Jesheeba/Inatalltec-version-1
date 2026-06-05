@@ -19,7 +19,10 @@ import {
   resumeAmc,
   startWorkOrder, completeWorkOrder, markWorkOrderDone,
   deleteSubContractorHoursEntry,
+  addWoTask, toggleWoTask, deleteWoTask,
 } from "@/lib/create";
+import { can } from "@/lib/permissions";
+import { getWorkerConflictsFor } from "@/lib/conflicts";
 import { formatDurationMinutes, formatLongDateTime, formatMonthDay, formatRelativeDay, formatTimeOfDay } from "@/lib/dates";
 import { supabaseBrowser } from "@/lib/supabase/client";
 
@@ -675,12 +678,15 @@ export function WoSlideover() {
   const woId = slideover?.kind === "wo" ? slideover.id : null;
   const wo = woId ? db.wo(woId) : null;
   void dataVersion;
-  const [tasks, setTasks] = useState(wo?.tasks || []);
   const [tab, setTab] = useState<"overview" | "tasks" | "materials" | "replacements" | "thread" | "audit">("overview");
   const [historyTick, setHistoryTick] = useState(0);
+  const [newTaskLabel, setNewTaskLabel] = useState("");
+  const [taskBusy, setTaskBusy] = useState(false);
+  const [showAddCrew, setShowAddCrew] = useState(false);
+  const [crewBusy, setCrewBusy] = useState(false);
 
   useEffect(() => {
-    if (wo) { setTasks(wo.tasks || []); setTab("overview"); }
+    if (wo) { setTab("overview"); setNewTaskLabel(""); setShowAddCrew(false); }
   }, [wo?.id]);
 
   if (!wo) return null;
@@ -691,8 +697,21 @@ export function WoSlideover() {
   const custName = cust?.name ?? "-";
   const siteName = site?.name ?? "-";
   const siteArea = site?.area ?? "";
+  // v1.1.0 — read tasks from the persisted mirror, not from wo.tasks.
+  const tasks = db.tasksForWO(wo.id);
   const doneCount = tasks.filter(t => t.done).length;
   const totalTasks = tasks.length;
+  // v1.1.0 — task edit gate widened to every role that touches WOs in
+  // day-to-day flow. Sales / Estimator / Sub-contractor / Super Admin
+  // stay read-only. Mirrored in 0029 RLS so the DB doesn't reject the
+  // INSERT/UPDATE/DELETE from these roles.
+  const TASK_EDIT_ROLES: ReadonlySet<Role> = new Set<Role>([
+    "admin", "md", "manager", "lead_worker", "worker", "driver", "accounts", "service_support",
+  ]);
+  const canEditTasks = TASK_EDIT_ROLES.has(role);
+  // v1.1.0 — Crew reassign: same gate as the create modal. Admin/MD/
+  // manager/lead_worker can add or remove crew on an existing WO.
+  const canEditCrew = can(role, "CREATE_WORK_ORDER");
 
   const typeMap: Record<string, string> = {
     AMC: "badge-primary", PROJECT: "badge-info", REPAIR: "badge-warning",
@@ -745,7 +764,7 @@ export function WoSlideover() {
         </div>
         <div style={{ font: "var(--t-h2)", marginTop: 10 }}>{wo.title}</div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, marginTop: 14 }}>
           <DetailField icon="building" label="Customer" value={custName} onClick={() => followTarget({ kind: "customer", id: wo.customer })} />
           <DetailField icon="mapPin" label="Site" value={siteName} sub={siteArea} />
           <DetailField icon="clock" label="Window"
@@ -789,23 +808,80 @@ export function WoSlideover() {
         <div className="col gap-4">
           <TimeTrackingPanel wo={wo} />
           <section className="card card-pad">
-            <CardHead title="Crew" />
+            <CardHead title="Crew"
+              right={canEditCrew ? (
+                <button className="btn btn-ghost btn-sm"
+                  onClick={() => setShowAddCrew(v => !v)}
+                  disabled={crewBusy}>
+                  <Icon name={showAddCrew ? "x" : "plus"} size={13} />
+                  {showAddCrew ? " Cancel" : " Add worker"}
+                </button>
+              ) : undefined} />
             <div className="col gap-2">
               {(wo.assigned || []).map(uid => {
                 const u = db.user(uid);
+                const isLead = uid === wo.assignedLead;
                 return (
                   <div key={uid} className="row gap-3" style={{ padding: "8px 10px", borderRadius: "var(--r-md)" }}>
                     <span className={"avatar avatar-" + (u.tint || "primary")}>{u.initials}</span>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ font: "var(--t-body-md)" }}>{u.name}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="truncate" style={{ font: "var(--t-body-md)" }}>{u.name}</div>
                       <div style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{ROLE_LABELS[u.role]}</div>
                     </div>
-                    {uid === wo.assignedLead && <span className="badge badge-primary">Lead</span>}
-                    <button className="btn btn-ghost btn-icon btn-sm"><Icon name="phone" size={14} /></button>
-                    <button className="btn btn-ghost btn-icon btn-sm"><Icon name="messageCircle" size={14} /></button>
+                    {isLead && <span className="badge badge-primary">Lead</span>}
+                    {canEditCrew && !isLead && (
+                      <button className="btn btn-ghost btn-icon btn-sm"
+                        title="Remove from crew"
+                        disabled={crewBusy}
+                        onClick={async () => {
+                          setCrewBusy(true);
+                          const prev = wo.assigned ?? [];
+                          const next = prev.filter(x => x !== uid);
+                          // Optimistic mirror update so the row disappears
+                          // immediately; revert if updateWorkOrder fails.
+                          db.WORK_ORDERS[wo.id] = { ...wo, assigned: next };
+                          bumpData();
+                          const r = await updateWorkOrder(wo.id, { assigned: next });
+                          if (!r.ok) {
+                            db.WORK_ORDERS[wo.id] = { ...wo, assigned: prev };
+                            bumpData();
+                            fireToast(`Couldn't remove ${u.name}: ${r.error}`);
+                          } else {
+                            fireToast(`${u.name} removed from crew`);
+                          }
+                          setCrewBusy(false);
+                        }}>
+                        <Icon name="x" size={14} />
+                      </button>
+                    )}
                   </div>
                 );
               })}
+              {showAddCrew && canEditCrew && (
+                <CrewPicker
+                  wo={wo}
+                  busy={crewBusy}
+                  onAdd={async (uid) => {
+                    setCrewBusy(true);
+                    const u = db.user(uid);
+                    const prev = wo.assigned ?? [];
+                    if (prev.includes(uid)) { setCrewBusy(false); setShowAddCrew(false); return; }
+                    const next = [...prev, uid];
+                    db.WORK_ORDERS[wo.id] = { ...wo, assigned: next };
+                    bumpData();
+                    const r = await updateWorkOrder(wo.id, { assigned: next });
+                    if (!r.ok) {
+                      db.WORK_ORDERS[wo.id] = { ...wo, assigned: prev };
+                      bumpData();
+                      fireToast(`Couldn't add ${u.name}: ${r.error}`);
+                    } else {
+                      fireToast(`${u.name} added to crew`);
+                      setShowAddCrew(false);
+                    }
+                    setCrewBusy(false);
+                  }}
+                />
+              )}
               <SubContractorRows wo={wo} />
             </div>
           </section>
@@ -841,39 +917,88 @@ export function WoSlideover() {
       {tab === "tasks" && (
         <section className="card card-pad">
           <CardHead title="Service checklist" sub={`${doneCount} of ${totalTasks} complete`} />
+          {totalTasks > 0 && (
+            <div className="progress progress-success" style={{ marginBottom: 16 }}>
+              <div style={{ width: (doneCount / totalTasks) * 100 + "%" }} />
+            </div>
+          )}
           {totalTasks === 0 ? (
-            <EmptyState icon="list" title="No tasks defined" sub="Tasks will appear here once the WO is opened by the technician on site." />
+            <EmptyState icon="list" title="No tasks defined"
+              sub={canEditTasks
+                ? "Add the first checklist item below — it'll save and sync to anyone else viewing this WO."
+                : "Tasks will appear here once the lead or manager adds them."} />
           ) : (
-            <>
-              <div className="progress progress-success" style={{ marginBottom: 16 }}>
-                <div style={{ width: (doneCount / totalTasks) * 100 + "%" }} />
-              </div>
-              <div className="col gap-2">
-                {tasks.map(t => (
-                  <div key={t.id} className="row gap-3"
-                    onClick={() => setTasks(tasks.map(x => x.id === t.id ? { ...x, done: !x.done } : x))}
+            <div className="col gap-2">
+              {tasks.map(t => (
+                <div key={t.id} className="row gap-3"
+                  style={{
+                    padding: "12px 14px", borderRadius: "var(--r-md)",
+                    background: t.done ? "var(--bg-muted)" : "var(--bg-elev)",
+                    border: "1px solid var(--border)",
+                    opacity: t.done ? 0.7 : 1,
+                  }}>
+                  <div
+                    onClick={async () => {
+                      if (!canEditTasks) return;
+                      const nextDone = !t.done;
+                      bumpData();
+                      const r = await toggleWoTask(t.id, nextDone);
+                      if (!r.ok) {
+                        fireToast(`Couldn't update task: ${r.error}`);
+                      }
+                      bumpData();
+                    }}
                     style={{
-                      padding: "12px 14px", borderRadius: "var(--r-md)",
-                      background: t.done ? "var(--bg-muted)" : "var(--bg-elev)",
-                      border: "1px solid var(--border)",
-                      cursor: "pointer",
-                      opacity: t.done ? 0.7 : 1,
-                    }}>
-                    <div style={{
                       width: 22, height: 22, borderRadius: "50%",
                       background: t.done ? "var(--pri-500)" : "transparent",
                       border: t.done ? "none" : "1.5px solid var(--border-strong)",
                       display: "flex", alignItems: "center", justifyContent: "center",
                       color: "#fff", flexShrink: 0,
+                      cursor: canEditTasks ? "pointer" : "default",
                     }}>
-                      {t.done && <Icon name="check" size={14} strokeWidth={2.5} />}
-                    </div>
-                    <span style={{ flex: 1, font: "var(--t-body-md)", textDecoration: t.done ? "line-through" : "none" }}>{t.label}</span>
-                    {t.count && <span className="badge">{t.count}</span>}
+                    {t.done && <Icon name="check" size={14} strokeWidth={2.5} />}
                   </div>
-                ))}
-              </div>
-            </>
+                  <span style={{ flex: 1, font: "var(--t-body-md)", textDecoration: t.done ? "line-through" : "none" }}>{t.label}</span>
+                  {t.count && <span className="badge">{t.count}</span>}
+                  {canEditTasks && (
+                    <button className="btn btn-ghost btn-icon btn-sm"
+                      title="Delete task"
+                      onClick={async () => {
+                        const r = await deleteWoTask(t.id);
+                        if (!r.ok) { fireToast(`Couldn't delete: ${r.error}`); return; }
+                        bumpData();
+                      }}>
+                      <Icon name="x" size={14} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {canEditTasks && (
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const label = newTaskLabel.trim();
+                if (!label || taskBusy) return;
+                setTaskBusy(true);
+                const r = await addWoTask(wo.id, label);
+                setTaskBusy(false);
+                if (!r.ok) { fireToast(`Couldn't add task: ${r.error}`); return; }
+                setNewTaskLabel("");
+                bumpData();
+              }}
+              className="row gap-2"
+              style={{ marginTop: 16, alignItems: "center" }}>
+              <input className="input" placeholder="Add a checklist item…"
+                value={newTaskLabel}
+                onChange={e => setNewTaskLabel(e.target.value)}
+                style={{ flex: 1 }} />
+              <button className="btn btn-primary btn-sm" type="submit"
+                disabled={taskBusy || !newTaskLabel.trim()}>
+                <Icon name="plus" size={13} /> {taskBusy ? "Adding…" : "Add"}
+              </button>
+            </form>
           )}
         </section>
       )}
@@ -926,6 +1051,97 @@ export function WoSlideover() {
         <WoStatusHistory woId={wo.id} reloadKey={historyTick + dataVersion} />
       )}
     </SlideOver>
+  );
+}
+
+/* ─── Crew picker (v1.1.0) ───────────────────────────────
+   Inline list of unassigned workers + drivers shown in the
+   Overview tab when the lead/manager clicks "+ Add worker".
+   Conflicted techs (those with an overlapping active WO at
+   this WO's time window) are greyed + disabled — same shape
+   as the Phase A picker in the create modal.
+============================================================ */
+function CrewPicker({ wo, busy, onAdd }: {
+  wo: WorkOrder;
+  busy: boolean;
+  onAdd: (uid: string) => void;
+}) {
+  const candidates = useMemo(() => {
+    const taken = new Set(wo.assigned ?? []);
+    return Object.values(db.USERS)
+      .filter(u => (u.role === "worker" || u.role === "driver"))
+      .filter(u => !taken.has(u.id))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [wo.assigned]);
+
+  const conflicts = useMemo(() => {
+    const map: Record<string, ReturnType<typeof getWorkerConflictsFor>> = {};
+    if (!wo.scheduledStart || !wo.scheduledEnd) return map;
+    for (const u of candidates) {
+      map[u.id] = getWorkerConflictsFor(u.id, wo.scheduledStart, wo.scheduledEnd, wo.id);
+    }
+    return map;
+  }, [candidates, wo.scheduledStart, wo.scheduledEnd, wo.id]);
+
+  if (candidates.length === 0) {
+    return (
+      <div style={{
+        padding: 12, borderRadius: "var(--r-md)",
+        background: "var(--bg-muted)", border: "1px dashed var(--border)",
+        font: "var(--t-small)", color: "var(--ink-mute)",
+      }}>
+        Every technician and driver is already on this crew.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      maxHeight: 220, overflowY: "auto",
+      border: "1px solid var(--border)", borderRadius: "var(--r-md)",
+      padding: 6, background: "var(--bg-elev)",
+    }}>
+      {candidates.map(u => {
+        const cs = conflicts[u.id] ?? [];
+        const hasConflict = cs.length > 0;
+        const first = cs[0];
+        const busySub = first
+          ? `Busy: ${first.code} ${first.scheduledStart.slice(11, 16)}-${first.scheduledEnd.slice(11, 16)}${cs.length > 1 ? ` +${cs.length - 1} more` : ""}`
+          : "";
+        const disabled = hasConflict || busy;
+        return (
+          <button key={u.id} type="button"
+            disabled={disabled}
+            onClick={() => onAdd(u.id)}
+            title={hasConflict ? `Time conflict: ${cs.map(c => c.code).join(", ")}` : undefined}
+            style={{
+              all: "unset", display: "flex", alignItems: "center", gap: 10,
+              padding: "8px 10px", borderRadius: "var(--r-sm)",
+              width: "100%", boxSizing: "border-box",
+              cursor: disabled ? "not-allowed" : "pointer",
+              opacity: disabled ? 0.55 : 1,
+              minHeight: 44,
+            }}>
+            <span className={"avatar avatar-sm avatar-" + (u.tint || "primary")}>{u.initials}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="truncate" style={{
+                font: "var(--t-body-md)",
+                textDecoration: hasConflict ? "line-through" : undefined,
+              }}>{u.name}</div>
+              <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                {ROLE_LABELS[u.role]}
+              </div>
+              {hasConflict && (
+                <div className="truncate" style={{
+                  font: "var(--t-micro)", color: "var(--warn-700)", marginTop: 2,
+                }}>{busySub}</div>
+              )}
+            </div>
+            {hasConflict && <Icon name="alertTriangle" size={14} style={{ color: "var(--warn-700)" }} />}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

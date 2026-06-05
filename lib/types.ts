@@ -226,8 +226,27 @@ export interface AmcContract {
   suspendedReason: string | null;   // free-text reason (existing column)
   pausedBy: string | null;          // users.id of who paused (auto sweep → null)
   resumedAt: string | null;         // ISO timestamptz of most recent resume
-  firstPaymentDueAt: string | null; // signed_at + payment_grace_days, ISO
+  firstPaymentDueAt: string | null; // first_visit_date + payment_grace_days, ISO (was signed_at + grace pre-0033)
   renewedFromId: string | null;     // previous AMC this one renews (chain)
+  // OM-selected anchor for service 1 and the 30-day payment grace
+  // window. NULL until "Book first visit date" is clicked. Once set,
+  // service 1 lands on the calendar and first_payment_due_at is
+  // populated by a BEFORE UPDATE trigger. Migration 0033.
+  firstVisitDate: string | null;    // YYYY-MM-DD date
+}
+
+// AMC document — uploaded paperwork against an AMC contract.
+// Migration 0034. Binaries live in Supabase Storage bucket
+// 'amc-documents'; this row holds the metadata + path pointer.
+export interface AmcDocument {
+  id: string;
+  amcId: string;
+  fileName: string;
+  filePath: string;          // path inside the amc-documents bucket
+  fileSizeBytes: number | null;
+  mimeType: string | null;
+  uploadedBy: string | null; // users.id
+  uploadedAt: string;        // ISO timestamptz
 }
 
 export interface RepairTicket {
@@ -265,8 +284,10 @@ export type WoStatus =
 
 export interface WoTask {
   id: string;
+  workOrderId: string;
   label: string;
   done: boolean;
+  position: number;
   count?: string;
 }
 
@@ -402,6 +423,14 @@ export interface Quotation {
   createdBy: string | null;
   createdAt: string;
   updatedAt: string;
+  // Migration 0035 — quotation template fields.
+  // projectId   = the project this quotation was auto-generated FOR
+  //               (distinct from convertedToProjectId — see migration).
+  // description = scope of work, multi-line text, edited by Sales.
+  // terms       = commercial / payment terms, multi-line.
+  projectId: string | null;
+  description: string | null;
+  terms: string | null;
 }
 
 // ============================================================

@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
 import { LoadingSplash } from "@/components/shared/LoadingSplash";
 import { supabaseServer, supabaseAdmin } from "@/lib/supabase/server";
-import { hydrateAll } from "@/lib/hydrate";
+import { hydrateAll, fetchNotifications } from "@/lib/hydrate";
 import type { Role, Tint, User } from "@/lib/types";
 
 // TEMPORARY (until the `role` enum gains 'super_admin' via DDL):
@@ -137,9 +137,15 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   // db.CUSTOMERS / db.AMCS / etc. are populated from real rows on every
   // page load, so creates persist visibly across refreshes.
 
+  // The signed-in user's notifications — scoped by their public.users.id
+  // (only known after the Promise.all resolves), so this is a single extra
+  // read. Failures are swallowed inside fetchNotifications (returns []).
+  const initialNotifications = await fetchNotifications(admin, currentUser.id);
+
   return (
     <>
-      <AppShell currentUser={currentUser} initialUsers={initialUsers} initialBundle={bundle}>
+      <AppShell currentUser={currentUser} initialUsers={initialUsers}
+        initialBundle={bundle} initialNotifications={initialNotifications}>
         {children}
       </AppShell>
       <LoadingSplash />

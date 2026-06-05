@@ -36,7 +36,7 @@ import { can, type PermissionAction } from "@/lib/permissions";
 import { createNote, updateNote } from "@/lib/notes";
 import { currencySymbol } from "@/lib/format";
 import {
-  formatConflictLabel, getWorkerConflictsFor,
+  formatConflictLabel, getWorkerConflictsFor, getSubContractorConflictsFor,
   type WorkerConflict,
 } from "@/lib/conflicts";
 
@@ -1412,15 +1412,23 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
     source_kind: initialSourceKind, source_id: initialSourceId,
   });
   const customers = Object.values(db.CUSTOMERS);
-  // Spec: lead is a lead_worker. Additional workers can be worker /
-  // lead_worker / driver. super_admin is filtered by the explicit role list.
+  // Deliveries are driver-led, not lead-tech-led. The top picker becomes
+  // a single-driver chooser; "additional workers" becomes optional helpers.
+  const isDelivery = fixedType === "DELIVERY";
+  // Spec: for normal WOs the top picker is a lead_worker. For deliveries
+  // it's a driver — the person who actually drives the van. Additional
+  // workers below are technicians + drivers (helpers / ride-alongs).
+  // super_admin is filtered by the explicit role list.
   const leadOptions = useMemo(() =>
-    Object.values(db.USERS).filter(u => u.role === "lead_worker"),
-    []);
+    Object.values(db.USERS).filter(u =>
+      isDelivery ? u.role === "driver" : u.role === "lead_worker"
+    ),
+    [isDelivery]);
   const workerOptions = useMemo(() =>
     Object.values(db.USERS).filter(u =>
-      u.role === "worker" || u.role === "lead_worker" || u.role === "driver"
-    ).filter(u => u.id !== f.assigned_lead),
+      (u.role === "worker" || u.role === "driver")
+      && u.id !== f.assigned_lead
+    ),
     [f.assigned_lead]);
   // Active sub-contractor profiles (migration 0023). Inactive ones are
   // hidden from the picker but existing WO assignments stay visible
@@ -1459,6 +1467,22 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
   const totalWorkerConflictCount = f.additional_workers
     .reduce((sum, id) => sum + (workerConflicts[id]?.length ?? 0), 0);
 
+  // Sub-contractor availability — same shape as workerConflicts, reads
+  // from work_order_sub_contractors (migration 0023) via the
+  // getSubContractorConflictsFor helper. Powers the greyed-out state
+  // on the sub picker so the Lead Tech doesn't double-book externals.
+  const subConflicts = useMemo(() => {
+    const map: Record<string, WorkerConflict[]> = {};
+    if (!f.scheduled_start || !f.scheduled_end) return map;
+    for (const s of subOptions) {
+      map[s.id] = getSubContractorConflictsFor(s.id, f.scheduled_start, f.scheduled_end);
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [f.scheduled_start, f.scheduled_end, subOptions]);
+  const totalSubConflictCount = f.additional_subs
+    .reduce((sum, id) => sum + (subConflicts[id]?.length ?? 0), 0);
+
   // Re-validate worker selections after the user changes the time window.
   // We only toast (don't auto-deselect) so the user keeps control. Skip
   // the very first mount so prefilled forms don't toast immediately. Lead
@@ -1473,6 +1497,11 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
         offenders.push(db.user(id)?.name ?? "Worker");
       }
     }
+    for (const id of f.additional_subs) {
+      if ((subConflicts[id]?.length ?? 0) > 0) {
+        offenders.push(db.subContractor(id)?.name ?? "Sub-contractor");
+      }
+    }
     if (offenders.length > 0) {
       const names = offenders.slice(0, 3).join(", ")
         + (offenders.length > 3 ? ` +${offenders.length - 3} more` : "");
@@ -1483,7 +1512,12 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault(); setErr(null);
-    if (!f.assigned_lead) { setErr("Assigned lead is required — pick a Lead Technician."); return; }
+    if (!f.assigned_lead) {
+      setErr(isDelivery
+        ? "Driver is required — pick the user who will handle the delivery."
+        : "Assigned lead is required — pick a Lead Technician.");
+      return;
+    }
     setBusy(true);
     const res = await createWorkOrder({
       title: f.title, type: f.type, customer_id: f.customer_id, site_id: f.site_id || undefined,
@@ -1609,14 +1643,19 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
       </Section>
 
       <Section title="Assignment & link">
-        <Field label="Assigned lead" required hint="Lead Technician who owns this work order">
+        <Field
+          label={isDelivery ? "Driver" : "Assigned lead"}
+          required
+          hint={isDelivery
+            ? "Driver who will handle the delivery"
+            : "Lead Technician who owns this work order"}>
           <Select required value={f.assigned_lead}
             onChange={v => setF({ ...f, assigned_lead: v })}
-            placeholder="- Select Lead Technician -"
+            placeholder={isDelivery ? "- Select Driver -" : "- Select Lead Technician -"}
             options={leadOptions.map(u => ({ value: u.id, label: `${u.name} · ${ROLE_LABELS[u.role]}` }))} />
           {f.assigned_lead && (
             <ConflictWarning
-              workerName={db.user(f.assigned_lead)?.name ?? "This lead"}
+              workerName={db.user(f.assigned_lead)?.name ?? (isDelivery ? "This driver" : "This lead")}
               conflicts={leadConflicts} />
           )}
         </Field>
@@ -1694,7 +1733,7 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
         </Field>
         <Field label="Sub-contractors"
           hint={f.additional_subs.length > 0
-            ? `${f.additional_subs.length} selected`
+            ? `${f.additional_subs.length} selected${totalSubConflictCount > 0 ? ` · ${totalSubConflictCount} conflict${totalSubConflictCount === 1 ? "" : "s"}` : ""}`
             : "Optional — external contractors from the sub-contractor directory"}>
           {subOptions.length === 0 ? (
             <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: 8 }}>
@@ -1708,17 +1747,31 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             }}>
               {subOptions.map(s => {
                 const checked = f.additional_subs.includes(s.id);
+                const conflicts = subConflicts[s.id] ?? [];
+                const hasConflict = conflicts.length > 0;
+                const blockSelect = hasConflict && !checked;
+                const first = conflicts[0];
+                const busySub = first
+                  ? `Busy: ${first.code} ${first.scheduledStart.slice(11, 16)}-${first.scheduledEnd.slice(11, 16)}${conflicts.length > 1 ? ` +${conflicts.length - 1} more` : ""}`
+                  : "";
                 return (
                   <label key={s.id}
+                    title={hasConflict
+                      ? `Time conflict: ${conflicts.map(c => c.code).join(", ")}`
+                      : undefined}
                     style={{
                       display: "flex", alignItems: "center", gap: 10,
                       padding: "8px 10px", borderRadius: "var(--r-sm)",
-                      cursor: "pointer", minHeight: 44,
+                      cursor: blockSelect ? "not-allowed" : "pointer",
+                      minHeight: 44,
                       background: checked ? "var(--pri-50)" : "transparent",
+                      opacity: blockSelect ? 0.55 : 1,
                     }}>
                     <input type="checkbox" checked={checked}
+                      disabled={blockSelect}
                       onChange={() => toggleSub(s.id)}
-                      style={{ width: 18, height: 18, flexShrink: 0, cursor: "pointer" }} />
+                      style={{ width: 18, height: 18, flexShrink: 0,
+                               cursor: blockSelect ? "not-allowed" : "pointer" }} />
                     <span style={{
                       width: 28, height: 28, borderRadius: 999, flexShrink: 0,
                       background: "var(--bg-muted)", display: "flex",
@@ -1728,13 +1781,24 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
                       <Icon name="user" size={14} />
                     </span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="truncate" style={{ font: "var(--t-body-md)" }}>
+                      <div className="truncate" style={{
+                        font: "var(--t-body-md)",
+                        textDecoration: blockSelect ? "line-through" : undefined,
+                      }}>
                         {s.name}
                       </div>
                       <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
                         {s.company ?? "Independent"}
                       </div>
+                      {hasConflict && (
+                        <div className="truncate" style={{
+                          font: "var(--t-micro)", color: "var(--warn-700)", marginTop: 2,
+                        }}>{busySub}</div>
+                      )}
                     </div>
+                    {hasConflict && (
+                      <Icon name="alertTriangle" size={14} style={{ color: "var(--warn-700)" }} />
+                    )}
                     <span className="badge badge-outline" style={{ font: "var(--t-micro)" }}>
                       Sub
                     </span>

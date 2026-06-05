@@ -913,13 +913,56 @@ function ManagerDashboard() {
 }
 
 /* ─── Field worker dashboard ────────────────────────────── */
+const LONG_WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function sumScheduledMinutes(wos: WorkOrder[]): number {
+  let total = 0;
+  for (const w of wos) {
+    if (!w.scheduledStart || !w.scheduledEnd) continue;
+    const s = new Date(w.scheduledStart).getTime();
+    const e = new Date(w.scheduledEnd).getTime();
+    if (Number.isNaN(s) || Number.isNaN(e) || e <= s) continue;
+    total += (e - s) / 60_000;
+  }
+  return total;
+}
+
+function formatHm(minutes: number): string {
+  if (minutes <= 0) return "0h";
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes - h * 60);
+  if (m === 0) return `${h}h`;
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+
 function FieldDashboard() {
   const { me, role, openWO, openReplacement, fireToast, bumpData, dataVersion } = useApp();
   void dataVersion;
+  // Live date scoping — the eyebrow, today's WOs, this-week WOs and
+  // hour estimates all key off the wall clock instead of a hard-coded
+  // demo date. Computed once per render; the rest of the component
+  // re-runs whenever dataVersion bumps so mirrors stay fresh.
+  const now = new Date();
+  const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const weekStartIso = (() => {
+    const d = new Date(now);
+    const day = d.getDay(); // 0=Sun … 6=Sat
+    const diff = day === 0 ? -6 : 1 - day; // back to Monday
+    d.setDate(d.getDate() + diff);
+    d.setHours(0, 0, 0, 0);
+    return d.toISOString();
+  })();
+  const eyebrowText = `${LONG_WEEKDAYS[now.getDay()]} · ${fmtMonthDay(now)}`;
+
   const myWOs = Object.values(db.WORK_ORDERS).filter(w =>
-    w.assigned && w.assigned.includes(me.id) && w.scheduledStart.startsWith("2025-05-16"));
+    w.assigned && w.assigned.includes(me.id) && w.scheduledStart.startsWith(todayKey));
   const upcoming = Object.values(db.WORK_ORDERS).filter(w =>
-    w.assigned && w.assigned.includes(me.id) && w.scheduledStart > "2025-05-16");
+    w.assigned && w.assigned.includes(me.id) && w.scheduledStart > todayKey);
+  const myWeekWOs = Object.values(db.WORK_ORDERS).filter(w =>
+    w.assigned && w.assigned.includes(me.id) && w.scheduledStart >= weekStartIso);
+  const todayHoursLabel = formatHm(sumScheduledMinutes(myWOs));
+  const weekHoursLabel = formatHm(sumScheduledMinutes(myWeekWOs));
   // Migration 0014: "live" now means actively in-progress (we surface
   // waiting_material separately if we ever want a pause indicator).
   const live = myWOs.find(w => w.status === "in_progress");
@@ -941,10 +984,11 @@ function FieldDashboard() {
   return (
     <div className="main-pad">
       <PageHeader
-        eyebrow={"Thursday · 16 May"}
+        eyebrow={eyebrowText}
         title={"My day, " + me.name.split(" ")[0]}
-        sub={`${myWOs.length} work orders · est. 7h 30m on site`}
-        right={<SignOutButton />}
+        sub={myWOs.length === 0
+          ? "No work orders scheduled for today"
+          : `${myWOs.length} work order${myWOs.length === 1 ? "" : "s"} · est. ${todayHoursLabel} on site`}
       />
 
       <CriticalAlertsWidget />
@@ -963,7 +1007,7 @@ function FieldDashboard() {
               ? live.scheduledStart.split("T")[1].slice(0, 5) + " – " + live.scheduledEnd.split("T")[1].slice(0, 5)
               : "-"}
           </div>
-          <div className="row gap-2" style={{ marginTop: 14 }}>
+          <div className="row gap-2" style={{ marginTop: 14, flexWrap: "wrap" }}>
             <button className="btn btn-primary" onClick={() => openWO(live.id)}>Continue work <Icon name="arrowRight" size={14} /></button>
             <button className="btn btn-ghost" onClick={startNavigation} disabled={!liveSite}>
               <Icon name="navigation" size={14} /> Navigate
@@ -973,8 +1017,8 @@ function FieldDashboard() {
       )}
 
       <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", marginBottom: 24 }}>
-        <KPI label="Today" value={myWOs.length} sub="work orders" />
-        <KPI label="This week" value="12" sub="est. 38h" />
+        <KPI label="Today" value={myWOs.length} sub={`est. ${todayHoursLabel}`} />
+        <KPI label="This week" value={myWeekWOs.length} sub={`est. ${weekHoursLabel}`} />
         <KPI label="Pending leave" value="0" sub="all clear" />
       </div>
 

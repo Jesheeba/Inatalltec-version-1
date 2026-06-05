@@ -1179,6 +1179,11 @@ hr.divider {
   .topbar-cmd { display: none; }
   .topbar-bread { display: none; }
   .page-head { flex-direction: column; align-items: stretch; }
+  /* Keep page-header action buttons at their natural width on mobile.
+     Without this override the global align-items:stretch above makes
+     a single button (e.g. "+ Add member" on /team) span the full row,
+     which reads as an oversized cluttered hero block on small phones. */
+  .page-head > :last-child { align-self: flex-start; }
   .hide-mobile { display: none !important; }
   .show-mobile { display: initial !important; }
   .slideover { width: 100vw; }
@@ -1251,6 +1256,84 @@ hr.divider {
   /* Picker rows - bigger tap targets */
   .modal > div > div[onClick],
   .modal-lg > div > div[onClick] { min-height: 56px; }
+
+  /* ── Touch targets — bump controls to a comfortable finger size
+     (iOS HIG ≈ 44px). Desktop sizing is untouched; this only applies
+     at phone width. ─────────────────────────────────────────────── */
+  .btn            { height: 44px; }
+  .btn-lg         { height: 50px; }
+  .btn-sm         { height: 40px; padding: 0 14px; }
+  .btn-icon       { width: 44px; }
+  .btn-icon.btn-sm { width: 40px; }
+
+  /* ── Segmented controls / tab bars — scroll sideways instead of
+     cramming many tabs into one cramped row (e.g. the WO detail tabs:
+     Overview · Tasks · Materials · Replacements · Thread · Audit). ── */
+  .seg {
+    display: flex;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .seg::-webkit-scrollbar { display: none; }
+  .seg button       { height: 40px; flex: 0 0 auto; white-space: nowrap; }
+  .seg-block button { flex: 1 0 auto; }
+
+  /* ── Two-column inline grids collapse to one column. Opt-in via the
+     .grid-collapse helper so we don't disturb intentional layouts. ── */
+  .grid-collapse { grid-template-columns: 1fr !important; }
+
+  /* ── Aggressive responsive shim for inline-styled grids ──
+     Many detail pages (AMC, Project, Customer, Replacement, Dashboard
+     widgets) use inline `style={{ gridTemplateColumns: ... }}` with
+     fixed 2-track ratios or 280px+ minmax floors. Inline styles win
+     against ordinary class rules so we can't override them with
+     `.main-pad div`. Attribute selectors that pattern-match the inline
+     style string get us there: any element whose inline style contains
+     one of these signatures collapses to a single column on phones.
+
+     Calendars (GrowthPlan uses `repeat(7, 1fr)` and `60px repeat(7, 1fr)`)
+     are NOT matched, so they keep their week layout intact. KPI grids
+     use `minmax(180px, 1fr)` / `minmax(200px, 1fr)` and are handled by
+     the separate `div:has(> .kpi)` rule in the 520px media block. */
+  [style*="minmax(0, 1.4fr)"],
+  [style*="minmax(0, 1.6fr)"],
+  [style*="minmax(0, 1fr) minmax(0, 1fr)"],
+  [style*="minmax(280px, 1fr)"],
+  [style*="minmax(300px, 1fr)"],
+  [style*="minmax(320px, 1fr)"],
+  [style*="minmax(360px, 1fr)"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Prevent inline `minWidth: 220+` filter chips or fixed-width cards
+     from forcing the whole viewport to scroll horizontally. The
+     content past the edge is still scrollable inside its own
+     overflow-x containers (tables, etc.). */
+  .main-pad { overflow-x: hidden; }
+
+  /* Modals on phones: leave room around the dialog so the close button
+     and corners are always reachable. The existing rule turns the
+     modal into a bottom sheet (align-items: flex-end + padding: 0) —
+     this just shrinks the maximum content height so users can still
+     swipe the backdrop. */
+  .modal { max-height: 88vh; border-radius: var(--r-xl) var(--r-xl) 0 0; }
+}
+
+/* ── Small phones: KPI / stat cards sit two-up instead of one giant
+   card per row. The grids that hold them use inline
+   `repeat(auto-fit, minmax(180px, 1fr))`, which collapses to a single
+   tall column under ~210px of usable width — visually it reads as
+   "broken / not loaded". This is pure layout: it targets any grid whose
+   direct children are `.kpi` cards, with no markup or desktop change. ─ */
+@media (max-width: 520px) {
+  div:has(> .kpi) {
+    grid-template-columns: 1fr 1fr !important;
+    gap: 10px !important;
+  }
+  .kpi        { padding: 13px; }
+  .kpi-value  { font: 600 21px/1.05 var(--font-display); }
 }
 
 /* ============================================================

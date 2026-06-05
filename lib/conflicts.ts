@@ -94,6 +94,48 @@ export function hasWorkerConflict(
 }
 
 /**
+ * Sub-contractor variant: every active WO that overlaps [windowStart, windowEnd]
+ * for the given sub-contractor. Reads the WORK_ORDER_SUB_CONTRACTORS join
+ * mirror (migration 0023) instead of WO.assignedLead / assigned[]. Same
+ * overlap rules, same terminal-status filter as the worker variant — so the
+ * UI can treat the returned shape interchangeably.
+ */
+export function getSubContractorConflictsFor(
+  subId:        string,
+  windowStart:  string,
+  windowEnd:    string,
+  excludeWoId?: string,
+): WorkerConflict[] {
+  if (!subId || !windowStart || !windowEnd) return [];
+  const start = new Date(windowStart).getTime();
+  const end   = new Date(windowEnd).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return [];
+
+  const out: WorkerConflict[] = [];
+  for (const j of db.woAssignmentsForSub(subId)) {
+    if (excludeWoId && j.workOrderId === excludeWoId) continue;
+    const w = db.WORK_ORDERS[j.workOrderId];
+    if (!w) continue;
+    if (w.status === "cancelled" || w.status === "done" || w.status === "closed") continue;
+    const wStart = new Date(w.scheduledStart).getTime();
+    const wEnd   = new Date(w.scheduledEnd).getTime();
+    if (Number.isNaN(wStart) || Number.isNaN(wEnd)) continue;
+    if (wStart < end && wEnd > start) {
+      out.push({
+        workOrderId:    w.id,
+        code:           w.code,
+        title:          w.title,
+        scheduledStart: w.scheduledStart,
+        scheduledEnd:   w.scheduledEnd,
+        isLead:         false,
+      });
+    }
+  }
+  out.sort((a, b) => a.scheduledStart.localeCompare(b.scheduledStart));
+  return out;
+}
+
+/**
  * Format a conflict for inline display: "WO-1234 · 11:00–13:00 on May 21".
  * Keeps the formatting consistent between the create-form warning and
  * the dashboard badge so users learn one shape.

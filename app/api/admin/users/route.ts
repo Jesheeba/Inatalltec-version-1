@@ -54,8 +54,20 @@ export async function POST(req: Request) {
     caller?.role === "super_admin" ||
     SUPER_ADMIN_EMAILS.has(callerEmail);
 
-  if (!isPrivileged) {
-    return NextResponse.json({ ok: false, error: "Forbidden - admin role required" }, { status: 403 });
+  // Team leads (Operations Manager / MD / Lead Technician) onboard the field
+  // crew and subcontractors they assign to work orders. They may create ONLY
+  // field-execution roles — never office/admin staff (that stays admin-only via
+  // the isPrivileged path). Mirrors CREATE_TEAM_MEMBER in lib/permissions.ts.
+  const FIELD_ROLES = new Set(["lead_worker", "worker", "driver", "subcontractor"]);
+  const TEAM_LEAD_ROLES = new Set(["md", "manager", "lead_worker"]);
+  const isTeamLead = TEAM_LEAD_ROLES.has(caller?.role ?? "");
+  const mayCreate = isPrivileged || (isTeamLead && FIELD_ROLES.has(body.role));
+
+  if (!mayCreate) {
+    return NextResponse.json(
+      { ok: false, error: "Forbidden - you can only add field crew or subcontractors." },
+      { status: 403 },
+    );
   }
 
   // ── Input validation ─────────────────────────────────────
@@ -78,6 +90,15 @@ export async function POST(req: Request) {
   const list = await admin.auth.admin.listUsers({ page: 1, perPage: 200 });
   const existing = list.data?.users.find(u => u.email?.toLowerCase() === email);
   if (existing) {
+    // Reusing an existing account resets its password and (via the email upsert
+    // below) can rewrite its role. That's an admin-only operation — a team lead
+    // must not be able to hijack an existing account by re-entering its email.
+    if (!isPrivileged) {
+      return NextResponse.json(
+        { ok: false, error: "A user with this email already exists - ask an admin to manage it." },
+        { status: 409 },
+      );
+    }
     authId = existing.id;
     // Reset password to the standard so the credentials we return work.
     await admin.auth.admin.updateUserById(authId, { password, email_confirm: true });
