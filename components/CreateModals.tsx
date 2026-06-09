@@ -11,7 +11,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "./Icon";
-import { Modal } from "./shared";
+import { Modal, FreeCallsModePicker, type FreeCallsModeValue } from "./shared";
 import { useApp, type CreateKind } from "@/lib/app-context";
 import { db, ROLE_LABELS } from "@/lib/db";
 import type { IconName, Role } from "@/lib/types";
@@ -23,6 +23,7 @@ import {
   JOB_CATEGORIES, JOB_CATEGORY_LABEL,
   UAE_EMIRATES,
   createReplacementRequest, REPLACEMENT_CONTEXT_LABEL,
+  createMaterialRequest, MATERIAL_REQUEST_URGENCY_LABEL,
   createSubContractor, assignSubContractorToWO,
   logSubContractorHours, editSubContractorHoursEntry,
   createFreeCall, createQuotation, linkFreeCallToWorkOrder,
@@ -30,7 +31,7 @@ import {
   type JobCategory, type ContractMeta,
 } from "@/lib/create";
 import { formatMonthDay } from "@/lib/dates";
-import type { ProjectPhase, ReplacementContext } from "@/lib/types";
+import type { ProjectPhase, ReplacementContext, MaterialRequestUrgency } from "@/lib/types";
 import { PROJECT_PHASES, PROJECT_PHASE_LABEL } from "@/lib/phases";
 import { can, type PermissionAction } from "@/lib/permissions";
 import { createNote, updateNote } from "@/lib/notes";
@@ -57,7 +58,7 @@ export function CreateModalsHost() {
         <RoleGate action="CREATE_SITE" kindLabel="sites"><SiteForm /></RoleGate>
       )}
       {create.kind === "project" && (
-        <RoleGate action="CREATE_PROJECT" kindLabel="Main Contractor jobs"><ProjectForm /></RoleGate>
+        <RoleGate action="CREATE_PROJECT" kindLabel="projects"><ProjectForm /></RoleGate>
       )}
       {create.kind === "amc" && (
         <RoleGate action="CREATE_AMC" kindLabel="AMC contracts"><AmcForm /></RoleGate>
@@ -66,7 +67,7 @@ export function CreateModalsHost() {
         <RoleGate action="CREATE_WORK_ORDER" kindLabel="work orders"><WorkOrderForm /></RoleGate>
       )}
       {create.kind === "repair" && (
-        <RoleGate action="CREATE_REPAIR" kindLabel="repair tickets"><RepairForm /></RoleGate>
+        <RoleGate action="CREATE_REPAIR" kindLabel="repair services"><RepairForm /></RoleGate>
       )}
       {create.kind === "material_request" && (
         <RoleGate action="CREATE_MATERIAL_REQUEST" kindLabel="material requests"><MaterialRequestForm /></RoleGate>
@@ -444,10 +445,10 @@ function Picker() {
     { kind: "workorder", label: "Work order", sub: "Schedule field execution", icon: "briefcase", roles: ["admin", "md", "manager", "lead_worker"] },
     { kind: "customer", label: "Customer", sub: "Add a new account", icon: "building", roles: ["admin", "md", "manager", "sales"] },
     { kind: "site", label: "Site", sub: "Customer location for field work", icon: "mapPin", roles: ["admin", "md", "manager", "lead_worker"] },
-    { kind: "project", label: "Main Contractor Job", sub: "Installation contract with milestones and payment terms", icon: "layers", roles: ["admin", "md", "manager"] },
+    { kind: "project", label: "Project", sub: "Installation contract with milestones and payment terms", icon: "layers", roles: ["admin", "md", "manager"] },
     { kind: "amc", label: "AMC contract", sub: "Annual maintenance, 4 quarterly services", icon: "shieldCheck", roles: ["admin", "md", "manager"] },
-    { kind: "repair", label: "Repair ticket", sub: "Log a service request", icon: "wrench", roles: ["admin", "md", "manager"] },
-    { kind: "material_request", label: "Material request", sub: "Approval-routed materials", icon: "package", roles: ["admin", "md", "manager", "lead_worker"] },
+    { kind: "repair", label: "Repair Service", sub: "Log a service request", icon: "wrench", roles: ["admin", "md", "manager"] },
+    { kind: "material_request", label: "Material request", sub: "Request materials/parts on a work order", icon: "package", roles: ["admin", "md", "manager", "lead_worker", "worker", "subcontractor"] },
     { kind: "user", label: "User", sub: "Invite a team member", icon: "user", roles: ["admin"] },
   ];
   const visible = items.filter(i => !i.roles || i.roles.includes(role));
@@ -627,7 +628,7 @@ function UserForm({ teamOnly }: { teamOnly?: boolean }) {
   return (
     <FormShell icon={teamOnly ? "users" : "user"}
       title={teamOnly ? "Add team member" : "New user"}
-      sub={teamOnly ? "Adds a field worker, lead, driver, or subcontractor" : "Create a system user - admin sets role and scope"}
+      sub={teamOnly ? "Adds a field team member, lead, driver, or subcontractor" : "Create a system user - admin sets role and scope"}
       busy={busy} error={err} onSubmit={submit}
       submitLabel={teamOnly ? "Add member" : "Create user"}>
       <Section title="Identity">
@@ -702,7 +703,7 @@ function CustomerForm() {
 
   return (
     <FormShell icon="building" title="New customer"
-      sub="Adds a customer account - sites, jobs, AMCs and tickets attach to this"
+      sub="Adds a customer account - sites, projects, AMCs and services attach to this"
       busy={busy} error={err} onSubmit={submit} submitLabel="Add customer">
       <Section title="Profile">
         <Field label="Customer name" required>
@@ -998,11 +999,11 @@ function ProjectForm() {
     });
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
-    fireToast("Main Contractor Job created"); bumpData(); closeCreate();
+    fireToast("Project created"); bumpData(); closeCreate();
   };
 
   return (
-    <FormShell icon="briefcase" title="New Main Contractor Job"
+    <FormShell icon="briefcase" title="New Project"
       sub="Installation contract with milestones and payment terms"
       busy={busy} error={err} onSubmit={submit} submitLabel="Create job">
       <Section title="Basics">
@@ -1076,7 +1077,7 @@ function ProjectForm() {
           </Field>
         )}
         <Field label="Lead Technician" required
-          hint="Who will manage execution and assign workers?">
+          hint="Who will manage execution and assign team members?">
           <Select required value={f.lead_tech_id}
             onChange={v => setF({ ...f, lead_tech_id: v })}
             placeholder="- Select Lead Technician -"
@@ -1186,6 +1187,10 @@ function AmcForm() {
     lead_tech_id: "", value_aed: "",
     expires_at: expDefault.toISOString().slice(0, 10),
   });
+  // Free-call entitlement (migration 0037). Optional — null mode means the
+  // OM is skipping it for now; the contract is created "unset" and flagged.
+  const [freeCallsMode, setFreeCallsMode] = useState<FreeCallsModeValue | null>(null);
+  const [freeCallsCount, setFreeCallsCount] = useState("10");
   const customers = Object.values(db.CUSTOMERS);
   const leadTechs = useMemo(() => Object.values(db.USERS).filter(u => u.role === "lead_worker"), []);
 
@@ -1193,6 +1198,10 @@ function AmcForm() {
     e.preventDefault(); setErr(null);
     if (!f.lead_tech_id) {
       setErr("Lead Technician is required — pick the user who will manage execution.");
+      return;
+    }
+    if (freeCallsMode === "limited" && (!freeCallsCount || Number(freeCallsCount) <= 0)) {
+      setErr("Enter how many free calls are included (or choose Unlimited / No).");
       return;
     }
     setBusy(true);
@@ -1203,6 +1212,8 @@ function AmcForm() {
       lead_tech_id: f.lead_tech_id || null,
       value_aed: Number(f.value_aed),
       expires_at: f.expires_at,
+      free_calls_mode: freeCallsMode,
+      free_calls_included: freeCallsMode === "limited" ? Number(freeCallsCount) : undefined,
     });
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
@@ -1331,11 +1342,23 @@ function AmcForm() {
           )}
         </Row>
         <Field label="Lead Technician" required
-          hint="Who will manage execution and assign workers?">
+          hint="Who will manage execution and assign team members?">
           <Select required value={f.lead_tech_id}
             onChange={v => setF({ ...f, lead_tech_id: v })}
             placeholder="- Select Lead Technician -"
             options={leadTechs.map(u => ({ value: u.id, label: `${u.name} · ${ROLE_LABELS[u.role]}` }))} />
+        </Field>
+      </Section>
+
+      <Section title="Free calls">
+        <Field label="Free calls included"
+          hint="Optional — set how many free call-outs this contract includes. Leave blank to configure later; the contract is flagged until you do.">
+          <FreeCallsModePicker
+            mode={freeCallsMode}
+            count={freeCallsCount}
+            onModeChange={setFreeCallsMode}
+            onCountChange={setFreeCallsCount}
+          />
         </Field>
       </Section>
     </FormShell>
@@ -1659,13 +1682,13 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
               conflicts={leadConflicts} />
           )}
         </Field>
-        <Field label="Additional workers"
+        <Field label="Additional team members"
           hint={f.additional_workers.length > 0
             ? `${f.additional_workers.length} selected${totalWorkerConflictCount > 0 ? ` · ${totalWorkerConflictCount} conflict${totalWorkerConflictCount === 1 ? "" : "s"}` : ""}`
             : "Optional — Technicians, Lead Techs, and Drivers can join the crew"}>
           {workerOptions.length === 0 ? (
             <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: 8 }}>
-              No additional workers available yet.
+              No additional team members available yet.
             </div>
           ) : (
             <div style={{
@@ -1727,7 +1750,7 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             .filter(id => (workerConflicts[id]?.length ?? 0) > 0)
             .map(id => (
               <ConflictWarning key={id}
-                workerName={db.user(id)?.name ?? "Worker"}
+                workerName={db.user(id)?.name ?? "Team member"}
                 conflicts={workerConflicts[id]} />
             ))}
         </Field>
@@ -1808,10 +1831,10 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
             </div>
           )}
         </Field>
-        <Field label="Link to source" hint="Optional - link this WO to a Main Contractor Job, AMC, or repair ticket">
+        <Field label="Link to source" hint="Optional - link this WO to a Project, AMC, or Repair Service">
           <div className="form-row-mixed">
             <Select value={f.source_kind} onChange={v => setF({ ...f, source_kind: v as typeof f.source_kind, source_id: "" })}
-              options={[{ value: "", label: "none" }, { value: "project", label: "Main Contractor" }, { value: "amc", label: "AMC" }, { value: "repair", label: "repair" }]} />
+              options={[{ value: "", label: "none" }, { value: "project", label: "Project" }, { value: "amc", label: "AMC" }, { value: "repair", label: "Repair Service" }]} />
             <Select value={f.source_id} onChange={v => setF({ ...f, source_id: v })}
               placeholder={f.source_kind ? "- Select -" : "Pick a type first"}
               disabled={!f.source_kind} options={sourceOptions} />
@@ -1851,13 +1874,13 @@ function RepairForm() {
     });
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
-    fireToast("Repair ticket logged"); bumpData(); closeCreate();
+    fireToast("Repair Service logged"); bumpData(); closeCreate();
   };
 
   return (
-    <FormShell icon="wrench" title="Log repair ticket"
+    <FormShell icon="wrench" title="Log Repair Service"
       sub="Own product or third-party - multi-visit, SLA-tracked"
-      busy={busy} error={err} onSubmit={submit} submitLabel="Log ticket">
+      busy={busy} error={err} onSubmit={submit} submitLabel="Log service">
       <Section title="Issue">
         <Field label="Title" required>
           <input className="input" required value={f.title} onChange={e => setF({ ...f, title: e.target.value })} placeholder="e.g. Camera offline - main entrance" />
@@ -1877,7 +1900,7 @@ function RepairForm() {
           </Field>
         </Row>
         <Field label="Lead Technician" required
-          hint="Who will manage execution and assign workers?">
+          hint="Who will manage execution and assign team members?">
           <Select required value={f.lead_tech_id}
             onChange={v => setF({ ...f, lead_tech_id: v })}
             placeholder="- Select Lead Technician -"
@@ -1909,54 +1932,129 @@ function RepairForm() {
 }
 
 /* ─── MATERIAL REQUEST (Approval) ──────────────────────── */
+// Material request — workflow-based (migration 0038). Raised against a
+// Work Order; the parent project/AMC manager + supervising Lead Tech are
+// notified; managers approve / reject / fulfil. Mirrors the
+// ReplacementRequestForm pattern (WO-linked, context inferred from source).
 function MaterialRequestForm() {
-  const { closeCreate, fireToast, bumpData, me, currentOrg } = useApp();
+  const { closeCreate, create, fireToast, bumpData, me, role } = useApp();
+  const prefill = (create?.prefill ?? {}) as { work_order_id?: string };
+  const lockedWoId = prefill.work_order_id ?? "";
+
+  const [woId, setWoId] = useState(lockedWoId);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [f, setF] = useState({ context: "", amount_aed: "", project_id: "" });
-  const projects = Object.values(db.PROJECTS);
+  const [f, setF] = useState({
+    item_name: "",
+    quantity: "1",
+    urgency: "normal" as MaterialRequestUrgency,
+    notes: "",
+  });
+
+  // Standalone (no prefill): user picks from the WOs they can act on.
+  // Managers see all live WOs; field staff see ones they lead / are on.
+  const pickableWos = useMemo(() => {
+    if (lockedWoId) return [];
+    const isManager = role === "admin" || role === "md" || role === "manager";
+    return Object.values(db.WORK_ORDERS)
+      .filter(w => w.status !== "closed" && w.status !== "cancelled" && w.status !== "done")
+      .filter(w => isManager
+        || w.assignedLead === me.id
+        || (w.assigned ?? []).includes(me.id)
+      )
+      .sort((a, b) => a.code.localeCompare(b.code));
+  }, [lockedWoId, role, me.id]);
+
+  const wo = woId ? db.wo(woId) : null;
+  const cust = wo ? db.cust(wo.customer) : null;
 
   const submit = async (e: React.FormEvent) => {
-    e.preventDefault(); setErr(null); setBusy(true);
-    const res = await createApproval({
-      kind: "Material Request",
-      context: f.context, amount_aed: Number(f.amount_aed),
-      requester_id: me.id,
-      target_kind: f.project_id ? "project" : undefined,
-      target_id: f.project_id || undefined,
+    e.preventDefault();
+    setErr(null);
+    if (!wo) { setErr("Pick a work order first."); return; }
+    if (!f.item_name.trim()) { setErr("Material name is required."); return; }
+    const qty = Number(f.quantity);
+    if (!Number.isFinite(qty) || qty < 1) { setErr("Quantity must be 1 or more."); return; }
+
+    setBusy(true);
+    const res = await createMaterialRequest({
+      customer_id:      wo.customer,
+      work_order_id:    wo.id,
+      project_id:       wo.source.kind === "project" ? wo.source.id : null,
+      amc_contract_id:  wo.source.kind === "amc"     ? wo.source.id : null,
+      repair_ticket_id: wo.source.kind === "repair"  ? wo.source.id : null,
+      site_id:          wo.site || null,
+      item_name:        f.item_name,
+      quantity:         qty,
+      urgency:          f.urgency,
+      notes:            f.notes || null,
+      requested_by:     me.id,
     });
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
-    fireToast("Material request submitted for approval"); bumpData(); closeCreate();
+    fireToast(`Material requested · ${res.mr.code}`);
+    bumpData();
+    closeCreate();
   };
-
-  const overFiveK = Number(f.amount_aed) >= 5000;
 
   return (
     <FormShell icon="package" title="Request materials"
-      sub="Routes through the Approval Chain Engine"
-      busy={busy} error={err} onSubmit={submit} submitLabel="Submit request"
-      footerHint={<><Icon name="inbox" size={13} style={{ color: "var(--pri-600)" }} />
-        {overFiveK ? "Lead Worker → Manager" : "Lead Worker only"}
-      </>}>
-      <Section title="What you need">
-        <Field label="Description" required>
-          <textarea className="textarea" required value={f.context} onChange={e => setF({ ...f, context: e.target.value })}
-            placeholder="e.g. Cat6A 305m drum × 2, patch panels × 4 for the Azizi Riviera riser run" />
-        </Field>
+      sub="The Operations Manager and Lead Tech are notified to review and procure"
+      busy={busy} error={err} onSubmit={submit}
+      submitLabel="Submit request">
+      <Section title="Work order">
+        {lockedWoId ? (
+          <Field label="Linked WO">
+            <div className="row gap-3" style={{
+              padding: 10, background: "var(--bg-muted)",
+              borderRadius: "var(--r-md)", border: "1px solid var(--border)",
+            }}>
+              <Icon name="briefcase" size={14} style={{ color: "var(--ink-mute)" }} />
+              <span className="numeric" style={{ fontFamily: "var(--font-mono)", font: "var(--t-small)" }}>{wo?.code ?? "—"}</span>
+              <span className="truncate" style={{ flex: 1, font: "var(--t-small)" }}>{wo?.title ?? ""}</span>
+            </div>
+          </Field>
+        ) : (
+          <Field label="Work order" required hint="Only your active assignments are listed">
+            <Select required value={woId} onChange={setWoId}
+              placeholder={pickableWos.length === 0 ? "No active WOs available" : "- Select a work order -"}
+              disabled={pickableWos.length === 0}
+              options={pickableWos.map(w => ({ value: w.id, label: w.code + " · " + w.title }))} />
+          </Field>
+        )}
+        {wo && (
+          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: "0 2px" }}>
+            Customer: <strong style={{ color: "var(--ink)" }}>{cust?.name ?? "—"}</strong>
+          </div>
+        )}
       </Section>
 
-      <Section title="Cost & scope">
+      <Section title="What you need">
+        <Field label="Material" required>
+          <input className="input" required
+            value={f.item_name}
+            onChange={e => setF({ ...f, item_name: e.target.value })}
+            placeholder="e.g. Cable trays, Cat6A drum, patch panels" />
+        </Field>
         <Row>
-          <Field label={`Estimated cost (${currencySymbol(currentOrg)})`} required>
-            <input className="input numeric" type="number" min={0} required value={f.amount_aed} onChange={e => setF({ ...f, amount_aed: e.target.value })} />
+          <Field label="Quantity" required>
+            <input className="input numeric" type="number" min={1} required
+              value={f.quantity}
+              onChange={e => setF({ ...f, quantity: e.target.value })} />
           </Field>
-          <Field label="For job">
-            <Select value={f.project_id} onChange={v => setF({ ...f, project_id: v })}
-              placeholder="- Not job-bound -"
-              options={projects.map(p => ({ value: p.id, label: `${p.code} · ${p.name}` }))} />
+          <Field label="Urgency">
+            <Select value={f.urgency} onChange={v => setF({ ...f, urgency: v as MaterialRequestUrgency })}
+              options={(["low", "normal", "high"] as MaterialRequestUrgency[]).map(u => ({
+                value: u, label: MATERIAL_REQUEST_URGENCY_LABEL[u],
+              }))} />
           </Field>
         </Row>
+        <Field label="Notes" hint="Why is it needed? Helps the manager decide quickly.">
+          <textarea className="textarea" rows={3}
+            value={f.notes}
+            onChange={e => setF({ ...f, notes: e.target.value })}
+            placeholder="e.g. Riser run short by 2 trays; needed to finish 4th-floor pull tomorrow" />
+        </Field>
       </Section>
     </FormShell>
   );

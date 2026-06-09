@@ -24,7 +24,7 @@ import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
 import { db } from "@/lib/db";
 import {
-  EmptyState, KPI, PageHeader, SignOutButton,
+  EmptyState, KPI, PageHeader,
 } from "../shared";
 import type { AmcContract } from "@/lib/types";
 
@@ -45,7 +45,7 @@ export function Accountant() {
   if (!ALLOWED.has(role)) {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Finance" title="Accountant" right={<SignOutButton />} />
+        <PageHeader eyebrow="Finance" title="Accountant" />
         <EmptyState icon="shield" title="Not available for your role"
           sub="Accountant is available to MD / Admin / Operations Manager / Accounts." />
       </div>
@@ -93,8 +93,7 @@ export function Accountant() {
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Finance" title="Accountant"
-        sub="Outstanding AMC balances and aging"
-        right={<SignOutButton />} />
+        sub="Outstanding AMC balances and aging" />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(3, minmax(0, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Total outstanding"

@@ -53,9 +53,9 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Jobs", items: [
-      { id: "projects", label: "Main Contractor Jobs", icon: "briefcase", roles: ["admin", "md", "manager", "lead_worker"] },
+      { id: "projects", label: "Projects", icon: "briefcase", roles: ["admin", "md", "manager", "lead_worker"] },
       { id: "amc", label: "AMC contracts", icon: "shieldCheck", roles: ["admin", "md", "manager", "sales", "accounts", "lead_worker"] },
-      { id: "repair", label: "Repair tickets", icon: "wrench", roles: ["admin", "md", "manager", "service_support", "lead_worker"] },
+      { id: "repair", label: "Repair Services", icon: "wrench", roles: ["admin", "md", "manager", "service_support", "lead_worker"] },
     ]
   },
   {
@@ -65,6 +65,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "scheduling", label: "Scheduling", icon: "calendar", roles: ["admin", "md", "manager"] },
       { id: "approvals", label: "Approvals", icon: "inbox", roles: ["admin", "md", "manager", "accounts"], countKey: "approvals_count" },
       { id: "replacements", label: "Replacements", icon: "package", roles: ["admin", "md", "manager", "lead_worker", "worker", "subcontractor", "accounts"] },
+      { id: "material-requests", label: "Material Requests", icon: "package", roles: ["admin", "md", "manager", "lead_worker", "worker", "subcontractor", "accounts"] },
       { id: "inventory", label: "Inventory", icon: "package", roles: ["admin", "md", "manager", "lead_worker"] },
       { id: "logistics", label: "Logistics", icon: "truck", roles: ["admin", "md", "manager", "lead_worker"] },
     ]
@@ -200,14 +201,15 @@ const TITLE_MAP: Record<RouteName, string> = {
   feed: "Live operations feed",
   scheduling: "Scheduling & dispatch",
   approvals: "Approvals",
-  projects: "Main Contractor Jobs",
+  projects: "Projects",
   amc: "AMC contracts",
-  repair: "Repair tickets",
+  repair: "Repair Services",
   inventory: "Inventory",
   logistics: "Logistics",
   customers: "Customers",
   sites: "Sites",
   replacements: "Replacements",
+  "material-requests": "Material Requests",
   "growth-plan": "Growth Plan",
   "sub-contractors": "Sub-contractors",
   team: "Team",

@@ -23,7 +23,9 @@
 import { supabaseBrowser } from "./supabase/client";
 import { db } from "./db";
 import type {
-  AmcContract, AmcStatus, Approval, Customer, FreeCall, Organization, Project, ProjectPhase,
+  AmcContract, AmcStatus, Approval, Customer, FreeCall, FreeCallsMode,
+  MaterialRequest, MaterialRequestStatus, MaterialRequestUrgency,
+  Organization, Project, ProjectPhase,
   Quotation, QuotationStatus, RepairTicket, ReplacementContext, ReplacementRequest,
   ReplacementStatus, Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
@@ -792,6 +794,10 @@ export interface AmcInput {
   lead_tech_id?: string | null;
   value_aed: number;
   expires_at: string;
+  // Free-call entitlement (migration 0037). Optional — omit / null to
+  // leave the contract "unset" (UI flags it for later configuration).
+  free_calls_mode?: FreeCallsMode | null;
+  free_calls_included?: number | null; // the cap, only used when mode='limited'
 }
 export async function createAmc(input: AmcInput): Promise<Result> {
   if (!input.customer_id) return { ok: false, error: "Customer is required." };
@@ -819,8 +825,13 @@ export async function createAmc(input: AmcInput): Promise<Result> {
     contract_status: "pending_payment",
     value_aed: input.value_aed,
     expires_at: input.expires_at,
+    free_calls_mode: input.free_calls_mode ?? null,
+    // Only meaningful for 'limited'; otherwise leave the DB default in place.
+    ...(input.free_calls_mode === "limited" && input.free_calls_included != null
+      ? { free_calls_included: input.free_calls_included }
+      : {}),
   })
-  .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
+  .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, free_calls_mode, free_calls_included, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
   .single();
   if (error) return { ok: false, error: error.message };
 
@@ -838,6 +849,8 @@ export async function createAmc(input: AmcInput): Promise<Result> {
     nextDue:           (data.next_due_label as string) ?? "-",
     overdueDays:       (data.overdue_days as number) ?? 0,
     freeCalls:         (data.free_calls_used as number) ?? 0,
+    freeCallsMode:     (data.free_calls_mode as AmcContract["freeCallsMode"]) ?? null,
+    freeCallsIncluded: data.free_calls_included == null ? null : (data.free_calls_included as number),
     expiresAt:         (data.expires_at as string) ?? input.expires_at,
     suspendedAt:       (data.suspended_at as string | null) ?? null,
     suspendedReason:   (data.suspended_reason as string | null) ?? null,
@@ -1038,6 +1051,221 @@ export async function getAmcDocumentDownloadUrl(
 }
 
 // ─────────────────────────────────────────────────────────
+// REPLACEMENT DOCUMENTS + REFUND PHOTO (migration 0039)
+// Mirrors the AMC-documents pattern above. Both general documents and
+// the single refund photo share the private 'replacement-documents'
+// bucket. Docs are rows in replacement_documents; the refund photo is
+// stored as columns on the replacement_requests row.
+// ─────────────────────────────────────────────────────────
+export const REPLACEMENT_DOC_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const REPLACEMENT_BUCKET = "replacement-documents";
+
+const DOC_EXTS = ["pdf", "docx", "jpg", "jpeg", "png"];
+const IMG_EXTS = ["jpg", "jpeg", "png"];
+function fileExt(name: string): string {
+  const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : "";
+}
+
+export interface UploadReplacementDocResult {
+  ok: boolean;
+  doc?: import("./types").ReplacementDocument;
+  error?: string;
+}
+
+export async function uploadReplacementDocument(
+  rrId: string,
+  file: File,
+  uploaderId: string | null,
+): Promise<UploadReplacementDocResult> {
+  if (!rrId) return { ok: false, error: "Replacement id is required." };
+  if (!file)  return { ok: false, error: "Pick a file to upload." };
+  if (file.size > REPLACEMENT_DOC_MAX_BYTES) {
+    return { ok: false, error: `File is over the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!DOC_EXTS.includes(fileExt(file.name))) {
+    return { ok: false, error: "Allowed types: PDF, DOCX, JPG, PNG." };
+  }
+
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "document";
+  const random = Math.random().toString(36).slice(2, 10);
+  const filePath = `${rrId}/${random}-${safeName}`;
+
+  const supa = supabaseBrowser();
+  const { error: storageErr } = await supa.storage
+    .from(REPLACEMENT_BUCKET)
+    .upload(filePath, file, { contentType: file.type || undefined, upsert: false });
+  if (storageErr) return { ok: false, error: `Upload failed: ${storageErr.message}` };
+
+  const { data, error: insertErr } = await supa
+    .from("replacement_documents")
+    .insert({
+      replacement_request_id: rrId,
+      file_name:       file.name,
+      file_path:       filePath,
+      file_size_bytes: file.size,
+      mime_type:       file.type || null,
+      uploaded_by:     uploaderId,
+    })
+    .select("id, replacement_request_id, file_name, file_path, file_size_bytes, mime_type, uploaded_by, uploaded_at")
+    .single();
+
+  if (insertErr || !data) {
+    await supa.storage.from(REPLACEMENT_BUCKET).remove([filePath]);
+    return { ok: false, error: insertErr?.message || "Failed to record document." };
+  }
+
+  const doc: import("./types").ReplacementDocument = {
+    id:                   data.id as string,
+    replacementRequestId: data.replacement_request_id as string,
+    fileName:             data.file_name as string,
+    filePath:             data.file_path as string,
+    fileSizeBytes:        (data.file_size_bytes as number | null) ?? null,
+    mimeType:             (data.mime_type as string | null) ?? null,
+    uploadedBy:           (data.uploaded_by as string | null) ?? null,
+    uploadedAt:           data.uploaded_at as string,
+  };
+  db.REPLACEMENT_DOCUMENTS[doc.id] = doc;
+  return { ok: true, doc };
+}
+
+export async function deleteReplacementDocument(docId: string): Promise<Result> {
+  if (!docId) return { ok: false, error: "Document id is required." };
+  const doc = db.REPLACEMENT_DOCUMENTS[docId];
+  if (!doc) return { ok: false, error: "Document not found." };
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  delete db.REPLACEMENT_DOCUMENTS[docId]; // optimistic
+
+  const { error: rowErr } = await supa.from("replacement_documents").delete().eq("id", docId);
+  if (rowErr) {
+    db.REPLACEMENT_DOCUMENTS[docId] = doc; // revert
+    return { ok: false, error: rowErr.message };
+  }
+
+  const { error: storageErr } = await supa.storage.from(REPLACEMENT_BUCKET).remove([doc.filePath]);
+  if (storageErr) console.warn("[deleteReplacementDocument] storage cleanup failed:", storageErr.message);
+
+  return { ok: true, id: docId };
+}
+
+export async function getReplacementDocumentDownloadUrl(
+  filePath: string,
+  expiresInSeconds: number = 60,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!filePath) return { ok: false, error: "filePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+
+  const { data, error } = await supabaseBrowser()
+    .storage.from(REPLACEMENT_BUCKET)
+    .createSignedUrl(filePath, expiresInSeconds);
+  if (error || !data?.signedUrl) {
+    return { ok: false, error: error?.message || "Could not create signed URL." };
+  }
+  return { ok: true, url: data.signedUrl };
+}
+
+// Upload (or replace) the single refund photo for a replacement. The
+// previous photo, if any, is removed from storage so we don't orphan
+// blobs. Metadata is written to columns on replacement_requests.
+export async function setRefundPhoto(
+  rrId: string,
+  file: File,
+  uploaderId: string | null,
+): Promise<Result> {
+  if (!rrId) return { ok: false, error: "Replacement id is required." };
+  if (!file)  return { ok: false, error: "Pick a photo to upload." };
+  if (file.size > REPLACEMENT_DOC_MAX_BYTES) {
+    return { ok: false, error: `Photo is over the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!IMG_EXTS.includes(fileExt(file.name))) {
+    return { ok: false, error: "Refund photo must be a JPG or PNG image." };
+  }
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+  const prevPath = db.REPLACEMENTS[rrId]?.refundPhotoPath ?? null;
+
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "refund-photo";
+  const random = Math.random().toString(36).slice(2, 10);
+  const filePath = `${rrId}/refund-${random}-${safeName}`;
+
+  const { error: storageErr } = await supa.storage
+    .from(REPLACEMENT_BUCKET)
+    .upload(filePath, file, { contentType: file.type || undefined, upsert: false });
+  if (storageErr) return { ok: false, error: `Upload failed: ${storageErr.message}` };
+
+  const { data, error: updErr } = await supa
+    .from("replacement_requests")
+    .update({
+      refund_photo_path:        filePath,
+      refund_photo_name:        file.name,
+      refund_photo_uploaded_by: uploaderId,
+      refund_photo_uploaded_at: new Date().toISOString(),
+    })
+    .eq("id", rrId)
+    .select("refund_photo_path, refund_photo_name, refund_photo_uploaded_by, refund_photo_uploaded_at")
+    .single();
+
+  if (updErr || !data) {
+    await supa.storage.from(REPLACEMENT_BUCKET).remove([filePath]); // rollback
+    return { ok: false, error: updErr?.message || "Failed to save refund photo." };
+  }
+
+  // Mirror + clean up the old blob (best-effort).
+  const rr = db.REPLACEMENTS[rrId];
+  if (rr) {
+    rr.refundPhotoPath       = data.refund_photo_path as string | null;
+    rr.refundPhotoName       = data.refund_photo_name as string | null;
+    rr.refundPhotoUploadedBy = data.refund_photo_uploaded_by as string | null;
+    rr.refundPhotoUploadedAt = data.refund_photo_uploaded_at as string | null;
+  }
+  if (prevPath && prevPath !== filePath) {
+    await supa.storage.from(REPLACEMENT_BUCKET).remove([prevPath]);
+  }
+  return { ok: true, id: rrId };
+}
+
+export async function deleteRefundPhoto(rrId: string): Promise<Result> {
+  if (!rrId) return { ok: false, error: "Replacement id is required." };
+  const rr = db.REPLACEMENTS[rrId];
+  const prevPath = rr?.refundPhotoPath ?? null;
+  if (!prevPath) return { ok: false, error: "No refund photo to remove." };
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { error: updErr } = await supa
+    .from("replacement_requests")
+    .update({
+      refund_photo_path:        null,
+      refund_photo_name:        null,
+      refund_photo_uploaded_by: null,
+      refund_photo_uploaded_at: null,
+    })
+    .eq("id", rrId);
+  if (updErr) return { ok: false, error: updErr.message };
+
+  if (rr) {
+    rr.refundPhotoPath = null; rr.refundPhotoName = null;
+    rr.refundPhotoUploadedBy = null; rr.refundPhotoUploadedAt = null;
+  }
+  const { error: storageErr } = await supa.storage.from(REPLACEMENT_BUCKET).remove([prevPath]);
+  if (storageErr) console.warn("[deleteRefundPhoto] storage cleanup failed:", storageErr.message);
+
+  return { ok: true, id: rrId };
+}
+
+// ─────────────────────────────────────────────────────────
 // AMC label maps + lifecycle constants
 // ─────────────────────────────────────────────────────────
 //
@@ -1077,6 +1305,10 @@ export interface AmcPatch {
   lead_tech_id?: string | null;
   site_id?: string | null;
   expires_at?: string;
+  // Free-call entitlement (migration 0037). Editable after creation by
+  // admin / md / manager. Pass mode=null to clear back to "unset".
+  free_calls_mode?: FreeCallsMode | null;
+  free_calls_included?: number | null;
 }
 export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true; amc: AmcContract } | { ok: false; error: string }> {
   if (!id) return { ok: false, error: "AMC id is required." };
@@ -1093,10 +1325,12 @@ export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true
   if (patch.lead_tech_id    !== undefined) body.lead_tech_id    = patch.lead_tech_id;
   if (patch.site_id         !== undefined) body.site_id         = patch.site_id;
   if (patch.expires_at      !== undefined) body.expires_at      = patch.expires_at;
+  if (patch.free_calls_mode     !== undefined) body.free_calls_mode     = patch.free_calls_mode;
+  if (patch.free_calls_included !== undefined) body.free_calls_included = patch.free_calls_included;
 
   const { data, error } = await supabaseBrowser()
     .from("amc_contracts").update(body).eq("id", id)
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, free_calls_mode, free_calls_included, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .single();
   if (error) return { ok: false, error: error.message };
 
@@ -1115,6 +1349,8 @@ export async function updateAmc(id: string, patch: AmcPatch): Promise<{ ok: true
     nextDue:           (data.next_due_label as string) ?? "-",
     overdueDays:       (data.overdue_days as number) ?? 0,
     freeCalls:         (data.free_calls_used as number) ?? 0,
+    freeCallsMode:     (data.free_calls_mode as AmcContract["freeCallsMode"]) ?? null,
+    freeCallsIncluded: data.free_calls_included == null ? null : (data.free_calls_included as number),
     expiresAt:         (data.expires_at as string) ?? "",
     suspendedAt:       (data.suspended_at as string | null) ?? null,
     suspendedReason:   (data.suspended_reason as string | null) ?? null,
@@ -1207,7 +1443,7 @@ export async function recordAmcPayment(
   //    when the payment trigger auto-resumes a paused contract.
   const { data: amcRow, error: amcErr } = await supa
     .from("amc_contracts")
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, free_calls_mode, free_calls_included, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .eq("id", amcId)
     .single();
   if (amcErr || !amcRow) {
@@ -1231,6 +1467,8 @@ export async function recordAmcPayment(
     nextDue:           (amcRow.next_due_label as string) ?? "-",
     overdueDays:       (amcRow.overdue_days as number) ?? 0,
     freeCalls:         (amcRow.free_calls_used as number) ?? 0,
+    freeCallsMode:     (amcRow.free_calls_mode as AmcContract["freeCallsMode"]) ?? current?.freeCallsMode ?? null,
+    freeCallsIncluded: amcRow.free_calls_included == null ? (current?.freeCallsIncluded ?? null) : (amcRow.free_calls_included as number),
     expiresAt:         (amcRow.expires_at as string) ?? "",
     suspendedAt:       (amcRow.suspended_at as string | null) ?? null,
     suspendedReason:   (amcRow.suspended_reason as string | null) ?? null,
@@ -1440,6 +1678,13 @@ export async function renewAmc(
     expires_at:      input.expires_at,
     signed_at:       signedAt,
     renewed_from_id: previousAmcId,
+    // Carry the customer's negotiated free-call terms forward to the
+    // renewal (migration 0037). If the source was unset, the renewal is
+    // unset too and the UI prompts the OM to configure it.
+    free_calls_mode: prev.freeCallsMode ?? null,
+    ...(prev.freeCallsMode === "limited" && prev.freeCallsIncluded != null
+      ? { free_calls_included: prev.freeCallsIncluded }
+      : {}),
     // first_payment_due_at is populated by the BEFORE INSERT trigger
     // (trg_amc_set_first_payment_due_at) from signed_at + grace days.
   }).select("id").single();
@@ -1459,6 +1704,8 @@ export async function renewAmc(
     nextDue:           "-",
     overdueDays:       0,
     freeCalls:         0,
+    freeCallsMode:     prev.freeCallsMode ?? null,
+    freeCallsIncluded: prev.freeCallsIncluded ?? null,
     expiresAt:         input.expires_at,
     suspendedAt:       null,
     suspendedReason:   null,
@@ -1483,7 +1730,7 @@ async function updateAmcWithExtras(
   const supa = supabaseBrowser();
   const { data, error } = await supa
     .from("amc_contracts").update(body).eq("id", amcId)
-    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
+    .select("id, code, customer_id, site_id, manager_id, lead_tech_id, contract_status, value_aed, next_due_label, overdue_days, free_calls_used, free_calls_mode, free_calls_included, expires_at, suspended_at, suspended_reason, paused_by, resumed_at, first_payment_due_at, renewed_from_id, first_visit_date")
     .single();
   if (error) return { ok: false, error: error.message };
   const current = db.AMCS[amcId];
@@ -1500,6 +1747,8 @@ async function updateAmcWithExtras(
     nextDue:           (data.next_due_label as string) ?? "-",
     overdueDays:       (data.overdue_days as number) ?? 0,
     freeCalls:         (data.free_calls_used as number) ?? 0,
+    freeCallsMode:     (data.free_calls_mode as AmcContract["freeCallsMode"]) ?? current?.freeCallsMode ?? null,
+    freeCallsIncluded: data.free_calls_included == null ? (current?.freeCallsIncluded ?? null) : (data.free_calls_included as number),
     expiresAt:         (data.expires_at as string) ?? "",
     suspendedAt:       (data.suspended_at as string | null) ?? null,
     suspendedReason:   (data.suspended_reason as string | null) ?? null,
@@ -2135,10 +2384,10 @@ export const REPLACEMENT_STATUS_BADGE: Record<ReplacementStatus, string> = {
 };
 
 export const REPLACEMENT_CONTEXT_LABEL: Record<ReplacementContext, string> = {
-  main_contractor: "Main Contractor Job",
+  main_contractor: "Project",
   amc_free_call:   "AMC Free Call",
   amc_scheduled:   "AMC Scheduled Service",
-  repair:          "Repair Ticket",
+  repair:          "Repair Service",
 };
 
 const RR_SELECT_COLS =
@@ -2147,7 +2396,9 @@ const RR_SELECT_COLS =
   "requested_by, requested_at, approved_by, approved_at, approval_note, " +
   "installed_by, installed_at, installation_note, " +
   "confirmed_by, confirmed_at, confirmation_note, " +
-  "rejected_by, rejected_at, rejection_reason, created_at, updated_at";
+  "rejected_by, rejected_at, rejection_reason, " +
+  "refund_photo_path, refund_photo_name, refund_photo_uploaded_by, refund_photo_uploaded_at, " +
+  "created_at, updated_at";
 
 // Maps a raw Supabase row → ReplacementRequest. Kept here (and not imported
 // from lib/hydrate.ts) because hydrate is server-only — duplicating the
@@ -2183,6 +2434,10 @@ function rowToRr(r: Record<string, unknown>): ReplacementRequest {
     rejectedBy:       sn(r.rejected_by),
     rejectedAt:       sn(r.rejected_at),
     rejectionReason:  sn(r.rejection_reason),
+    refundPhotoPath:       sn(r.refund_photo_path),
+    refundPhotoName:       sn(r.refund_photo_name),
+    refundPhotoUploadedBy: sn(r.refund_photo_uploaded_by),
+    refundPhotoUploadedAt: sn(r.refund_photo_uploaded_at),
     createdAt:        s(r.created_at),
     updatedAt:        s(r.updated_at),
   };
@@ -2370,6 +2625,213 @@ export async function cancelReplacement(id: string, reason: string, currentStatu
   return rrTransition(id, currentStatus, {
     status: "cancelled",
     rejection_reason: trimmed,  // overloaded reason field
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// MATERIAL REQUESTS  (migration 0038)
+//
+// On-site materials/parts procurement. A technician raises a request
+// from a Work Order; managers approve / reject / fulfil. Mirrors the
+// replacement-request helpers above: optimistic concurrency via
+// .eq("status", expected); the DB code/touch/notify triggers handle
+// code generation, updated_at, and the in-app notifications.
+//
+// Lifecycle: pending → approved → fulfilled; pending → rejected.
+// ─────────────────────────────────────────────────────────
+
+export const MATERIAL_REQUEST_STATUSES: MaterialRequestStatus[] = [
+  "pending", "approved", "rejected", "fulfilled",
+];
+
+export const MATERIAL_REQUEST_STATUS_LABEL: Record<MaterialRequestStatus, string> = {
+  pending:   "Pending",
+  approved:  "Approved",
+  rejected:  "Rejected",
+  fulfilled: "Fulfilled",
+};
+
+// Badge CSS class per status — all exist in shared.tsx StatusBadge.
+export const MATERIAL_REQUEST_STATUS_BADGE: Record<MaterialRequestStatus, string> = {
+  pending:   "badge-warning",
+  approved:  "badge-info",
+  rejected:  "badge-danger",
+  fulfilled: "badge-success",
+};
+
+export const MATERIAL_REQUEST_URGENCY_LABEL: Record<MaterialRequestUrgency, string> = {
+  low:    "Low",
+  normal: "Normal",
+  high:   "High",
+};
+
+const MR_SELECT_COLS =
+  "id, code, work_order_id, project_id, amc_contract_id, repair_ticket_id, " +
+  "customer_id, site_id, item_name, quantity, urgency, notes, status, " +
+  "requested_by, requested_at, approved_by, approved_at, approval_note, " +
+  "rejected_by, rejected_at, rejection_reason, " +
+  "fulfilled_by, fulfilled_at, fulfillment_note, created_at, updated_at";
+
+function rowToMr(r: Record<string, unknown>): MaterialRequest {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const sn = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    id:               s(r.id),
+    code:             s(r.code),
+    workOrderId:      (r.work_order_id as string | null) ?? null,
+    projectId:        (r.project_id as string | null) ?? null,
+    amcContractId:    (r.amc_contract_id as string | null) ?? null,
+    repairTicketId:   (r.repair_ticket_id as string | null) ?? null,
+    customerId:       s(r.customer_id),
+    siteId:           (r.site_id as string | null) ?? null,
+    itemName:         s(r.item_name),
+    quantity:         typeof r.quantity === "number" ? r.quantity : 1,
+    urgency:          ((r.urgency as MaterialRequestUrgency) ?? "normal"),
+    notes:            sn(r.notes),
+    status:           ((r.status as MaterialRequestStatus) ?? "pending"),
+    requestedBy:      sn(r.requested_by),
+    requestedAt:      s(r.requested_at),
+    approvedBy:       sn(r.approved_by),
+    approvedAt:       sn(r.approved_at),
+    approvalNote:     sn(r.approval_note),
+    rejectedBy:       sn(r.rejected_by),
+    rejectedAt:       sn(r.rejected_at),
+    rejectionReason:  sn(r.rejection_reason),
+    fulfilledBy:      sn(r.fulfilled_by),
+    fulfilledAt:      sn(r.fulfilled_at),
+    fulfillmentNote:  sn(r.fulfillment_note),
+    createdAt:        s(r.created_at),
+    updatedAt:        s(r.updated_at),
+  };
+}
+
+export interface MaterialRequestInput {
+  customer_id: string;
+  work_order_id?: string | null;
+  project_id?: string | null;
+  amc_contract_id?: string | null;
+  repair_ticket_id?: string | null;
+  site_id?: string | null;
+  item_name: string;
+  quantity?: number;
+  urgency?: MaterialRequestUrgency;
+  notes?: string | null;
+  requested_by?: string | null;
+}
+
+type MrOk = { ok: true; mr: MaterialRequest };
+type MrFail = { ok: false; error: string };
+type MrResult = MrOk | MrFail;
+
+export async function createMaterialRequest(input: MaterialRequestInput): Promise<MrResult> {
+  if (!input.item_name?.trim()) return { ok: false, error: "Material name is required." };
+  if (!input.customer_id) return { ok: false, error: "Customer is required." };
+  const qty = input.quantity ?? 1;
+  if (!Number.isFinite(qty) || qty < 1) return { ok: false, error: "Quantity must be at least 1." };
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const body = {
+    customer_id:      input.customer_id,
+    work_order_id:    input.work_order_id    ?? null,
+    project_id:       input.project_id       ?? null,
+    amc_contract_id:  input.amc_contract_id  ?? null,
+    repair_ticket_id: input.repair_ticket_id ?? null,
+    site_id:          input.site_id          ?? null,
+    item_name:        input.item_name.trim(),
+    quantity:         qty,
+    urgency:          input.urgency ?? "normal",
+    notes:            input.notes?.trim() || null,
+    requested_by:     input.requested_by ?? null,
+  };
+
+  // Code-gen trigger is racy (COUNT+1) — retry on unique-violation. Same
+  // pattern + reasoning as createReplacementRequest above.
+  for (let attempt = 0; attempt < MAX_CODE_RETRIES; attempt++) {
+    const { data, error } = await supa
+      .from("material_requests")
+      .insert(body)
+      .select(MR_SELECT_COLS)
+      .single();
+    if (!error && data) {
+      const mr = rowToMr(data as unknown as Record<string, unknown>);
+      db.MATERIAL_REQUESTS[mr.id] = mr;
+      return { ok: true, mr };
+    }
+    const code = (error as { code?: string } | null)?.code;
+    const msg  = (error as { message?: string } | null)?.message ?? "";
+    if (code === UNIQUE_VIOLATION && /material_requests_code_key|code/.test(msg)) continue;
+    return { ok: false, error: error?.message ?? "Couldn't create material request." };
+  }
+  return { ok: false, error: "Couldn't allocate a unique MR code after retries. Please try again." };
+}
+
+// Generic status transition with optimistic concurrency (mirrors rrTransition).
+async function mrTransition(
+  id: string,
+  expectedStatus: MaterialRequestStatus,
+  patch: Record<string, unknown>,
+): Promise<MrResult> {
+  if (!id) return { ok: false, error: "Material request id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("material_requests")
+    .update(patch)
+    .eq("id", id)
+    .eq("status", expectedStatus)
+    .select(MR_SELECT_COLS);
+  if (error) return { ok: false, error: error.message };
+  if (!data || data.length === 0) {
+    const { data: current } = await supa
+      .from("material_requests")
+      .select(MR_SELECT_COLS)
+      .eq("id", id).maybeSingle();
+    if (current) {
+      const mr = rowToMr(current as unknown as Record<string, unknown>);
+      db.MATERIAL_REQUESTS[mr.id] = mr;
+      return {
+        ok: false,
+        error: `This request is already ${MATERIAL_REQUEST_STATUS_LABEL[mr.status]} — refresh to see the latest.`,
+      };
+    }
+    return { ok: false, error: "Material request not found or no permission to update." };
+  }
+  const mr = rowToMr(data[0] as unknown as Record<string, unknown>);
+  db.MATERIAL_REQUESTS[mr.id] = mr;
+  return { ok: true, mr };
+}
+
+export async function approveMaterialRequest(id: string, note: string | null, approverId: string): Promise<MrResult> {
+  return mrTransition(id, "pending", {
+    status: "approved",
+    approved_by: approverId,
+    approved_at: new Date().toISOString(),
+    approval_note: note?.trim() || null,
+  });
+}
+
+export async function rejectMaterialRequest(id: string, reason: string, rejecterId: string): Promise<MrResult> {
+  const trimmed = reason?.trim();
+  if (!trimmed) return { ok: false, error: "Rejection reason is required." };
+  return mrTransition(id, "pending", {
+    status: "rejected",
+    rejected_by: rejecterId,
+    rejected_at: new Date().toISOString(),
+    rejection_reason: trimmed,
+  });
+}
+
+export async function fulfillMaterialRequest(id: string, note: string | null, fulfillerId: string): Promise<MrResult> {
+  return mrTransition(id, "approved", {
+    status: "fulfilled",
+    fulfilled_by: fulfillerId,
+    fulfilled_at: new Date().toISOString(),
+    fulfillment_note: note?.trim() || null,
   });
 }
 
@@ -2855,6 +3317,13 @@ export async function createFreeCall(
 ): Promise<{ ok: true; freeCall: FreeCall } | { ok: false; error: string }> {
   if (!input.amc_contract_id) return { ok: false, error: "AMC contract is required." };
   if (!input.description?.trim()) return { ok: false, error: "Description is required." };
+  // Migration 0037: contracts explicitly configured with no free calls
+  // cannot have one logged — the visit is billable. Other modes (limited /
+  // unlimited / unset) all permit logging.
+  const targetAmc = db.AMCS[input.amc_contract_id];
+  if (targetAmc && targetAmc.freeCallsMode === "none") {
+    return { ok: false, error: "This contract includes no free calls — log a billable work order instead." };
+  }
   const guard = ensureSupabase();
   if (guard) return guard;
   const supa = supabaseBrowser();

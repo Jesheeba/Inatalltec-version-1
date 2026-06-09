@@ -200,6 +200,9 @@ export type AmcStatus =
 // while we migrate them over. Safe to delete once nothing references it.
 export type AmcState = AmcStatus;
 
+// Free-call entitlement mode for an AMC contract (migration 0037).
+export type FreeCallsMode = "limited" | "unlimited" | "none";
+
 export interface AmcContract {
   id: string;
   code: string;
@@ -214,6 +217,14 @@ export interface AmcContract {
   nextDue: string;
   overdueDays: number;
   freeCalls: number;
+  // Free-call entitlement configuration (migration 0037).
+  //   freeCallsMode === null   → unset; UI shows a red "No free calls
+  //                              assigned" warning on detail + contract list.
+  //   'limited'   → capped at freeCallsIncluded (e.g. "1 of 10 included").
+  //   'unlimited' → no cap; KPI shows used count + "Unlimited".
+  //   'none'      → no free calls included; visits are billable.
+  freeCallsMode: FreeCallsMode | null;
+  freeCallsIncluded: number | null; // the cap, meaningful when mode='limited'
   expiresAt: string;
   // Pause / resume / renewal fields. The frontend labels
   // contract_status='suspended' as "Paused"; the DB keeps the existing
@@ -542,6 +553,72 @@ export interface ReplacementRequest {
   rejectedBy: string | null;
   rejectedAt: string | null;
   rejectionReason: string | null;
+
+  // Refund photo (migration 0039) — single dedicated image of the
+  // refundable item. Replaceable; binary in the 'replacement-documents'
+  // bucket. General documents live in replacement_documents (see
+  // ReplacementDocument), not here.
+  refundPhotoPath: string | null;
+  refundPhotoName: string | null;
+  refundPhotoUploadedBy: string | null;
+  refundPhotoUploadedAt: string | null;
+
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Supporting documents attached to a replacement record (migration 0039).
+// Mirrors AmcDocument. Binaries live in the private 'replacement-documents'
+// Storage bucket; this is metadata only.
+export interface ReplacementDocument {
+  id: string;
+  replacementRequestId: string;
+  fileName: string;
+  filePath: string;          // path inside the replacement-documents bucket
+  fileSizeBytes: number | null;
+  mimeType: string | null;
+  uploadedBy: string | null; // users.id
+  uploadedAt: string;        // ISO timestamptz
+}
+
+// Material Requests — on-site material/parts procurement flow
+// (migration 0038). A technician raises a request from a Work Order;
+// the parent project/AMC manager + supervising Lead Tech are notified;
+// managers approve / reject / fulfil. Every transition is timestamped
+// with the actor for a complete audit trail.
+export type MaterialRequestStatus = "pending" | "approved" | "rejected" | "fulfilled";
+export type MaterialRequestUrgency = "low" | "normal" | "high";
+
+export interface MaterialRequest {
+  id: string;
+  code: string;                  // MR-YYYY-NNNN, assigned by trigger
+  // Parent links — work order is the origin; project/amc/repair are
+  // denormalised from the WO source for project/AMC roll-up filtering.
+  workOrderId: string | null;
+  projectId: string | null;
+  amcContractId: string | null;
+  repairTicketId: string | null;
+  customerId: string;
+  siteId: string | null;
+
+  itemName: string;              // material name / description
+  quantity: number;
+  urgency: MaterialRequestUrgency;
+  notes: string | null;
+
+  status: MaterialRequestStatus;
+
+  requestedBy: string | null;
+  requestedAt: string;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  approvalNote: string | null;
+  rejectedBy: string | null;
+  rejectedAt: string | null;
+  rejectionReason: string | null;
+  fulfilledBy: string | null;
+  fulfilledAt: string | null;
+  fulfillmentNote: string | null;
 
   createdAt: string;
   updatedAt: string;

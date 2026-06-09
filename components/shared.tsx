@@ -239,6 +239,53 @@ export function ChoicePill<T extends string>({ value, options, onChange, ariaLab
   );
 }
 
+/* ─── Free-calls entitlement picker (migration 0037) ──────
+   Three mutually-exclusive options — Limited / Unlimited / No —
+   plus an optional "unset" state (no option selected). Clicking the
+   active option again clears back to unset, which is how the create
+   form and the detail editor both express "skip / not configured".
+   When "Limited" is active a number input appears for the cap.
+   Presentational only — the caller owns the value + persistence. */
+export type FreeCallsModeValue = "limited" | "unlimited" | "none";
+export function FreeCallsModePicker({
+  mode, count, onModeChange, onCountChange, disabled,
+}: {
+  mode: FreeCallsModeValue | null;
+  count: string;
+  onModeChange: (m: FreeCallsModeValue | null) => void;
+  onCountChange: (v: string) => void;
+  disabled?: boolean;
+}) {
+  const opts: { value: FreeCallsModeValue; label: string }[] = [
+    { value: "limited",   label: "Limited" },
+    { value: "unlimited", label: "Unlimited" },
+    { value: "none",      label: "No" },
+  ];
+  return (
+    <div>
+      <div className="row gap-2" style={{ flexWrap: "wrap" }} role="group" aria-label="Free calls included">
+        {opts.map(o => {
+          const active = mode === o.value;
+          return (
+            <button key={o.value} type="button" disabled={disabled}
+              className={"btn btn-sm " + (active ? "btn-primary" : "btn-ghost")}
+              aria-pressed={active}
+              onClick={() => onModeChange(active ? null : o.value)}>
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+      {mode === "limited" && (
+        <input className="input numeric" type="number" min={1} disabled={disabled}
+          style={{ marginTop: 8, maxWidth: 200 }}
+          value={count} onChange={e => onCountChange(e.target.value)}
+          placeholder="e.g. 10" aria-label="Number of free calls included" />
+      )}
+    </div>
+  );
+}
+
 /* ─── KPI ──────────────────────────────────────────── */
 interface KPIProps {
   label: string;

@@ -27,6 +27,7 @@ import {
 import {
   AdvancePhaseButton, PhaseBadge, PhaseHistoryTimeline, PhaseStepper,
 } from "../PhaseTracker";
+import { MaterialRequestsSection } from "./MaterialRequests";
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
@@ -234,12 +235,12 @@ const PROJECT_TAB_STATUS: Record<Exclude<ProjectTab, "all">, ProjectStatus> = {
   cancelled: "cancelled",
 };
 const PROJECT_TAB_EMPTY: Record<ProjectTab, { title: string; sub?: string }> = {
-  all: { title: "No Main Contractor jobs yet", sub: 'Click "+ New Main Contractor Job" to create your first one.' },
-  upcoming: { title: "No upcoming jobs", sub: 'Plan ahead - create a job with status "Planned".' },
-  active: { title: "No active jobs right now" },
-  on_hold: { title: "No jobs on hold" },
-  completed: { title: "No completed jobs yet" },
-  cancelled: { title: "No cancelled jobs" },
+  all: { title: "No Projects yet", sub: 'Click "+ New Project" to create your first one.' },
+  upcoming: { title: "No upcoming projects", sub: 'Plan ahead - create a project with status "Planned".' },
+  active: { title: "No active projects right now" },
+  on_hold: { title: "No projects on hold" },
+  completed: { title: "No completed projects yet" },
+  cancelled: { title: "No cancelled projects" },
 };
 
 export function ProjectsList() {
@@ -250,9 +251,9 @@ export function ProjectsList() {
   if (scope === "hidden") {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Engineering" title="Main Contractor Jobs" />
+        <PageHeader eyebrow="Engineering" title="Projects" />
         <EmptyState icon="shield" title="Not available for your role"
-          sub="Main Contractor Jobs are visible to Operations Manager, Admin, MD, and Lead Technicians." />
+          sub="Projects are visible to Operations Manager, Admin, MD, and Lead Technicians." />
       </div>
     );
   }
@@ -352,14 +353,14 @@ export function ProjectsList() {
   }, [scoped, tab, q]);
 
   const scopeActive = managerScope || teamScope;
-  const headerTitle = managerScope ? "My Main Contractor Jobs" : "Main Contractor Jobs";
+  const headerTitle = managerScope ? "My Projects" : "Projects";
 
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Engineering" title={headerTitle}
         sub="Full installation contracts — supply, design, T&C"
         right={can(role, "CREATE_PROJECT")
-          ? <button className="btn btn-primary" onClick={() => openCreate("project")}><Icon name="plus" size={14} /> New Main Contractor Job</button>
+          ? <button className="btn btn-primary" onClick={() => openCreate("project")}><Icon name="plus" size={14} /> New Project</button>
           : undefined} />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Active" value={counts.active} />
@@ -388,7 +389,7 @@ export function ProjectsList() {
         <div className="row gap-3" style={{ flexWrap: "wrap", marginTop: 12 }}>
           <div className="input-search-wrap" style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
             <Icon name="search" size={14} />
-            <input className="input input-sm" placeholder="Search Main Contractor jobs…" value={q} onChange={e => setQ(e.target.value)} />
+            <input className="input input-sm" placeholder="Search projects…" value={q} onChange={e => setQ(e.target.value)} />
           </div>
         </div>
       </div>
@@ -397,10 +398,10 @@ export function ProjectsList() {
         ? (
           <EmptyState
             icon="briefcase"
-            title={q.trim() ? "No matching jobs" : PROJECT_TAB_EMPTY[tab].title}
+            title={q.trim() ? "No matching projects" : PROJECT_TAB_EMPTY[tab].title}
             sub={q.trim() ? `Nothing matches "${q.trim()}" in this tab.` : PROJECT_TAB_EMPTY[tab].sub}
             action={tab === "all" && !q.trim() && can(role, "CREATE_PROJECT")
-              ? <button className="btn btn-primary" onClick={() => openCreate("project")}><Icon name="plus" size={14} /> New Main Contractor Job</button>
+              ? <button className="btn btn-primary" onClick={() => openCreate("project")}><Icon name="plus" size={14} /> New Project</button>
               : undefined}
           />
         )
@@ -418,7 +419,7 @@ export function ProjectDetail({ id }: { id: string }) {
   // Subscribe to dataVersion so a status/stage change re-renders the badge.
   void dataVersion;
   const p = db.proj(id);
-  if (!p) return <EmptyState icon="alertCircle" title="Main Contractor job not found"
+  if (!p) return <EmptyState icon="alertCircle" title="Project not found"
     action={<button className="btn btn-primary" onClick={() => go("projects")}>Back</button>} />;
   const cust = db.cust(p.customer);
   const site = db.site(p.site);
@@ -501,10 +502,10 @@ export function ProjectDetail({ id }: { id: string }) {
     <div className="main-pad">
       <div style={{ marginBottom: 16 }}>
         <a onClick={() => go("projects")} style={{ font: "var(--t-small)", color: "var(--ink-mute)", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <Icon name="chevronLeft" size={14} /> All Main Contractor Jobs
+          <Icon name="chevronLeft" size={14} /> All Projects
         </a>
       </div>
-      <PageHeader eyebrow={"Main Contractor Job · " + p.code} title={p.name} sub={[cust?.name, site?.name].filter(Boolean).join(" · ") || "-"}
+      <PageHeader eyebrow={"Project · " + p.code} title={p.name} sub={[cust?.name, site?.name].filter(Boolean).join(" · ") || "-"}
         right={
           <div className="row gap-2" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
             <ChoicePill<ProjectStatus>
@@ -676,6 +677,11 @@ export function ProjectDetail({ id }: { id: string }) {
         </div>
       </section>
 
+      <MaterialRequestsSection
+        requests={db.materialRequestsForProject(id)}
+        title="Material requests"
+        emptyHint="Materials requested by technicians across this project's work orders will appear here." />
+
       <ProjectStatusHistory projectId={id} reloadKey={historyTick} />
 
       <section className="card card-pad" style={{ marginTop: 20 }}>
@@ -714,7 +720,7 @@ function ProjectManHoursKpi({ projectId }: { projectId: string }) {
   const total = workerHrs + subHrs;
   return (
     <KPI label="Total man-hours" value={`${total.toFixed(1)} hrs`}
-      sub={`${workerHrs.toFixed(1)} worker · ${subHrs.toFixed(1)} sub`} />
+      sub={`${workerHrs.toFixed(1)} team · ${subHrs.toFixed(1)} sub`} />
   );
 }
 
@@ -778,7 +784,7 @@ function ProjectManpowerKpi({ projectId }: { projectId: string }) {
   const total = workers + subs;
   return (
     <KPI label="Manpower" value={total}
-      sub={`${workers} worker${workers === 1 ? "" : "s"} · ${subs} sub${subs === 1 ? "" : "s"}`} />
+      sub={`${workers} team member${workers === 1 ? "" : "s"} · ${subs} sub${subs === 1 ? "" : "s"}`} />
   );
 }
 
@@ -967,9 +973,9 @@ export function Repair() {
   if (scope === "hidden") {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Service support" title="Repair tickets" />
+        <PageHeader eyebrow="Service support" title="Repair Services" />
         <EmptyState icon="shield" title="Not available for your role"
-          sub="Repair tickets are visible to Operations Manager, Admin, MD, Service Support, and Lead Technicians." />
+          sub="Repair Services are visible to Operations Manager, Admin, MD, Service Support, and Lead Technicians." />
       </div>
     );
   }
@@ -990,9 +996,9 @@ export function Repair() {
       })();
   return (
     <div className="main-pad">
-      <PageHeader eyebrow="Service support" title="Repair tickets" sub="Own products + 3rd-party · multi-visit · SLA-tracked"
+      <PageHeader eyebrow="Service support" title="Repair Services" sub="Own products + 3rd-party · multi-visit · SLA-tracked"
         right={can(role, "CREATE_REPAIR")
-          ? <button className="btn btn-primary" onClick={() => openCreate("repair")}><Icon name="plus" size={14} /> Log ticket</button>
+          ? <button className="btn btn-primary" onClick={() => openCreate("repair")}><Icon name="plus" size={14} /> Log service</button>
           : undefined} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
@@ -1065,7 +1071,7 @@ export function RepairDetail({ id }: { id: string }) {
   if (!t) {
     return (
       <div className="main-pad">
-        <EmptyState icon="alertCircle" title="Repair ticket not found"
+        <EmptyState icon="alertCircle" title="Repair Service not found"
           action={<button className="btn btn-primary" onClick={() => router.push("/repair")}>Back to repairs</button>} />
       </div>
     );
@@ -1111,7 +1117,7 @@ export function RepairDetail({ id }: { id: string }) {
       <div style={{ marginBottom: 16 }}>
         <a onClick={() => router.push("/repair")}
            style={{ font: "var(--t-small)", color: "var(--ink-mute)", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <Icon name="chevronLeft" size={14} /> All repair tickets
+          <Icon name="chevronLeft" size={14} /> All Repair Services
         </a>
       </div>
 
@@ -1825,7 +1831,7 @@ export function Reports() {
           {([
             { k: "project", label: "Projects" },
             { k: "sub",     label: "Sub-contractors" },
-            { k: "worker",  label: "Workers" },
+            { k: "worker",  label: "Team" },
           ] as { k: ReportTab; label: string }[]).map(t => (
             <button key={t.k}
               className={"btn btn-sm " + (tab === t.k ? "btn-primary" : "btn-ghost")}
@@ -2028,7 +2034,7 @@ function ProjectReport() {
   const onExport = () => {
     downloadCsv(
       `project-report-${todayYmd()}.csv`,
-      ["Type", "Code", "Title", "Status", "Total Hours", "Worker Hours", "Sub Hours", "Manpower", "Workers", "Subs"],
+      ["Type", "Code", "Title", "Status", "Total Hours", "Team Hours", "Sub Hours", "Manpower", "Team", "Subs"],
       sorted.map(r => [
         TYPE_LABEL[r.type], r.code, r.title, r.status,
         r.totalHrs.toFixed(2), r.workerHrs.toFixed(2), r.subHrs.toFixed(2),
@@ -2057,7 +2063,7 @@ function ProjectReport() {
               <select className="input input-sm" value={typeF}
                       onChange={e => setTypeF(e.target.value as TypeFilter)}>
                 <option value="all">All</option>
-                <option value="main_contractor">Main Contractor</option>
+                <option value="main_contractor">Project</option>
                 <option value="amc">AMC</option>
                 <option value="repair">Repair</option>
               </select>
@@ -2084,10 +2090,10 @@ function ProjectReport() {
                 <SortHead<ProjectSortKey> k="title"     current={sortKey} dir={sortDir} onSort={onSort}>Title</SortHead>
                 <SortHead<ProjectSortKey> k="status"    current={sortKey} dir={sortDir} onSort={onSort}>Status</SortHead>
                 <SortHead<ProjectSortKey> k="totalHrs"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Total hrs</SortHead>
-                <SortHead<ProjectSortKey> k="workerHrs" current={sortKey} dir={sortDir} onSort={onSort} align="right">Worker hrs</SortHead>
+                <SortHead<ProjectSortKey> k="workerHrs" current={sortKey} dir={sortDir} onSort={onSort} align="right">Team hrs</SortHead>
                 <SortHead<ProjectSortKey> k="subHrs"    current={sortKey} dir={sortDir} onSort={onSort} align="right">Sub hrs</SortHead>
                 <SortHead<ProjectSortKey> k="manpower"  current={sortKey} dir={sortDir} onSort={onSort} align="right">Manpower</SortHead>
-                <SortHead<ProjectSortKey> k="workers"   current={sortKey} dir={sortDir} onSort={onSort} align="right"># Workers</SortHead>
+                <SortHead<ProjectSortKey> k="workers"   current={sortKey} dir={sortDir} onSort={onSort} align="right"># Team</SortHead>
                 <SortHead<ProjectSortKey> k="subs"      current={sortKey} dir={sortDir} onSort={onSort} align="right"># Subs</SortHead>
               </tr>
             </thead>
@@ -2118,10 +2124,10 @@ function ProjectReport() {
                       <td data-th="Title" style={{ font: "var(--t-small)" }}>{r.title}</td>
                       <td data-th="Status" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{r.status}</td>
                       <td data-th="Total hrs" className="numeric" style={{ textAlign: "right", fontWeight: 600 }}>{r.totalHrs > 0 ? r.totalHrs.toFixed(1) : "—"}</td>
-                      <td data-th="Worker hrs" className="numeric" style={{ textAlign: "right" }}>{r.workerHrs > 0 ? r.workerHrs.toFixed(1) : "—"}</td>
+                      <td data-th="Team hrs" className="numeric" style={{ textAlign: "right" }}>{r.workerHrs > 0 ? r.workerHrs.toFixed(1) : "—"}</td>
                       <td data-th="Sub hrs" className="numeric" style={{ textAlign: "right" }}>{r.subHrs > 0 ? r.subHrs.toFixed(1) : "—"}</td>
                       <td data-th="Manpower" className="numeric" style={{ textAlign: "right" }}>{r.manpower > 0 ? r.manpower : "—"}</td>
-                      <td data-th="# Workers" className="numeric" style={{ textAlign: "right" }}>{r.workers > 0 ? r.workers : "—"}</td>
+                      <td data-th="# Team" className="numeric" style={{ textAlign: "right" }}>{r.workers > 0 ? r.workers : "—"}</td>
                       <td data-th="# Subs" className="numeric" style={{ textAlign: "right" }}>{r.subs > 0 ? r.subs : "—"}</td>
                     </tr>
                     {isOpen && (
@@ -2143,7 +2149,7 @@ function ProjectReport() {
 }
 
 const TYPE_LABEL: Record<ProjectType, string> = {
-  main_contractor: "Main Contractor",
+  main_contractor: "Project",
   amc: "AMC",
   repair: "Repair",
 };
@@ -2311,12 +2317,12 @@ function ProjectBreakdownPanel({ containerId, from, to }: { containerId: string;
         <div className="row gap-2" style={{ alignItems: "center", marginBottom: 8 }}>
           <Icon name="users" size={14} style={{ color: "var(--ink-mute)" }} />
           <span style={{ font: "var(--t-small)", fontWeight: 600 }}>
-            Workers ({workers.length})
+            Team ({workers.length})
           </span>
         </div>
         {workers.length === 0 ? (
           <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: "8px 0" }}>
-            No worker hours logged in this range.
+            No team hours logged in this range.
           </div>
         ) : (
           <table className="table" style={{ font: "var(--t-small)" }}>
@@ -2631,7 +2637,7 @@ function WorkerReport() {
 
   const onExport = () => {
     downloadCsv(
-      `worker-report-${todayYmd()}.csv`,
+      `team-report-${todayYmd()}.csv`,
       ["Name", "Role", "Total Hours", "# Projects", "# WOs", "Last Entry"],
       sorted.map(r => [
         r.name, ROLE_LABELS[r.role as keyof typeof ROLE_LABELS] ?? r.role,

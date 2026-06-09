@@ -212,7 +212,7 @@ function WoTableRow({ wo, onClick, showAssigned = true }: { wo: WorkOrder; onCli
         {wo.durationMinutes > 0 ? formatDuration(wo.durationMinutes) : "-"}
         {wo.actualWorkersCount > 1 && (
           <div style={{ font: "var(--t-micro)", color: "var(--ink-quiet)", marginTop: 2 }}>
-            {wo.actualWorkersCount} workers
+            {wo.actualWorkersCount} team members
           </div>
         )}
       </td>

@@ -12,6 +12,7 @@ import { db, ROLE_LABELS } from "@/lib/db";
 import type { IconName, Role, WoStatus, WorkOrder, WorkOrderSubContractorHours, WorkOrderTimeEntry } from "@/lib/types";
 import { CardHead, ChoicePill, EmptyState, Modal, SlideOver, StatusBadge } from "./shared";
 import { NotificationDropdown } from "./notifications";
+import { MaterialRequestsSection } from "./modules/MaterialRequests";
 import { navigateTo } from "@/lib/maps";
 import {
   updateWorkOrder, WORK_ORDER_STATUSES, WO_STATUS_LABEL,
@@ -51,9 +52,9 @@ export function CommandPalette() {
     { id: "scheduling", label: "Scheduling", kind: "Page", icon: "calendar" as IconName },
     { id: "customers", label: "Customers", kind: "Page", icon: "building" as IconName },
     { id: "sites", label: "Sites", kind: "Page", icon: "mapPin" as IconName },
-    { id: "repair", label: "Repair tickets", kind: "Page", icon: "wrench" as IconName },
+    { id: "repair", label: "Repair Services", kind: "Page", icon: "wrench" as IconName },
     { id: "inventory", label: "Inventory", kind: "Page", icon: "package" as IconName },
-    { id: "projects", label: "Main Contractor Jobs", kind: "Page", icon: "briefcase" as IconName },
+    { id: "projects", label: "Projects", kind: "Page", icon: "briefcase" as IconName },
     { id: "reports", label: "Reports", kind: "Page", icon: "chartBar" as IconName },
   ] as const).map(x => ({ ...x, type: "nav" as const }));
 
@@ -171,7 +172,7 @@ function ThreadMsg({ who, t, body }: { who: string; t: string; body: string }) {
 }
 function sourceLabel(src: { kind: string; id: string }) {
   if (!src) return "-";
-  if (src.kind === "project") { const p = db.proj(src.id); return p ? p.code + " · Main Contractor Job" : "Main Contractor Job"; }
+  if (src.kind === "project") { const p = db.proj(src.id); return p ? p.code + " · Project" : "Project"; }
   if (src.kind === "amc") { const a = db.amc(src.id); return a ? a.code + " · AMC" : "AMC"; }
   if (src.kind === "repair") { const r = db.REPAIRS[src.id]; return r ? r.code + " · Repair" : "Repair"; }
   return src.kind;
@@ -415,7 +416,7 @@ function ActiveMultiLine({ entries }: { entries: WorkOrderTimeEntry[] }) {
       <div className="row gap-2" style={{ alignItems: "center", marginBottom: 10 }}>
         <span className="dot dot-success" style={{ flexShrink: 0 }} />
         <span style={{ font: "var(--t-body-md)", fontWeight: 600 }}>
-          {entries.length} workers active
+          {entries.length} team members active
         </span>
       </div>
       <div className="col gap-1" style={{ paddingLeft: 18 }}>
@@ -452,7 +453,7 @@ function CompletedSummary({ wo, entries }: { wo: WorkOrder; entries: WorkOrderTi
         <div>
           <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
                         textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
-            Workers
+            Team
           </div>
           <div className="numeric" style={{ font: "var(--t-h3)", marginTop: 2 }}>
             {wo.actualWorkersCount || entries.length}
@@ -465,7 +466,7 @@ function CompletedSummary({ wo, entries }: { wo: WorkOrder; entries: WorkOrderTi
         textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,
         marginBottom: 8,
       }}>
-        Worker entries
+        Team entries
       </div>
       <div className="col gap-2">
         {entries.map(e => <CompletedEntryRow key={e.id} e={e} />)}
@@ -814,7 +815,7 @@ export function WoSlideover() {
                   onClick={() => setShowAddCrew(v => !v)}
                   disabled={crewBusy}>
                   <Icon name={showAddCrew ? "x" : "plus"} size={13} />
-                  {showAddCrew ? " Cancel" : " Add worker"}
+                  {showAddCrew ? " Cancel" : " Add team member"}
                 </button>
               ) : undefined} />
             <div className="col gap-2">
@@ -1003,24 +1004,41 @@ export function WoSlideover() {
         </section>
       )}
 
-      {tab === "materials" && (
-        <section className="card card-pad">
-          <CardHead title="Materials allocated" right={<button className="btn btn-ghost btn-sm"><Icon name="plus" size={14} /> Request more</button>} />
-          {(!wo.materials || wo.materials.length === 0) ? (
-            <EmptyState icon="package" title="No materials allocated" sub="This work order doesn't require materials from stock." />
-          ) : (
-            <div className="col gap-2">
-              {wo.materials.map((m, i) => (
-                <div key={i} className="row gap-3" style={{ padding: 12, borderRadius: "var(--r-md)", background: "var(--bg-muted)" }}>
-                  <Icon name="package" size={16} style={{ color: "var(--ink-mute)" }} />
-                  <span style={{ flex: 1, font: "var(--t-body)" }}>{m}</span>
-                  <span className="badge badge-success"><Icon name="check" size={11} /> Ready</span>
+      {tab === "materials" && (() => {
+        void dataVersion; // re-read MR mirror after a request / status change
+        const assignedToMe = (wo.assigned ?? []).includes(me.id) || wo.assignedLead === me.id;
+        const isManager = role === "admin" || role === "md" || role === "manager";
+        const canRequest = can(role, "CREATE_MATERIAL_REQUEST") && (assignedToMe || isManager);
+        const requests = db.materialRequestsForWO(wo.id);
+        return (
+          <>
+            <section className="card card-pad">
+              <CardHead title="Materials allocated" />
+              {(!wo.materials || wo.materials.length === 0) ? (
+                <EmptyState icon="package" title="No materials allocated" sub="This work order doesn't require materials from stock." />
+              ) : (
+                <div className="col gap-2">
+                  {wo.materials.map((m, i) => (
+                    <div key={i} className="row gap-3" style={{ padding: 12, borderRadius: "var(--r-md)", background: "var(--bg-muted)" }}>
+                      <Icon name="package" size={16} style={{ color: "var(--ink-mute)" }} />
+                      <span style={{ flex: 1, font: "var(--t-body)" }}>{m}</span>
+                      <span className="badge badge-success"><Icon name="check" size={11} /> Ready</span>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-        </section>
-      )}
+              )}
+            </section>
+            <MaterialRequestsSection
+              requests={requests}
+              canRequest={canRequest}
+              onRequest={() => openCreate("material_request", { work_order_id: wo.id })}
+              emptyHint={canRequest
+                ? "Need something to finish the job? Raise a material request — the manager is notified to review and procure."
+                : "Material requests raised on this work order will appear here."}
+            />
+          </>
+        );
+      })()}
 
       {tab === "replacements" && (
         <WoReplacementsTab
@@ -1520,7 +1538,7 @@ function WoReplacementsTab({
         <EmptyState icon="package" title="No replacement requests yet"
           sub={canRequest
             ? "If you discover something on-site that needs replacing, raise it here."
-            : "Workers and Lead Techs raise replacement requests from this tab."} />
+            : "Team members and Lead Techs raise replacement requests from this tab."} />
       ) : (
         <div className="col" style={{ gap: 8 }}>
           {rrs.map(r => {

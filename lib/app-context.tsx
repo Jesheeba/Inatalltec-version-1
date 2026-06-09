@@ -19,6 +19,8 @@ export type RouteName =
   | "dashboard" | "workorders" | "feed" | "scheduling" | "approvals"
   | "projects" | "amc" | "repair" | "inventory" | "logistics"
   | "replacements"
+  // Material Requests — on-site procurement workflow (migration 0038).
+  | "material-requests"
   // Growth Plan — calendar/planner aggregating projects, AMC visits, WOs.
   | "growth-plan"
   // Sub-contractors directory (migration 0023).
@@ -144,7 +146,7 @@ const NAME_FROM_PATH = (path: string): RouteName => {
   // first hyphen and silently fell back to "dashboard".
   const m = path.match(/^\/([a-z-]+)/);
   const name = (m ? m[1] : "dashboard") as RouteName;
-  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "growth-plan", "sub-contractors", "customers", "sites", "team", "reports", "accountant", "quotations", "admin", "notifications", "organizations", "admins"];
+  const known: RouteName[] = ["dashboard", "workorders", "feed", "scheduling", "approvals", "projects", "amc", "repair", "inventory", "logistics", "replacements", "material-requests", "growth-plan", "sub-contractors", "customers", "sites", "team", "reports", "accountant", "quotations", "admin", "notifications", "organizations", "admins"];
   return known.includes(name) ? name : "dashboard";
 };
 
@@ -198,6 +200,8 @@ export function AppProvider({
       for (const d of initialBundle.amcDocuments) db.AMC_DOCUMENTS[d.id] = d;
       for (const a of initialBundle.approvals) db.APPROVALS[a.id] = a;
       for (const r of initialBundle.replacements) db.REPLACEMENTS[r.id] = r;
+      for (const m of initialBundle.materialRequests) db.MATERIAL_REQUESTS[m.id] = m;
+      for (const d of initialBundle.replacementDocuments) db.REPLACEMENT_DOCUMENTS[d.id] = d;
     }
     return true;
   });
@@ -433,7 +437,7 @@ export function AppProvider({
       entries.sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""));
       const latest = entries[0];
       const iso = latest?.endedAt ?? wo.scheduledEnd ?? wo.scheduledStart;
-      const workerName = latest?.userId ? db.user(latest.userId).name : "A worker";
+      const workerName = latest?.userId ? db.user(latest.userId).name : "A team member";
       out.push({
         id:       `pc_wo_${wo.id}`,
         t:        rel(iso),

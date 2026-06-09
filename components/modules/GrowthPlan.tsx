@@ -22,7 +22,7 @@ import { useApp } from "@/lib/app-context";
 import { db } from "@/lib/db";
 import { PROJECT_PHASE_COLOR, PROJECT_PHASE_LABEL } from "@/lib/phases";
 import {
-  CardHead, EmptyState, PageHeader, SignOutButton,
+  CardHead, EmptyState, PageHeader,
 } from "../shared";
 import {
   dayKey, formatEventTime, getCalendarEvents,
@@ -184,7 +184,6 @@ export function GrowthPlan() {
         eyebrow="Workspace"
         title="Growth Plan"
         sub="Plan the next 3 months — projects, AMC visits, work orders, and people"
-        right={<SignOutButton />}
       />
 
       <FilterBar

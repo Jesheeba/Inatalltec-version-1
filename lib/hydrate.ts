@@ -11,8 +11,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
   AmcContract, AmcDocument, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
+  MaterialRequest, MaterialRequestStatus, MaterialRequestUrgency,
   Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
-  ReplacementRequest, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
+  ReplacementRequest, ReplacementDocument, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
   WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
 } from "./types";
 import { formatShortDate } from "./dates";
@@ -66,6 +67,11 @@ export interface HydrationBundle {
   amcDocuments: AmcDocument[];
   approvals: Approval[];
   replacements: ReplacementRequest[];
+  materialRequests: MaterialRequest[];
+  // Migration 0039 — supporting documents attached to replacements. The
+  // refund photo itself lives on the replacement row (refundPhoto* fields),
+  // not here. Hydrated for everyone who can read replacement_requests.
+  replacementDocuments: ReplacementDocument[];
 }
 
 type Row = Record<string, unknown>;
@@ -187,6 +193,9 @@ function mapAmc(r: Row): AmcContract {
     nextDue: asString(r.next_due_label, "-"),
     overdueDays: asNumber(r.overdue_days),
     freeCalls: asNumber(r.free_calls_used),
+    // Free-call entitlement config (migration 0037). NULL mode = unset.
+    freeCallsMode: ((r.free_calls_mode as AmcContract["freeCallsMode"]) ?? null),
+    freeCallsIncluded: r.free_calls_included == null ? null : asNumber(r.free_calls_included),
     expiresAt: asString(r.expires_at),
     // Pause/renewal fields. suspendedAt / suspendedReason exist since
     // 0009b; pausedBy / resumedAt / firstPaymentDueAt / renewedFromId
@@ -213,6 +222,20 @@ function mapAmcDocument(r: Row): AmcDocument {
     mimeType:      (r.mime_type as string | null) ?? null,
     uploadedBy:    (r.uploaded_by as string | null) ?? null,
     uploadedAt:    asString(r.uploaded_at),
+  };
+}
+
+// Migration 0039 — replacement document metadata row.
+function mapReplacementDocument(r: Row): ReplacementDocument {
+  return {
+    id:                   asString(r.id),
+    replacementRequestId: asString(r.replacement_request_id),
+    fileName:             asString(r.file_name),
+    filePath:             asString(r.file_path),
+    fileSizeBytes:        (r.file_size_bytes as number | null) ?? null,
+    mimeType:             (r.mime_type as string | null) ?? null,
+    uploadedBy:           (r.uploaded_by as string | null) ?? null,
+    uploadedAt:           asString(r.uploaded_at),
   };
 }
 
@@ -423,6 +446,41 @@ function mapReplacement(r: Row): ReplacementRequest {
     rejectedBy:       (r.rejected_by as string | null) ?? null,
     rejectedAt:       (r.rejected_at as string | null) ?? null,
     rejectionReason:  (r.rejection_reason as string | null) ?? null,
+    refundPhotoPath:       (r.refund_photo_path as string | null) ?? null,
+    refundPhotoName:       (r.refund_photo_name as string | null) ?? null,
+    refundPhotoUploadedBy: (r.refund_photo_uploaded_by as string | null) ?? null,
+    refundPhotoUploadedAt: (r.refund_photo_uploaded_at as string | null) ?? null,
+    createdAt:        asString(r.created_at),
+    updatedAt:        asString(r.updated_at),
+  };
+}
+
+function mapMaterialRequest(r: Row): MaterialRequest {
+  return {
+    id:               asString(r.id),
+    code:             asString(r.code),
+    workOrderId:      (r.work_order_id as string | null) ?? null,
+    projectId:        (r.project_id as string | null) ?? null,
+    amcContractId:    (r.amc_contract_id as string | null) ?? null,
+    repairTicketId:   (r.repair_ticket_id as string | null) ?? null,
+    customerId:       asString(r.customer_id),
+    siteId:           (r.site_id as string | null) ?? null,
+    itemName:         asString(r.item_name),
+    quantity:         asNumber(r.quantity, 1),
+    urgency:          ((r.urgency as MaterialRequestUrgency) ?? "normal"),
+    notes:            (r.notes as string | null) ?? null,
+    status:           ((r.status as MaterialRequestStatus) ?? "pending"),
+    requestedBy:      (r.requested_by as string | null) ?? null,
+    requestedAt:      asString(r.requested_at),
+    approvedBy:       (r.approved_by as string | null) ?? null,
+    approvedAt:       (r.approved_at as string | null) ?? null,
+    approvalNote:     (r.approval_note as string | null) ?? null,
+    rejectedBy:       (r.rejected_by as string | null) ?? null,
+    rejectedAt:       (r.rejected_at as string | null) ?? null,
+    rejectionReason:  (r.rejection_reason as string | null) ?? null,
+    fulfilledBy:      (r.fulfilled_by as string | null) ?? null,
+    fulfilledAt:      (r.fulfilled_at as string | null) ?? null,
+    fulfillmentNote:  (r.fulfillment_note as string | null) ?? null,
     createdAt:        asString(r.created_at),
     updatedAt:        asString(r.updated_at),
   };
@@ -487,7 +545,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     customersRaw, sitesRaw, teamsRaw, projectsRaw, milestonesRaw,
     amcsRaw, amcServicesRaw, repairsRaw, workOrdersRaw, woAssignRaw, approvalsRaw, approvalStepsRaw, usersRaw,
     replacementsRaw, woTimeEntriesRaw, subContractorsRaw, woSubContractorsRaw, woSubHoursRaw,
-    freeCallsRaw, quotationsRaw, woTasksRaw, amcDocumentsRaw,
+    freeCallsRaw, quotationsRaw, woTasksRaw, amcDocumentsRaw, materialRequestsRaw,
+    replacementDocumentsRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -511,6 +570,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "quotations"),
     fetchAll(admin, "work_order_tasks"),
     fetchAll(admin, "amc_documents"),
+    fetchAll(admin, "material_requests"),
+    fetchAll(admin, "replacement_documents"),
   ]);
 
   // Group milestones by project_id.
@@ -579,5 +640,7 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     amcDocuments: amcDocumentsRaw.map(mapAmcDocument),
     approvals: approvalsRaw.map(r => mapApproval(r, stepsByApproval.get(asString(r.id)) ?? [])),
     replacements: replacementsRaw.map(mapReplacement),
+    materialRequests: materialRequestsRaw.map(mapMaterialRequest),
+    replacementDocuments: replacementDocumentsRaw.map(mapReplacementDocument),
   };
 }

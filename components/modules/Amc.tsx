@@ -17,13 +17,31 @@ import {
   type AmcPaymentMethod,
 } from "@/lib/create";
 import { RenewAmcModal } from "../RenewAmcModal";
+import { MaterialRequestsSection } from "./MaterialRequests";
 import { can, listScopeFor } from "@/lib/permissions";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import { formatLongDate, formatLongDateTime } from "@/lib/dates";
 import type { AmcContract, AmcDocument, AmcStatus, User } from "@/lib/types";
 import {
-  CardHead, ChoicePill, EmptyState, FilterBar, KPI, PageHeader, StatusBadge, WoCard,
+  CardHead, ChoicePill, EmptyState, FilterBar, FreeCallsModePicker, KPI, PageHeader, StatusBadge, WoCard,
+  type FreeCallsModeValue,
 } from "../shared";
+
+// Free-call entitlement helpers (migration 0037). Centralise the
+// "unset / limited / unlimited / none" display logic so the detail KPI,
+// the FreeCallsCard, and the contract-list indicator all agree.
+function freeCallsUnset(c: AmcContract): boolean {
+  return c.freeCallsMode == null;
+}
+// Short sub-label for the "Free calls used" KPI on the detail page.
+function freeCallsKpiSub(c: AmcContract): string {
+  switch (c.freeCallsMode) {
+    case "limited":   return `of ${c.freeCallsIncluded ?? 0} included`;
+    case "unlimited": return "Unlimited";
+    case "none":      return "None included";
+    default:          return "No free calls assigned";
+  }
+}
 
 // Color tokens for each amc_status — fed to ChoicePill so the pill
 // background tracks the StatusBadge styling defined in shared.tsx.
@@ -80,6 +98,15 @@ function AmcRow({ c, onClick }: { c: AmcContract; onClick: () => void }) {
       <td data-th="Customer">
         <div style={{ font: "var(--t-body-md)" }}>{cust?.name ?? "-"}</div>
         <div style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{site?.name ?? "-"}</div>
+        {freeCallsUnset(c) && (
+          <div className="row gap-1" style={{ marginTop: 3, alignItems: "center" }}
+               title="Free calls not configured on this contract">
+            <span className="dot dot-danger" style={{ flexShrink: 0 }} />
+            <span style={{ font: "var(--t-micro)", color: "var(--dan-700)", fontWeight: 600 }}>
+              Free calls not set
+            </span>
+          </div>
+        )}
       </td>
       <td data-th="Services" className="hide-mobile">
         <div className="numeric" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{c.services.done}/{c.services.total}</div>
@@ -753,11 +780,21 @@ export function AmcDetail({ id }: { id: string }) {
           value={(scheduleStats?.done ?? c.services.done) + " / " + (scheduleStats?.total ?? c.services.total)}
           sub={"Next: " + (scheduleStats?.nextDue ?? c.nextDue)}
         />
-        <KPI label="Free calls used" value={c.freeCalls} sub="of 10 included" />
+        <KPI label="Free calls used" value={c.freeCalls}
+          sub={freeCallsUnset(c)
+            ? <span style={{ color: "var(--dan-700)", fontWeight: 600 }}>
+                <Icon name="alertTriangle" size={12} /> No free calls assigned
+              </span>
+            : freeCallsKpiSub(c)} />
         <KPI label="Expires" value={c.expiresAt} />
       </div>
 
       <FreeCallsCard amc={c} />
+
+      <MaterialRequestsSection
+        requests={db.materialRequestsForAmc(id)}
+        title="Material requests"
+        emptyHint="Materials requested by technicians across this contract's work orders will appear here." />
 
       {showTentativeVisits && <TentativeVisitsCard amc={c} />}
 
@@ -1137,35 +1174,133 @@ function AmcDocumentsCard({ amcId, canUpload }: { amcId: string; canUpload: bool
    Renders a count + threshold widget plus a list of logged calls.
    Admin / md / manager / lead_worker can log new ones.
    The DB enforces the same via amc_freecalls_write policy. */
-const FREE_CALLS_INCLUDED = 10;
 function FreeCallsCard({ amc }: { amc: AmcContract }) {
-  const { role, openCreate, openWO, dataVersion } = useApp();
+  const { role, openCreate, openWO, dataVersion, bumpData, fireToast } = useApp();
   const canCreateWo = can(role, "CREATE_WORK_ORDER");
   void dataVersion;
   const used = amc.freeCalls ?? 0;
   const entries = db.freeCallsForAmc(amc.id);
-  const thresholdHit = used >= FREE_CALLS_INCLUDED;
+  const mode = amc.freeCallsMode;
+  const cap = amc.freeCallsIncluded ?? 0;
+  const unset = mode == null;
+  // Threshold only meaningful for a capped contract.
+  const thresholdHit = mode === "limited" && used >= cap;
   const canLog = role === "admin" || role === "md" || role === "manager" || role === "lead_worker" || role === "accounts";
+  // Editing free-call terms is an AMC-management action (admin / md / manager).
+  const canConfigure = can(role, "CREATE_AMC");
+  // A "none" contract includes no free calls, so logging is blocked.
+  const logBlocked = mode === "none";
 
-  if (typeof window !== "undefined") {
-    // eslint-disable-next-line no-console
-    console.log("[FreeCallsCard] rendering for AMC", amc?.code,
-      "used=", used, "included=", FREE_CALLS_INCLUDED,
-      "role=", role, "canLog=", canLog, "entries=", entries.length);
-  }
+  // Inline configuration editor state.
+  const [editing, setEditing] = useState(false);
+  const [draftMode, setDraftMode] = useState<FreeCallsModeValue | null>(mode);
+  const [draftCount, setDraftCount] = useState(cap ? String(cap) : "10");
+  const [saving, setSaving] = useState(false);
+
+  const openEditor = () => {
+    setDraftMode(mode);
+    setDraftCount(cap ? String(cap) : "10");
+    setEditing(true);
+  };
+  const saveConfig = async () => {
+    if (draftMode === "limited" && (!draftCount || Number(draftCount) <= 0)) {
+      fireToast("Enter how many free calls are included.");
+      return;
+    }
+    const includedToSend = draftMode === "limited" ? Number(draftCount) : null;
+    setSaving(true);
+    // Optimistic mirror update so the KPI + warning flip instantly.
+    const prev = db.AMCS[amc.id];
+    db.AMCS[amc.id] = { ...prev, freeCallsMode: draftMode, freeCallsIncluded: includedToSend };
+    bumpData();
+    const res = await updateAmc(amc.id, {
+      free_calls_mode: draftMode,
+      free_calls_included: includedToSend,
+    });
+    setSaving(false);
+    if (!res.ok) {
+      db.AMCS[amc.id] = prev;
+      bumpData();
+      fireToast(`Couldn't update free calls: ${res.error}`);
+      return;
+    }
+    setEditing(false);
+    fireToast(draftMode == null ? "Free calls configuration cleared" : "Free calls updated");
+  };
+
+  const headSub =
+    unset                ? "Not configured" :
+    mode === "limited"   ? `${used} of ${cap} included` :
+    mode === "unlimited" ? `${used} used · Unlimited` :
+                           "No free calls included";
 
   return (
     <section className="card card-pad" data-testid="free-calls-card" style={{ marginTop: 20 }}>
       <CardHead
         title="Free calls"
-        sub={`${used} of ${FREE_CALLS_INCLUDED} included`}
-        right={canLog ? (
-          <button className="btn btn-primary btn-sm"
-                  onClick={() => openCreate("free_call", { amc_id: amc.id, code: amc.code })}>
-            <Icon name="plus" size={13} /> Log free call
-          </button>
-        ) : undefined}
+        sub={headSub}
+        right={
+          <div className="row gap-2">
+            {canConfigure && !editing && (
+              <button className="btn btn-ghost btn-sm" onClick={openEditor}>
+                <Icon name="cog" size={13} /> {unset ? "Configure" : "Edit"}
+              </button>
+            )}
+            {canLog && (
+              <button className="btn btn-primary btn-sm" disabled={logBlocked}
+                      title={logBlocked ? "This contract includes no free calls" : undefined}
+                      onClick={() => openCreate("free_call", { amc_id: amc.id, code: amc.code })}>
+                <Icon name="plus" size={13} /> Log free call
+              </button>
+            )}
+          </div>
+        }
       />
+
+      {editing && (
+        <div className="card card-pad" style={{ background: "var(--bg-muted)", marginBottom: 12 }}>
+          <div className="field-label" style={{ marginBottom: 8 }}>Free calls included</div>
+          <FreeCallsModePicker
+            mode={draftMode} count={draftCount}
+            onModeChange={setDraftMode} onCountChange={setDraftCount}
+            disabled={saving}
+          />
+          <div className="row gap-2" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+            <button className="btn btn-ghost btn-sm" disabled={saving}
+                    onClick={() => setEditing(false)}>Cancel</button>
+            <button className="btn btn-primary btn-sm" disabled={saving} onClick={saveConfig}>
+              {saving
+                ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
+                : <><Icon name="check" size={13} /> Save</>}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {unset && !editing && (
+        <div className="row gap-2" style={{
+          alignItems: "center", padding: "8px 12px", marginBottom: 12,
+          borderRadius: "var(--r-md)",
+          background: "var(--dan-100)", color: "var(--dan-700)",
+          font: "var(--t-small)",
+        }}>
+          <Icon name="alertTriangle" size={14} />
+          No free calls assigned — {canConfigure
+            ? "configure this contract's free-call terms."
+            : "ask a manager to configure the free-call terms."}
+        </div>
+      )}
+      {mode === "none" && !editing && (
+        <div className="row gap-2" style={{
+          alignItems: "center", padding: "8px 12px", marginBottom: 12,
+          borderRadius: "var(--r-md)",
+          background: "var(--bg-muted)", color: "var(--ink-mute)",
+          font: "var(--t-small)",
+        }}>
+          <Icon name="alertCircle" size={14} />
+          This contract includes no free calls — visits are billable.
+        </div>
+      )}
       {thresholdHit && (
         <div className="row gap-2" style={{
           alignItems: "center", padding: "8px 12px", marginBottom: 12,

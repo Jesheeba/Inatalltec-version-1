@@ -23,7 +23,7 @@ import {
   updateQuotation, downloadQuotationFile,
 } from "@/lib/create";
 import {
-  EmptyState, FilterBar, KPI, PageHeader, SignOutButton,
+  EmptyState, FilterBar, KPI, PageHeader,
 } from "../shared";
 import type { Quotation, QuotationStatus } from "@/lib/types";
 
@@ -51,7 +51,7 @@ export function Quotations() {
   if (!ALLOWED_READ.has(role)) {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Sales" title="Quotations" right={<SignOutButton />} />
+        <PageHeader eyebrow="Sales" title="Quotations" />
         <EmptyState icon="shield" title="Not available for your role"
           sub="Quotations are managed by MD / Admin / Operations Manager / Sales." />
       </div>
@@ -124,16 +124,11 @@ export function Quotations() {
     <div className="main-pad">
       <PageHeader eyebrow="Sales" title="Quotations"
         sub="Quick tracker — title, value, status, convert"
-        right={
-          <div className="row gap-2">
-            {canWrite && (
-              <button className="btn btn-primary" onClick={() => openCreate("quotation_v2")}>
-                <Icon name="plus" size={14} /> New quotation
-              </button>
-            )}
-            <SignOutButton />
-          </div>
-        } />
+        right={canWrite ? (
+          <button className="btn btn-primary" onClick={() => openCreate("quotation_v2")}>
+            <Icon name="plus" size={14} /> New quotation
+          </button>
+        ) : undefined} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Total quotations" value={all.length} />
@@ -304,7 +299,7 @@ export function Quotations() {
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div style={{ padding: 24 }}>
               <div style={{ font: "var(--t-h3)", marginBottom: 8 }}>
-                Convert to {convertTarget.target === "project" ? "Main Contractor Job" : "AMC contract"}?
+                Convert to {convertTarget.target === "project" ? "Project" : "AMC contract"}?
               </div>
               <div style={{ font: "var(--t-body)", color: "var(--ink-mute)", marginBottom: 20 }}>
                 A new {convertTarget.target === "project" ? "project" : "AMC"} will be created using this

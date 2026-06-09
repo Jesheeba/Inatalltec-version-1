@@ -13,7 +13,7 @@ import { db, KPI_OPS, ROLE_LABELS } from "@/lib/db";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import {
   ApprovalCard, CardHead, EmptyState, FeedItem, KPI, PageHeader,
-  SignOutButton, StatusBadge, WoCard,
+  StatusBadge, WoCard,
 } from "../shared";
 import type { CalendarEvent, Project, RepairTicket, WoStatus, WorkOrder } from "@/lib/types";
 import {
@@ -683,8 +683,7 @@ export function Dashboard() {
     return (
       <div className="main-pad">
         <PageHeader eyebrow="Platform" title="Super Admin"
-          sub="Manage organizations, admins, and platform-wide settings."
-          right={<SignOutButton />} />
+          sub="Manage organizations, admins, and platform-wide settings." />
         <EmptyState icon="building" title="Welcome, Super Admin"
           sub="You sit above all tenants. Start by reviewing your organizations or creating a new one."
           action={<button className="btn btn-primary" onClick={() => go("organizations")}><Icon name="arrowRight" size={14} /> Go to Organizations</button>} />
@@ -796,17 +795,14 @@ function ManagerDashboard() {
         title={"Morning, " + me.name.split(" ")[0] + "."}
         sub={<><span style={{ color: "var(--ink)", fontWeight: 600 }}>4 decisions</span> waiting · 1 SLA at risk · DAMAC AMC-091 cleared payment overnight.</>}
         right={
-          <div className="row gap-2">
-            <div className="seg hide-mobile">
-              {TIMEFRAME_KEYS.map(tf => (
-                <button key={tf}
-                  data-on={String(timeframe === tf)}
-                  onClick={() => setTimeframe(tf)}>
-                  {TIMEFRAME_TAB_LABEL[tf]}
-                </button>
-              ))}
-            </div>
-            <SignOutButton />
+          <div className="seg hide-mobile">
+            {TIMEFRAME_KEYS.map(tf => (
+              <button key={tf}
+                data-on={String(timeframe === tf)}
+                onClick={() => setTimeframe(tf)}>
+                {TIMEFRAME_TAB_LABEL[tf]}
+              </button>
+            ))}
           </div>
         }
       />
@@ -842,10 +838,10 @@ function ManagerDashboard() {
       </div>
 
       <MyProjectsCard
-        title={"My Main Contractor jobs · " + period.label}
+        title={"My Projects · " + period.label}
         projects={myProjectsInPeriod}
         seeAllHref="/projects?manager=me&status=active"
-        emptyMessage={`No Main Contractor jobs active ${period.label.toLowerCase()}`}
+        emptyMessage={`No projects active ${period.label.toLowerCase()}`}
       />
 
       <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1.6fr) minmax(0, 1fr)" }}>
@@ -1024,10 +1020,10 @@ function FieldDashboard() {
 
       {role === "lead_worker" && (
         <MyProjectsCard
-          title="My Main Contractor jobs"
+          title="My Projects"
           projects={Object.values(db.PROJECTS).filter(p => p.leadTechId === me.id)}
           seeAllHref={`/projects?status=active`}
-          emptyMessage="No Main Contractor jobs assigned to you yet"
+          emptyMessage="No projects assigned to you yet"
         />
       )}
 
@@ -1194,7 +1190,6 @@ function MdDashboard() {
         eyebrow="Strategic overview · Q2 2025"
         title={"Good morning, " + me.name.split(" ")[0]}
         sub="14 active jobs · 42 AMCs live · 6 countries"
-        right={<SignOutButton />}
       />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 24 }}>
         <KPI accent="primary" label="MTD revenue" value={fmtMoney(1_280_000, { compact: true })} sub="8.2% vs LM" trend="up" />
@@ -1229,7 +1224,7 @@ function MdDashboard() {
             })}
           </div>
           <div className="row gap-3" style={{ marginTop: 8, font: "var(--t-small)", color: "var(--ink-mute)" }}>
-            <span><span className="dot dot-primary" /> Main Contractor</span>
+            <span><span className="dot dot-primary" /> Project</span>
             <span><span className="dot" style={{ background: "var(--sec-500)" }} /> AMC</span>
             <span><span className="dot" style={{ background: "var(--acc-500)" }} /> Repair</span>
           </div>
@@ -1315,19 +1310,18 @@ function SupportDashboard() {
   return (
     <div className="main-pad">
       <PageHeader eyebrow="Service desk" title="Repair queue"
-        sub={tickets.filter(t => t.state !== "Resolved").length + " open tickets · 2 SLA at risk"}
-        right={<SignOutButton />} />
+        sub={tickets.filter(t => t.state !== "Resolved").length + " open services · 2 SLA at risk"} />
       <CriticalAlertsWidget />
       <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginBottom: 24 }}>
-        <KPI accent="primary" label="Open tickets" value={tickets.filter(t => t.state !== "Resolved").length} />
+        <KPI accent="primary" label="Open services" value={tickets.filter(t => t.state !== "Resolved").length} />
         <KPI label="SLA at risk" value="2" sub="next breach in 12m" trend="down" />
         <KPI label="Avg resolution" value="3.2h" />
         <KPI label="Repeat-failure flags" value="1" sub="CAM-B-204" />
       </div>
       <div className="card" style={{ padding: 0 }}>
         <div className="row between" style={{ padding: 16 }}>
-          <h3 style={{ font: "var(--t-h3)", margin: 0 }}>All tickets</h3>
+          <h3 style={{ font: "var(--t-h3)", margin: 0 }}>All services</h3>
           <button className="btn btn-primary btn-sm" onClick={() => go("repair")}>Open repair module</button>
         </div>
         <div style={{ padding: 12 }}>
@@ -1347,7 +1341,7 @@ function AccountsDashboard() {
   // useAutoPauseExpiredAmcs hook here — they only consume the alert.
   return (
     <div className="main-pad">
-      <PageHeader eyebrow="Finance" title="Accounts overview" sub="Invoicing, payments, AMC billing" right={<SignOutButton />} />
+      <PageHeader eyebrow="Finance" title="Accounts overview" sub="Invoicing, payments, AMC billing" />
       <AmcPauseAlert />
       <CriticalAlertsWidget />
       <ActiveProjectsWidget />
@@ -1371,7 +1365,7 @@ function SalesDashboard() {
   const { fmtMoney } = useApp();
   return (
     <div className="main-pad">
-      <PageHeader eyebrow="Sales" title="My pipeline" sub={`11 quotes in flight · ${fmtMoney(14_200_000, { compact: true })} pipeline`} right={<SignOutButton />} />
+      <PageHeader eyebrow="Sales" title="My pipeline" sub={`11 quotes in flight · ${fmtMoney(14_200_000, { compact: true })} pipeline`} />
       <CriticalAlertsWidget />
       <ActiveProjectsWidget />
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", marginBottom: 24 }}>

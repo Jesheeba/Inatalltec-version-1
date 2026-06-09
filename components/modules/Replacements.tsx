@@ -19,7 +19,7 @@
 // so two simultaneous approvals don't overwrite each other.
 // ============================================================
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Icon } from "../Icon";
 import { useApp } from "@/lib/app-context";
@@ -29,8 +29,10 @@ import {
   markReplacementInstalled, rejectReplacement, sendBackReplacement,
   REPLACEMENT_STATUSES, REPLACEMENT_STATUS_LABEL, REPLACEMENT_STATUS_BADGE,
   REPLACEMENT_CONTEXT_LABEL,
+  uploadReplacementDocument, deleteReplacementDocument, getReplacementDocumentDownloadUrl,
+  setRefundPhoto, deleteRefundPhoto, REPLACEMENT_DOC_MAX_BYTES,
 } from "@/lib/create";
-import type { ReplacementContext, ReplacementRequest, ReplacementStatus } from "@/lib/types";
+import type { ReplacementContext, ReplacementDocument, ReplacementRequest, ReplacementStatus } from "@/lib/types";
 import {
   CardHead, EmptyState, FilterBar, KPI, Modal, PageHeader,
 } from "../shared";
@@ -177,7 +179,7 @@ export function ReplacementsList() {
         <EmptyState icon="package"
           title={visible.length === 0 ? "No replacement requests yet" : "No replacements match"}
           sub={visible.length === 0
-            ? "Workers can request from any active work order."
+            ? "Team members can request from any active work order."
             : "Try clearing the filters or searching for a different term."}
           action={visible.length === 0 && canRequest
             ? <button className="btn btn-primary" onClick={() => openCreate("replacement_request")}>
@@ -214,13 +216,23 @@ export function ReplacementsList() {
 function RrRow({ r, onClick }: { r: ReplacementRequest; onClick: () => void }) {
   const cust = db.cust(r.customerId);
   const requester = r.requestedBy ? db.user(r.requestedBy) : null;
+  // Attachment indicator — count of supporting docs + the refund photo.
+  const attachCount = db.docsForReplacement(r.id).length + (r.refundPhotoPath ? 1 : 0);
   return (
     <tr onClick={onClick}>
       <td data-th="Code" className="numeric" style={{ fontFamily: "var(--font-mono)", font: "var(--t-small)", color: "var(--ink-mute)" }}>
         {r.code || "—"}
       </td>
       <td data-th="Item">
-        <div className="truncate" style={{ font: "var(--t-body-md)", maxWidth: 320 }} title={r.itemName}>{r.itemName}</div>
+        <div className="row gap-2" style={{ maxWidth: 320 }}>
+          <span className="truncate" style={{ font: "var(--t-body-md)" }} title={r.itemName}>{r.itemName}</span>
+          {attachCount > 0 && (
+            <span className="row gap-1" title={`${attachCount} attachment${attachCount === 1 ? "" : "s"}`}
+              style={{ font: "var(--t-micro)", color: "var(--ink-mute)", flexShrink: 0 }}>
+              <Icon name="paperclip" size={11} /> {attachCount}
+            </span>
+          )}
+        </div>
         {r.reason && (
           <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)", maxWidth: 320 }} title={r.reason}>
             {r.reason}
@@ -364,7 +376,7 @@ export function ReplacementDetail({ id }: { id: string }) {
             })()}
             {r.repairTicketId && (() => {
               const rep = db.REPAIRS[r.repairTicketId];
-              return <KvLink k="Repair ticket" code={rep?.code ?? null} text={rep?.title ?? null}
+              return <KvLink k="Repair Service" code={rep?.code ?? null} text={rep?.title ?? null}
                 onClick={null} />;
             })()}
             <KvLink k="Customer" code={null} text={cust?.name ?? "—"}
@@ -373,6 +385,13 @@ export function ReplacementDetail({ id }: { id: string }) {
             <KvLink k="Context" code={null} text={REPLACEMENT_CONTEXT_LABEL[r.context]} onClick={null} />
           </div>
         </section>
+      </div>
+
+      <div style={{ display: "grid", gap: 20, gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", marginTop: 20 }}>
+        <RefundPhotoCard r={r} canEdit={isLead} meId={me.id} role={role}
+          fireToast={fireToast} bumpData={bumpData} />
+        <ReplacementDocsCard rrId={r.id} canEdit={isLead} meId={me.id} role={role}
+          fireToast={fireToast} bumpData={bumpData} />
       </div>
 
       {modalMode && (
@@ -404,6 +423,183 @@ function KvLink({ k, code, text, onClick }: { k: string; code: string | null; te
         )}
       </span>
     </div>
+  );
+}
+
+/* ─── Refund photo (migration 0039) ────────────────────── */
+function RefundPhotoCard({ r, canEdit, meId, role, fireToast, bumpData }: {
+  r: ReplacementRequest; canEdit: boolean; meId: string; role: string;
+  fireToast: (m: string) => void; bumpData: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [url, setUrl] = useState<string | null>(null);
+
+  // Resolve a short-lived signed URL for the private photo whenever it changes.
+  useEffect(() => {
+    let alive = true;
+    if (!r.refundPhotoPath) { setUrl(null); return; }
+    void getReplacementDocumentDownloadUrl(r.refundPhotoPath, 300).then(res => {
+      if (alive && res.ok) setUrl(res.url);
+    });
+    return () => { alive = false; };
+  }, [r.refundPhotoPath]);
+
+  const canDelete = canEdit && (r.refundPhotoUploadedBy === meId || role === "admin" || role === "md");
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (inputRef.current) inputRef.current.value = "";
+    if (!f) return;
+    setErr(null); setBusy(true);
+    const res = await setRefundPhoto(r.id, f, meId);
+    setBusy(false);
+    if (!res.ok) { setErr(res.error || "Upload failed"); return; }
+    bumpData(); fireToast("Refund photo saved");
+  };
+
+  const onDelete = async () => {
+    if (!window.confirm("Remove the refund photo?")) return;
+    const res = await deleteRefundPhoto(r.id);
+    if (!res.ok) { fireToast(`Couldn't remove: ${res.error}`); return; }
+    bumpData(); fireToast("Refund photo removed");
+  };
+
+  return (
+    <section className="card card-pad">
+      <CardHead title="Photo of refundable item"
+        sub="Proof of the returned item — for refund processing & supplier claims"
+        right={canEdit ? (
+          <>
+            <input ref={inputRef} type="file" accept="image/png,image/jpeg" capture="environment"
+              style={{ display: "none" }} onChange={onPick} disabled={busy} />
+            <button className="btn btn-primary btn-sm" disabled={busy}
+              onClick={() => inputRef.current?.click()}>
+              <Icon name={r.refundPhotoPath ? "refresh" : "camera"} size={13} />
+              {busy ? " Uploading…" : r.refundPhotoPath ? " Replace" : " Add photo"}
+            </button>
+          </>
+        ) : undefined} />
+      {err && <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginBottom: 8 }}>{err}</div>}
+      {r.refundPhotoPath ? (
+        <div className="col gap-2">
+          {url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={url} alt="Refund item"
+              onClick={() => window.open(url, "_blank", "noopener")}
+              style={{ maxWidth: "100%", maxHeight: 260, objectFit: "contain",
+                borderRadius: "var(--r-md)", border: "1px solid var(--border)",
+                cursor: "zoom-in", background: "var(--bg-muted)" }} />
+          ) : (
+            <div style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Loading preview…</div>
+          )}
+          <div className="row between" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+            <span className="truncate">{r.refundPhotoName ?? "refund-photo"}</span>
+            {canDelete && (
+              <button className="btn btn-ghost btn-sm" onClick={onDelete}>
+                <Icon name="trash" size={12} /> Remove
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <EmptyState icon="camera" title="No refund photo yet"
+          sub={canEdit ? "JPG or PNG · up to 10 MB · take a photo on mobile" : undefined} />
+      )}
+    </section>
+  );
+}
+
+/* ─── Supporting documents (migration 0039) ────────────── */
+function ReplacementDocsCard({ rrId, canEdit, meId, role, fireToast, bumpData }: {
+  rrId: string; canEdit: boolean; meId: string; role: string;
+  fireToast: (m: string) => void; bumpData: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const docs = db.docsForReplacement(rrId);
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    if (inputRef.current) inputRef.current.value = "";
+    if (files.length === 0) return;
+    setErr(null); setBusy(true);
+    let failed = 0;
+    for (const f of files) {
+      const res = await uploadReplacementDocument(rrId, f, meId);
+      if (!res.ok) { failed++; setErr(res.error || "Upload failed"); }
+    }
+    setBusy(false);
+    bumpData();
+    if (failed < files.length) fireToast(`Uploaded ${files.length - failed} document${files.length - failed === 1 ? "" : "s"}`);
+  };
+
+  const onDownload = async (d: ReplacementDocument) => {
+    const res = await getReplacementDocumentDownloadUrl(d.filePath, 60);
+    if (!res.ok) { fireToast(`Couldn't open: ${res.error}`); return; }
+    window.open(res.url, "_blank", "noopener");
+  };
+
+  const onDelete = async (d: ReplacementDocument) => {
+    if (!window.confirm(`Delete ${d.fileName}?`)) return;
+    const res = await deleteReplacementDocument(d.id);
+    if (!res.ok) { fireToast(`Couldn't delete: ${res.error}`); return; }
+    bumpData(); fireToast(`Deleted ${d.fileName}`);
+  };
+
+  return (
+    <section className="card card-pad">
+      <CardHead title={`Documents · ${docs.length}`}
+        sub="Complaint forms, approvals, return authorisations, invoices"
+        right={canEdit ? (
+          <>
+            <input ref={inputRef} type="file" multiple
+              accept=".pdf,.docx,.jpg,.jpeg,.png" style={{ display: "none" }}
+              onChange={onPick} disabled={busy} />
+            <button className="btn btn-primary btn-sm" disabled={busy}
+              onClick={() => inputRef.current?.click()}>
+              <Icon name="paperclip" size={13} /> {busy ? "Uploading…" : "Upload documents"}
+            </button>
+          </>
+        ) : undefined} />
+      {err && <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginBottom: 8 }}>{err}</div>}
+      {docs.length === 0 ? (
+        <EmptyState icon="fileText" title="No documents uploaded"
+          sub={canEdit ? `PDF, DOCX, JPG, PNG · up to ${Math.round(REPLACEMENT_DOC_MAX_BYTES / 1024 / 1024)} MB each` : undefined} />
+      ) : (
+        <div className="col gap-2">
+          {docs.map(d => {
+            const uploader = d.uploadedBy ? db.user(d.uploadedBy) : null;
+            const sizeKb = d.fileSizeBytes != null ? Math.round(d.fileSizeBytes / 1024) : null;
+            const canDelete = canEdit && (d.uploadedBy === meId || role === "admin" || role === "md");
+            return (
+              <div key={d.id} className="row gap-3" style={{
+                alignItems: "center", padding: "8px 12px",
+                borderRadius: "var(--r-md)", background: "var(--bg-muted)",
+              }}>
+                <Icon name="fileText" size={16} style={{ color: "var(--ink-mute)" }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="truncate" style={{ font: "var(--t-body-md)", fontWeight: 600 }}>{d.fileName}</div>
+                  <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+                    {sizeKb != null ? `${sizeKb} KB · ` : ""}{d.uploadedAt.slice(0, 10)}{uploader ? ` · ${uploader.name}` : ""}
+                  </div>
+                </div>
+                <button className="btn btn-ghost btn-sm" onClick={() => onDownload(d)}>
+                  <Icon name="externalLink" size={13} /> Download
+                </button>
+                {canDelete && (
+                  <button className="btn btn-ghost btn-sm" onClick={() => onDelete(d)}>
+                    <Icon name="trash" size={13} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -491,11 +687,11 @@ function ActionModal({ mode, rr, meId, onClose, onDone, fireToast }: {
   const [err, setErr] = useState<string | null>(null);
 
   const config: Record<ActionMode, { title: string; sub: string; cta: string; noteRequired: boolean; placeholder: string }> = {
-    approve:  { title: "Approve replacement",        sub: "Worker can install once approved.", cta: "Approve",      noteRequired: false, placeholder: "Optional note for the requester" },
-    reject:   { title: "Reject replacement",         sub: "Worker will see this reason.",      cta: "Reject",       noteRequired: true,  placeholder: "Why are you rejecting? (required)" },
+    approve:  { title: "Approve replacement",        sub: "Team member can install once approved.", cta: "Approve",      noteRequired: false, placeholder: "Optional note for the requester" },
+    reject:   { title: "Reject replacement",         sub: "Team member will see this reason.",      cta: "Reject",       noteRequired: true,  placeholder: "Why are you rejecting? (required)" },
     install:  { title: "Mark replacement installed", sub: "Lead Tech will confirm next.",      cta: "Mark installed", noteRequired: false, placeholder: "Optional installation note" },
     confirm:  { title: "Confirm replacement",        sub: "Completes the lifecycle.",          cta: "Confirm",      noteRequired: false, placeholder: "Optional confirmation note" },
-    sendback: { title: "Send back to worker",        sub: "Worker will need to redo it.",      cta: "Send back",    noteRequired: true,  placeholder: "Why is this being sent back? (required)" },
+    sendback: { title: "Send back to team member",   sub: "Team member will need to redo it.",      cta: "Send back",    noteRequired: true,  placeholder: "Why is this being sent back? (required)" },
     cancel:   { title: "Cancel replacement",         sub: "This cannot be undone.",            cta: "Cancel request", noteRequired: true,  placeholder: "Why are you cancelling? (required)" },
   };
   const c = config[mode];

@@ -10,8 +10,8 @@
 
 import type {
   AmcContract, AmcDocument, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
-  InventoryItem, Notification, Organization, Project, Quotation, RepairTicket,
-  ReplacementRequest, Risk, Role,
+  InventoryItem, MaterialRequest, Notification, Organization, Project, Quotation, RepairTicket,
+  ReplacementRequest, ReplacementDocument, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoTask,
 } from "./types";
@@ -192,6 +192,11 @@ export const AMC_DOCUMENTS: Record<string, AmcDocument> = {};
 // ── APPROVALS / FEED / NOTIFICATIONS / RISKS ───────────────
 export const APPROVALS: Record<string, Approval> = {};
 export const REPLACEMENTS: Record<string, ReplacementRequest> = {};
+// Migration 0039 — supporting documents attached to a replacement record.
+// Binaries live in the 'replacement-documents' Storage bucket; metadata here.
+export const REPLACEMENT_DOCUMENTS: Record<string, ReplacementDocument> = {};
+// Migration 0038 — material/parts requests raised from a Work Order.
+export const MATERIAL_REQUESTS: Record<string, MaterialRequest> = {};
 export const FEED: FeedItem[] = [];
 export const NOTIFICATIONS: Notification[] = [];
 export const RISKS: Risk[] = [];
@@ -224,7 +229,7 @@ export const db = {
   WORK_ORDER_TIME_ENTRIES,
   SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTOR_HOURS,
   FREE_CALLS, QUOTATIONS, WO_TASKS, AMC_DOCUMENTS,
-  APPROVALS, REPLACEMENTS,
+  APPROVALS, REPLACEMENTS, REPLACEMENT_DOCUMENTS, MATERIAL_REQUESTS,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
   org: (id?: string | null): Organization | null => (id && ORGANIZATIONS[id]) || null,
@@ -235,6 +240,20 @@ export const db = {
   amc: (id: string) => AMCS[id] || null,
   wo: (id: string) => WORK_ORDERS[id] || null,
   replacement: (id: string): ReplacementRequest | null => REPLACEMENTS[id] || null,
+  // Migration 0038 — material request selectors. Newest first throughout.
+  materialRequest: (id: string): MaterialRequest | null => MATERIAL_REQUESTS[id] || null,
+  materialRequestsForWO: (woId: string): MaterialRequest[] =>
+    Object.values(MATERIAL_REQUESTS)
+      .filter(m => m.workOrderId === woId)
+      .sort((a, b) => b.requestedAt.localeCompare(a.requestedAt)),
+  materialRequestsForProject: (projectId: string): MaterialRequest[] =>
+    Object.values(MATERIAL_REQUESTS)
+      .filter(m => m.projectId === projectId)
+      .sort((a, b) => b.requestedAt.localeCompare(a.requestedAt)),
+  materialRequestsForAmc: (amcId: string): MaterialRequest[] =>
+    Object.values(MATERIAL_REQUESTS)
+      .filter(m => m.amcContractId === amcId)
+      .sort((a, b) => b.requestedAt.localeCompare(a.requestedAt)),
   byCustomer: (id: string) => ({
     projects: Object.values(PROJECTS).filter(p => p.customer === id),
     amcs: Object.values(AMCS).filter(a => a.customer === id),
@@ -314,5 +333,11 @@ export const db = {
   docsForAmc: (amcId: string): AmcDocument[] =>
     Object.values(AMC_DOCUMENTS)
       .filter(d => d.amcId === amcId)
+      .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
+
+  // Migration 0039 — documents attached to a replacement, newest first.
+  docsForReplacement: (rrId: string): ReplacementDocument[] =>
+    Object.values(REPLACEMENT_DOCUMENTS)
+      .filter(d => d.replacementRequestId === rrId)
       .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
 };

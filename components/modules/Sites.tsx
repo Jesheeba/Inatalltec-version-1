@@ -328,7 +328,7 @@ export function SiteDetail({ id }: { id: string }) {
       </div>
 
       <section className="card card-pad" style={{ marginTop: 20 }}>
-        <CardHead title={"Main Contractor jobs · " + projects.length} />
+        <CardHead title={"Projects · " + projects.length} />
         {projects.length === 0 ? (
           <EmptyState icon="briefcase" title="No jobs at this site yet" />
         ) : (

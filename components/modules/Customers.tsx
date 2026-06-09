@@ -185,9 +185,9 @@ export function CustomerDetail({ id }: { id: string }) {
       </div>
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
-        <KPI label="Main Contractor jobs" value={stats.projects.length} sub="all active" />
+        <KPI label="Projects" value={stats.projects.length} sub="all active" />
         <KPI label="AMC contracts" value={stats.amcs.length} sub={`${fmtMoney(stats.amcs.reduce((a, b) => a + b.value, 0))} annual`} />
-        <KPI label="Repair tickets" value={stats.repairs.length} sub={stats.repairs.filter(r => r.state !== "Resolved").length + " open"} />
+        <KPI label="Repair Services" value={stats.repairs.length} sub={stats.repairs.filter(r => r.state !== "Resolved").length + " open"} />
         <KPI label="Sites" value={sites.length} sub={c.region || "UAE"} />
       </div>
 
@@ -256,7 +256,7 @@ export function CustomerDetail({ id }: { id: string }) {
 
       {tab === "projects" && (
         stats.projects.length === 0 ? (
-          <EmptyState icon="briefcase" title="No active Main Contractor jobs" sub={c.name + " has no Main Contractor jobs on file."} />
+          <EmptyState icon="briefcase" title="No active Projects" sub={c.name + " has no projects on file."} />
         ) : (
           <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))" }}>
             {stats.projects.map(p => (

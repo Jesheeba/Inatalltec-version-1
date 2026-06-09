@@ -28,7 +28,7 @@ import {
   formatDurationMinutes, formatLongDateTime, formatMonthDay,
 } from "@/lib/dates";
 import {
-  CardHead, EmptyState, FilterBar, KPI, Modal, PageHeader, SignOutButton,
+  CardHead, EmptyState, FilterBar, KPI, Modal, PageHeader,
 } from "../shared";
 import type {
   SubContractor, WorkOrderSubContractorHours,
@@ -46,7 +46,7 @@ export function SubContractors() {
   if (!ALLOWED_ROLES.has(role)) {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Workforce" title="Sub-contractors" right={<SignOutButton />} />
+        <PageHeader eyebrow="Workforce" title="Sub-contractors" />
         <EmptyState icon="shield" title="Not available for your role"
           sub="Sub-contractor profiles are managed by Operations Manager / Admin / MD." />
       </div>
@@ -117,12 +117,9 @@ export function SubContractors() {
         title="Sub-contractors"
         sub="External contractor directory · hours tracked · HR compliance fields"
         right={
-          <div className="row gap-2">
-            <button className="btn btn-primary" onClick={() => openCreate("sub_contractor")}>
-              <Icon name="plus" size={14} /> Add sub-contractor
-            </button>
-            <SignOutButton />
-          </div>
+          <button className="btn btn-primary" onClick={() => openCreate("sub_contractor")}>
+            <Icon name="plus" size={14} /> Add sub-contractor
+          </button>
         } />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>

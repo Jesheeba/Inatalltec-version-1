@@ -32,6 +32,7 @@ export type PermissionAction =
   | "CREATE_SITE"
   | "CREATE_WORK_ORDER"
   | "CREATE_MATERIAL_REQUEST"
+  | "MANAGE_MATERIAL_REQUEST"
   | "CREATE_REPLACEMENT"
   | "CREATE_USER"
   | "CREATE_TEAM_MEMBER"
@@ -55,7 +56,13 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   CREATE_CUSTOMER:          ["admin", "md", "manager", "sales"],
   CREATE_SITE:              ["admin", "md", "manager", "lead_worker"],
   CREATE_WORK_ORDER:        ["admin", "md", "manager", "lead_worker"],
-  CREATE_MATERIAL_REQUEST:  ["admin", "md", "manager", "lead_worker"],
+  // Field-execution staff raise material requests from the WO they're on
+  // (migration 0038 widened this from the original manager-only set so
+  // technicians + subcontractors can request from the field).
+  CREATE_MATERIAL_REQUEST:  ["admin", "md", "manager", "lead_worker", "worker", "subcontractor"],
+  // Approve / reject / fulfil a material request — operational decision,
+  // restricted to the management roles who own the contract terms.
+  MANAGE_MATERIAL_REQUEST:  ["admin", "md", "manager"],
   // Drivers explicitly excluded — they don't do replacements (spec).
   // Sales / Accounts / Service Support also excluded (not field-execution roles).
   CREATE_REPLACEMENT:       ["admin", "md", "manager", "lead_worker", "worker", "subcontractor"],
@@ -123,7 +130,8 @@ export function canCreateAnything(role: Role): boolean {
 export type ListScope = "all" | "mine" | "hidden";
 
 export type ListEntity =
-  | "projects" | "amc" | "repairs" | "customers" | "sites" | "workorders";
+  | "projects" | "amc" | "repairs" | "customers" | "sites" | "workorders"
+  | "material_requests";
 
 export function listScopeFor(role: Role, entity: ListEntity): ListScope {
   // super_admin sees everything (platform-level admin).
@@ -163,6 +171,14 @@ export function listScopeFor(role: Role, entity: ListEntity): ListScope {
       // of work_order_assignments, and project they manage).
       if (role === "lead_worker") return "mine";
       if (role === "worker" || role === "driver" || role === "subcontractor") return "mine";
+      return "hidden";
+
+    case "material_requests":
+      // Managers/admin run the procurement review; accounts gets a
+      // read-only all-view for budgeting. Field staff see the ones they
+      // raised or are assigned to (computed in the list page).
+      if (role === "admin" || role === "md" || role === "manager" || role === "accounts") return "all";
+      if (role === "lead_worker" || role === "worker" || role === "subcontractor") return "mine";
       return "hidden";
   }
 }
