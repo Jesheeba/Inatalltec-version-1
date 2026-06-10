@@ -202,6 +202,9 @@ export function AppProvider({
       for (const r of initialBundle.replacements) db.REPLACEMENTS[r.id] = r;
       for (const m of initialBundle.materialRequests) db.MATERIAL_REQUESTS[m.id] = m;
       for (const d of initialBundle.replacementDocuments) db.REPLACEMENT_DOCUMENTS[d.id] = d;
+      for (const s of initialBundle.materialSubmittals) db.MATERIAL_SUBMITTALS[s.id] = s;
+      for (const r of initialBundle.materialSubmittalRevisions) db.MATERIAL_SUBMITTAL_REVISIONS[r.id] = r;
+      for (const i of initialBundle.materialItems) db.MATERIAL_ITEMS[i.id] = i;
     }
     return true;
   });

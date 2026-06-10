@@ -498,8 +498,13 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = typeof PROJECT_STATUSES[number];
 
+// Note: 'lead' stage was retired (per spec: a project enters the
+// system at the Quote stage). The DB enum still carries the 'lead'
+// label (Postgres won't let us drop an enum value cleanly) but no row
+// should ever hold it — migration 0041 backfills any leftovers to
+// 'quote' and the UI no longer offers it. Keep the type in sync.
 export const PROJECT_STAGES = [
-  "lead", "quote", "won", "mobilization", "execution",
+  "quote", "won", "mobilization", "execution",
   "testing_commissioning", "handover", "dlp", "amc_handoff",
 ] as const;
 export type ProjectStage = typeof PROJECT_STAGES[number];
@@ -512,7 +517,6 @@ export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
   cancelled: "Cancelled",
 };
 export const PROJECT_STAGE_LABEL: Record<ProjectStage, string> = {
-  lead: "Lead",
   quote: "Quote",
   won: "Won",
   mobilization: "Mobilization",
@@ -591,7 +595,7 @@ export async function createProject(input: ProjectInput): Promise<Result> {
   const code = input.code?.trim() || `PRJ-${new Date().getFullYear()}-${Math.floor(Math.random() * 900 + 100)}`;
   const id = shortId("p");
   const status: ProjectStatus = input.status || "planned";
-  const stage: ProjectStage = input.stage || "lead";
+  const stage: ProjectStage = input.stage || "quote";
   const row: Project = {
     id, code, name: input.name.trim(),
     customer: input.customer_id,
@@ -2722,6 +2726,294 @@ export interface MaterialRequestInput {
 type MrOk = { ok: true; mr: MaterialRequest };
 type MrFail = { ok: false; error: string };
 type MrResult = MrOk | MrFail;
+
+// ─────────────────────────────────────────────────────────
+// MATERIAL SUBMITTAL — Design phase activity 1 (migration 0040)
+// All functions here are NEW. Client communication happens outside the
+// app; we only record state. Mirrors the replacement lifecycle +
+// document-upload patterns (rrTransition / uploadReplacementDocument).
+// ─────────────────────────────────────────────────────────
+const DESIGN_BUCKET = "project-design-docs";
+
+const MS_COLS  = "id, project_id, code, current_revision, approved_revision, created_by, created_at, updated_at";
+const MSR_COLS = "id, submittal_id, revision_number, status, submitted_at, responded_at, client_comments, created_by, created_at, updated_at";
+const MI_COLS  = "id, revision_id, description, model_number, quantity, datasheet_path, datasheet_name, sort_order, created_at";
+
+type MsT  = import("./types").MaterialSubmittal;
+type MsrT = import("./types").MaterialSubmittalRevision;
+type MiT  = import("./types").MaterialItem;
+type MsrStatus = import("./types").MaterialSubmittalStatus;
+
+function rowToMs(r: Record<string, unknown>): MsT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const n = (v: unknown): number | null => (typeof v === "number" ? v : null);
+  return {
+    id: s(r.id), projectId: s(r.project_id), code: s(r.code),
+    currentRevision: typeof r.current_revision === "number" ? r.current_revision : 1,
+    approvedRevision: n(r.approved_revision),
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: s(r.created_at), updatedAt: s(r.updated_at),
+  };
+}
+function rowToMsr(r: Record<string, unknown>): MsrT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const sn = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    id: s(r.id), submittalId: s(r.submittal_id),
+    revisionNumber: typeof r.revision_number === "number" ? r.revision_number : 1,
+    status: ((r.status as MsrStatus) ?? "draft"),
+    submittedAt: sn(r.submitted_at), respondedAt: sn(r.responded_at),
+    clientComments: sn(r.client_comments),
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: s(r.created_at), updatedAt: s(r.updated_at),
+  };
+}
+function rowToMi(r: Record<string, unknown>): MiT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const sn = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    id: s(r.id), revisionId: s(r.revision_id),
+    description: s(r.description), modelNumber: sn(r.model_number),
+    quantity: typeof r.quantity === "number" ? r.quantity : 1,
+    datasheetPath: sn(r.datasheet_path), datasheetName: sn(r.datasheet_name),
+    sortOrder: typeof r.sort_order === "number" ? r.sort_order : 0,
+    createdAt: s(r.created_at),
+  };
+}
+
+// Signed download URL for any file in the shared design-docs bucket.
+export async function getDesignDocUrl(
+  filePath: string, expiresInSeconds = 60,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!filePath) return { ok: false, error: "filePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+  const { data, error } = await supabaseBrowser()
+    .storage.from(DESIGN_BUCKET).createSignedUrl(filePath, expiresInSeconds);
+  if (error || !data?.signedUrl) return { ok: false, error: error?.message || "Could not create signed URL." };
+  return { ok: true, url: data.signedUrl };
+}
+
+export type MsResult  = { ok: true; submittal: MsT } | { ok: false; error: string };
+export type MsrResult = { ok: true; revision: MsrT } | { ok: false; error: string };
+export type MiResult  = { ok: true; item: MiT } | { ok: false; error: string };
+
+// Create the submittal + its first (draft) revision for a project.
+export async function createMaterialSubmittal(
+  projectId: string, createdBy: string | null,
+): Promise<{ ok: true; submittal: MsT; revision: MsrT } | { ok: false; error: string }> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  if (db.MATERIAL_SUBMITTALS && Object.values(db.MATERIAL_SUBMITTALS).some(s => s.projectId === projectId)) {
+    return { ok: false, error: "This project already has a material submittal." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  let submittal: MsT | null = null;
+  for (let attempt = 0; attempt < MAX_CODE_RETRIES; attempt++) {
+    const { data, error } = await supa.from("material_submittals")
+      .insert({ project_id: projectId, current_revision: 1, created_by: createdBy })
+      .select(MS_COLS).single();
+    if (!error && data) { submittal = rowToMs(data as Record<string, unknown>); break; }
+    const code = (error as { code?: string } | null)?.code;
+    if (code === UNIQUE_VIOLATION && /code/.test((error as { message?: string } | null)?.message ?? "")) continue;
+    return { ok: false, error: error?.message || "Failed to create submittal." };
+  }
+  if (!submittal) return { ok: false, error: "Could not allocate a submittal code — try again." };
+
+  const { data: revData, error: revErr } = await supa.from("material_submittal_revisions")
+    .insert({ submittal_id: submittal.id, revision_number: 1, status: "draft", created_by: createdBy })
+    .select(MSR_COLS).single();
+  if (revErr || !revData) return { ok: false, error: revErr?.message || "Failed to create revision 1." };
+
+  const revision = rowToMsr(revData as Record<string, unknown>);
+  db.MATERIAL_SUBMITTALS[submittal.id] = submittal;
+  db.MATERIAL_SUBMITTAL_REVISIONS[revision.id] = revision;
+  return { ok: true, submittal, revision };
+}
+
+export interface MaterialItemInput { description: string; model_number?: string; quantity?: number; }
+
+// Add an item to a DRAFT revision, optionally with a datasheet upload.
+export async function addMaterialItem(
+  revisionId: string, input: MaterialItemInput,
+  datasheet: File | null, uploaderId: string | null,
+): Promise<MiResult> {
+  if (!revisionId) return { ok: false, error: "Revision id is required." };
+  if (!input.description?.trim()) return { ok: false, error: "Material description is required." };
+  const rev = db.MATERIAL_SUBMITTAL_REVISIONS[revisionId];
+  if (rev && rev.status !== "draft") return { ok: false, error: "This revision is locked — items can only be added while it's a draft." };
+  const projectId = rev ? db.MATERIAL_SUBMITTALS[rev.submittalId]?.projectId ?? "" : "";
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  let datasheetPath: string | null = null;
+  let datasheetName: string | null = null;
+  if (datasheet) {
+    if (datasheet.size > REPLACEMENT_DOC_MAX_BYTES) {
+      return { ok: false, error: `Datasheet is over the 10 MB limit (${(datasheet.size / 1024 / 1024).toFixed(1)} MB).` };
+    }
+    if (!["pdf", "jpg", "jpeg", "png"].includes(fileExt(datasheet.name))) {
+      return { ok: false, error: "Datasheet must be a PDF, JPG, or PNG." };
+    }
+    const safe = datasheet.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "datasheet";
+    const rand = Math.random().toString(36).slice(2, 10);
+    datasheetPath = `submittal/${projectId || "unknown"}/${rand}-${safe}`;
+    const { error: upErr } = await supa.storage.from(DESIGN_BUCKET)
+      .upload(datasheetPath, datasheet, { contentType: datasheet.type || undefined, upsert: false });
+    if (upErr) return { ok: false, error: `Datasheet upload failed: ${upErr.message}` };
+    datasheetName = datasheet.name;
+  }
+
+  const { data, error } = await supa.from("material_items").insert({
+    revision_id: revisionId,
+    description: input.description.trim(),
+    model_number: input.model_number?.trim() || null,
+    quantity: input.quantity && input.quantity > 0 ? input.quantity : 1,
+    datasheet_path: datasheetPath,
+    datasheet_name: datasheetName,
+  }).select(MI_COLS).single();
+
+  if (error || !data) {
+    if (datasheetPath) await supa.storage.from(DESIGN_BUCKET).remove([datasheetPath]);
+    return { ok: false, error: error?.message || "Failed to add item." };
+  }
+  const item = rowToMi(data as Record<string, unknown>);
+  db.MATERIAL_ITEMS[item.id] = item;
+  return { ok: true, item };
+}
+
+export async function updateMaterialItem(
+  itemId: string, input: MaterialItemInput,
+): Promise<MiResult> {
+  if (!itemId) return { ok: false, error: "Item id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const { data, error } = await supabaseBrowser().from("material_items").update({
+    description: input.description.trim(),
+    model_number: input.model_number?.trim() || null,
+    quantity: input.quantity && input.quantity > 0 ? input.quantity : 1,
+  }).eq("id", itemId).select(MI_COLS).single();
+  if (error || !data) return { ok: false, error: error?.message || "Failed to update item." };
+  const item = rowToMi(data as Record<string, unknown>);
+  db.MATERIAL_ITEMS[item.id] = item;
+  return { ok: true, item };
+}
+
+// Delete an item row. NOTE: we intentionally do NOT remove the datasheet
+// blob from storage — startNextSubmittalRevision copies items (and their
+// datasheet_path) into new revisions, so a blob can be shared across the
+// revision history. Orphaned datasheets are small and private; leaving
+// them avoids breaking an older revision's audit trail.
+export async function deleteMaterialItem(itemId: string): Promise<Result> {
+  if (!itemId) return { ok: false, error: "Item id is required." };
+  const item = db.MATERIAL_ITEMS[itemId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  delete db.MATERIAL_ITEMS[itemId]; // optimistic
+  const { error } = await supabaseBrowser().from("material_items").delete().eq("id", itemId);
+  if (error) { if (item) db.MATERIAL_ITEMS[itemId] = item; return { ok: false, error: error.message }; }
+  return { ok: true, id: itemId };
+}
+
+// Generic guarded revision transition (optimistic concurrency on status).
+async function msrTransition(
+  revisionId: string, expected: MsrStatus, patch: Record<string, unknown>,
+): Promise<MsrResult> {
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+  const { data, error } = await supa.from("material_submittal_revisions")
+    .update(patch).eq("id", revisionId).eq("status", expected).select(MSR_COLS);
+  if (error) return { ok: false, error: error.message };
+  if (!data || data.length === 0) {
+    const { data: cur } = await supa.from("material_submittal_revisions").select(MSR_COLS).eq("id", revisionId).maybeSingle();
+    if (cur) { const r = rowToMsr(cur as Record<string, unknown>); db.MATERIAL_SUBMITTAL_REVISIONS[r.id] = r;
+      return { ok: false, error: `This revision is already "${r.status}".` }; }
+    return { ok: false, error: "Revision not found." };
+  }
+  const revision = rowToMsr(data[0] as Record<string, unknown>);
+  db.MATERIAL_SUBMITTAL_REVISIONS[revision.id] = revision;
+  return { ok: true, revision };
+}
+
+export async function submitSubmittalRevision(revisionId: string): Promise<MsrResult> {
+  return msrTransition(revisionId, "draft", { status: "submitted", submitted_at: new Date().toISOString() });
+}
+
+export async function markSubmittalApproved(revisionId: string): Promise<MsrResult> {
+  const res = await msrTransition(revisionId, "submitted", { status: "approved", responded_at: new Date().toISOString() });
+  if (res.ok) {
+    // Stamp the approved revision number on the parent submittal.
+    const sub = db.MATERIAL_SUBMITTALS[res.revision.submittalId];
+    if (sub) {
+      const { data } = await supabaseBrowser().from("material_submittals")
+        .update({ approved_revision: res.revision.revisionNumber }).eq("id", sub.id).select(MS_COLS).maybeSingle();
+      if (data) db.MATERIAL_SUBMITTALS[sub.id] = rowToMs(data as Record<string, unknown>);
+    }
+  }
+  return res;
+}
+
+export async function markSubmittalReturned(revisionId: string, comments: string): Promise<MsrResult> {
+  return msrTransition(revisionId, "submitted", {
+    status: "returned", responded_at: new Date().toISOString(), client_comments: comments?.trim() || null,
+  });
+}
+
+export async function markSubmittalRejected(revisionId: string, reason: string): Promise<MsrResult> {
+  return msrTransition(revisionId, "submitted", {
+    status: "rejected", responded_at: new Date().toISOString(), client_comments: reason?.trim() || null,
+  });
+}
+
+// Start a new draft revision, copying items (incl. datasheet refs) from
+// the latest existing revision so the OM edits rather than re-enters.
+export async function startNextSubmittalRevision(
+  submittalId: string, createdBy: string | null,
+): Promise<MsrResult> {
+  if (!submittalId) return { ok: false, error: "Submittal id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const revs = Object.values(db.MATERIAL_SUBMITTAL_REVISIONS).filter(r => r.submittalId === submittalId);
+  const latest = revs.sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
+  const nextNum = (latest?.revisionNumber ?? 0) + 1;
+
+  const { data: revData, error: revErr } = await supa.from("material_submittal_revisions")
+    .insert({ submittal_id: submittalId, revision_number: nextNum, status: "draft", created_by: createdBy })
+    .select(MSR_COLS).single();
+  if (revErr || !revData) return { ok: false, error: revErr?.message || "Failed to start the next revision." };
+  const revision = rowToMsr(revData as Record<string, unknown>);
+
+  // Copy the latest revision's items into the new draft.
+  if (latest) {
+    const srcItems = Object.values(db.MATERIAL_ITEMS).filter(i => i.revisionId === latest.id);
+    if (srcItems.length > 0) {
+      const rows = srcItems
+        .sort((a, b) => a.sortOrder - b.sortOrder)
+        .map(i => ({
+          revision_id: revision.id, description: i.description, model_number: i.modelNumber,
+          quantity: i.quantity, datasheet_path: i.datasheetPath, datasheet_name: i.datasheetName,
+          sort_order: i.sortOrder,
+        }));
+      const { data: copied } = await supa.from("material_items").insert(rows).select(MI_COLS);
+      for (const r of (copied ?? [])) { const it = rowToMi(r as Record<string, unknown>); db.MATERIAL_ITEMS[it.id] = it; }
+    }
+  }
+
+  // Point the submittal at the new current revision.
+  const { data: msData } = await supa.from("material_submittals")
+    .update({ current_revision: nextNum }).eq("id", submittalId).select(MS_COLS).maybeSingle();
+  if (msData) db.MATERIAL_SUBMITTALS[submittalId] = rowToMs(msData as Record<string, unknown>);
+
+  db.MATERIAL_SUBMITTAL_REVISIONS[revision.id] = revision;
+  return { ok: true, revision };
+}
 
 export async function createMaterialRequest(input: MaterialRequestInput): Promise<MrResult> {
   if (!input.item_name?.trim()) return { ok: false, error: "Material name is required." };

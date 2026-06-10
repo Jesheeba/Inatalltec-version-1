@@ -38,6 +38,12 @@ export type PermissionAction =
   | "CREATE_TEAM_MEMBER"
   | "CREATE_QUOTATION"
   | "CREATE_ORGANIZATION"
+  // Design phase (migration 0040+). MANAGE_DESIGN = do the work (Material
+  // Submittal / Shop Drawing / JCA). VIEW_DESIGN_DOCS = read-only access to
+  // Material Submittal + Shop Drawing (Lead Tech sees what they'll build;
+  // Sales may discuss with the client). JCA visibility is separate (Accounts).
+  | "MANAGE_DESIGN"
+  | "VIEW_DESIGN_DOCS"
   // "View all" gates — when false, the page either hides or scopes
   // its list to rows the user is directly involved in. The page
   // helpers below resolve "what does involved mean" per entity.
@@ -75,6 +81,11 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   CREATE_TEAM_MEMBER:       ["admin", "md", "manager", "lead_worker"],
   CREATE_QUOTATION:         ["admin", "md", "manager", "sales"],
   CREATE_ORGANIZATION:      [], // super_admin only — handled separately
+  // Design phase. Edit = Ops Manager / Admin / MD. Read = those + Lead Tech
+  // (sees what they'll build) + Sales (client discussion). Accounts is NOT
+  // here — they get JCA-only visibility via a separate gate in a later slice.
+  MANAGE_DESIGN:            ["admin", "md", "manager"],
+  VIEW_DESIGN_DOCS:         ["admin", "md", "manager", "lead_worker", "sales"],
 
   // ── View-all gates ───────────────────────────────────────
   VIEW_ALL_PROJECTS:        ["admin", "md", "manager"],

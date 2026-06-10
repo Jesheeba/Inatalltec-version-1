@@ -581,6 +581,49 @@ export interface ReplacementDocument {
   uploadedAt: string;        // ISO timestamptz
 }
 
+// Material Submittal — Design-phase activity 1 (migration 0040). A
+// project has ONE submittal; it goes through one or more REVISIONS, each
+// a list of materials submitted to the client. Lifecycle per revision:
+//   draft → submitted → (approved | returned | rejected)
+export type MaterialSubmittalStatus =
+  | "draft" | "submitted" | "approved" | "returned" | "rejected";
+
+export interface MaterialSubmittal {
+  id: string;
+  projectId: string;
+  code: string;                    // MS-YYYY-NNNN
+  currentRevision: number;
+  approvedRevision: number | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MaterialSubmittalRevision {
+  id: string;
+  submittalId: string;
+  revisionNumber: number;
+  status: MaterialSubmittalStatus;
+  submittedAt: string | null;
+  respondedAt: string | null;
+  clientComments: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MaterialItem {
+  id: string;
+  revisionId: string;
+  description: string;
+  modelNumber: string | null;
+  quantity: number;
+  datasheetPath: string | null;   // path inside the project-design-docs bucket
+  datasheetName: string | null;
+  sortOrder: number;
+  createdAt: string;
+}
+
 // Material Requests — on-site material/parts procurement flow
 // (migration 0038). A technician raises a request from a Work Order;
 // the parent project/AMC manager + supervising Lead Tech are notified;

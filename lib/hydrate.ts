@@ -12,6 +12,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
   AmcContract, AmcDocument, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
   MaterialRequest, MaterialRequestStatus, MaterialRequestUrgency,
+  MaterialSubmittal, MaterialSubmittalRevision, MaterialSubmittalStatus, MaterialItem,
   Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
   ReplacementRequest, ReplacementDocument, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
   WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
@@ -72,6 +73,11 @@ export interface HydrationBundle {
   // refund photo itself lives on the replacement row (refundPhoto* fields),
   // not here. Hydrated for everyone who can read replacement_requests.
   replacementDocuments: ReplacementDocument[];
+  // Migration 0040 — Material Submittal (Design phase). RLS restricts these
+  // to admin/md/manager/lead_worker/sales.
+  materialSubmittals: MaterialSubmittal[];
+  materialSubmittalRevisions: MaterialSubmittalRevision[];
+  materialItems: MaterialItem[];
 }
 
 type Row = Record<string, unknown>;
@@ -222,6 +228,41 @@ function mapAmcDocument(r: Row): AmcDocument {
     mimeType:      (r.mime_type as string | null) ?? null,
     uploadedBy:    (r.uploaded_by as string | null) ?? null,
     uploadedAt:    asString(r.uploaded_at),
+  };
+}
+
+// Migration 0040 — Material Submittal mappers.
+function mapMaterialSubmittal(r: Row): MaterialSubmittal {
+  return {
+    id: asString(r.id), projectId: asString(r.project_id), code: asString(r.code),
+    currentRevision: asNumber(r.current_revision, 1),
+    approvedRevision: (r.approved_revision as number | null) ?? null,
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: asString(r.created_at), updatedAt: asString(r.updated_at),
+  };
+}
+function mapMaterialSubmittalRevision(r: Row): MaterialSubmittalRevision {
+  return {
+    id: asString(r.id), submittalId: asString(r.submittal_id),
+    revisionNumber: asNumber(r.revision_number, 1),
+    status: ((r.status as MaterialSubmittalStatus) ?? "draft"),
+    submittedAt: (r.submitted_at as string | null) ?? null,
+    respondedAt: (r.responded_at as string | null) ?? null,
+    clientComments: (r.client_comments as string | null) ?? null,
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: asString(r.created_at), updatedAt: asString(r.updated_at),
+  };
+}
+function mapMaterialItem(r: Row): MaterialItem {
+  return {
+    id: asString(r.id), revisionId: asString(r.revision_id),
+    description: asString(r.description),
+    modelNumber: (r.model_number as string | null) ?? null,
+    quantity: asNumber(r.quantity, 1),
+    datasheetPath: (r.datasheet_path as string | null) ?? null,
+    datasheetName: (r.datasheet_name as string | null) ?? null,
+    sortOrder: asNumber(r.sort_order, 0),
+    createdAt: asString(r.created_at),
   };
 }
 
@@ -547,6 +588,7 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     replacementsRaw, woTimeEntriesRaw, subContractorsRaw, woSubContractorsRaw, woSubHoursRaw,
     freeCallsRaw, quotationsRaw, woTasksRaw, amcDocumentsRaw, materialRequestsRaw,
     replacementDocumentsRaw,
+    materialSubmittalsRaw, materialSubmittalRevisionsRaw, materialItemsRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -572,6 +614,9 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "amc_documents"),
     fetchAll(admin, "material_requests"),
     fetchAll(admin, "replacement_documents"),
+    fetchAll(admin, "material_submittals"),
+    fetchAll(admin, "material_submittal_revisions"),
+    fetchAll(admin, "material_items"),
   ]);
 
   // Group milestones by project_id.
@@ -642,5 +687,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     replacements: replacementsRaw.map(mapReplacement),
     materialRequests: materialRequestsRaw.map(mapMaterialRequest),
     replacementDocuments: replacementDocumentsRaw.map(mapReplacementDocument),
+    materialSubmittals: materialSubmittalsRaw.map(mapMaterialSubmittal),
+    materialSubmittalRevisions: materialSubmittalRevisionsRaw.map(mapMaterialSubmittalRevision),
+    materialItems: materialItemsRaw.map(mapMaterialItem),
   };
 }

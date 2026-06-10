@@ -18,7 +18,6 @@ import type { IconName, Role } from "@/lib/types";
 import {
   createAmc, createApproval, createCustomer, createOrganization, createProject,
   createRepairTicket, createSite, updateSite, createUser, createWorkOrder, updateOrganization,
-  PROJECT_STATUSES, PROJECT_STAGES, PROJECT_STATUS_LABEL, PROJECT_STAGE_LABEL,
   recordAmcPayment, AMC_PAYMENT_METHOD_LABEL,
   JOB_CATEGORIES, JOB_CATEGORY_LABEL,
   UAE_EMIRATES,
@@ -32,7 +31,6 @@ import {
 } from "@/lib/create";
 import { formatMonthDay } from "@/lib/dates";
 import type { ProjectPhase, ReplacementContext, MaterialRequestUrgency } from "@/lib/types";
-import { PROJECT_PHASES, PROJECT_PHASE_LABEL } from "@/lib/phases";
 import { can, type PermissionAction } from "@/lib/permissions";
 import { createNote, updateNote } from "@/lib/notes";
 import { currencySymbol } from "@/lib/format";
@@ -905,11 +903,19 @@ function SiteForm() {
 
 /* ─── PROJECT ───────────────────────────────────────────── */
 function ProjectForm() {
-  const { closeCreate, fireToast, bumpData, create, currentOrg } = useApp();
+  const { closeCreate, fireToast, bumpData, create, currentOrg, role: viewerRole } = useApp();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const today = new Date().toISOString().slice(0, 10);
   const initialCustomer = (create?.prefill?.customer_id as string) || "";
+  // Inline new-customer mini-form (mirrors AmcForm) — create a client
+  // without leaving the project form.
+  const canCreateCustomer = CAN_CREATE_CUSTOMER_INLINE.has(viewerRole);
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
+  const [newCustName, setNewCustName] = useState("");
+  const [newCustTier, setNewCustTier] = useState<"Strategic" | "Key" | "Standard">("Standard");
+  const [newCustBusy, setNewCustBusy] = useState(false);
+  const [newCustErr, setNewCustErr] = useState<string | null>(null);
   // Phase 9.x Part 4 auto-assign — same pattern as AmcForm above.
   const managers = useMemo(() => Object.values(db.USERS).filter(u => u.role === "manager"), []);
   const autoManager = managers.length === 1 ? managers[0] : null;
@@ -926,7 +932,7 @@ function ProjectForm() {
     value_aed: "",
     started_at: today, due_at: "",
     status: "planned" as ProjectStatus,
-    stage: "lead" as ProjectStage,
+    stage: "quote" as ProjectStage,
     // Starting phase (migration 0020). Defaults to 'design' — the DB
     // default is the same, so this just makes the form's choice
     // visible. Operations Manager can pick a later phase if backfilling
@@ -1002,6 +1008,22 @@ function ProjectForm() {
     fireToast("Project created"); bumpData(); closeCreate();
   };
 
+  const submitNewCustomer = async () => {
+    setNewCustErr(null);
+    const trimmed = newCustName.trim();
+    if (!trimmed) { setNewCustErr("Customer name is required."); return; }
+    setNewCustBusy(true);
+    const res = await createCustomer({ name: trimmed, tier: newCustTier });
+    setNewCustBusy(false);
+    if (!res.ok) { setNewCustErr(res.error); return; }
+    setF({ ...f, customer_id: res.id, site_id: "" });
+    setShowNewCustomer(false);
+    setNewCustName("");
+    setNewCustTier("Standard");
+    fireToast(`Customer "${trimmed}" created`);
+    bumpData();
+  };
+
   return (
     <FormShell icon="briefcase" title="New Project"
       sub="Installation contract with milestones and payment terms"
@@ -1034,20 +1056,66 @@ function ProjectForm() {
             placeholder="— Select category —"
             options={JOB_CATEGORIES.map(c => ({ value: c, label: JOB_CATEGORY_LABEL[c] }))} />
         </Field>
-        <Field label="Starting phase"
-          hint="Most new projects start at Design. Pick a later phase only if you're backfilling a job that's already in motion.">
-          <Select value={f.current_phase}
-            onChange={v => setF({ ...f, current_phase: v as ProjectPhase })}
-            options={PROJECT_PHASES.map(p => ({ value: p, label: PROJECT_PHASE_LABEL[p] }))} />
-        </Field>
       </Section>
 
       <Section title="Customer & site">
         <Row>
           <Field label="Customer" required>
-            <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
-              placeholder="- Select -"
-              options={customers.map(c => ({ value: c.id, label: c.name }))} />
+            <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+              <div style={{ flex: 1 }}>
+                <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
+                  placeholder="- Select -"
+                  options={customers.map(c => ({ value: c.id, label: c.name }))} />
+              </div>
+              {canCreateCustomer && (
+                <button type="button" className="btn btn-ghost btn-sm"
+                        onClick={() => setShowNewCustomer(v => !v)}
+                        title="Create a new customer without leaving this form">
+                  <Icon name="plus" size={13} /> New
+                </button>
+              )}
+            </div>
+            {showNewCustomer && (
+              <div className="card card-pad" style={{ marginTop: 8, background: "var(--bg-muted)" }}>
+                <div className="col gap-3">
+                  <div className="field">
+                    <label className="field-label">New customer name<span className="req">*</span></label>
+                    <input className="input" autoFocus value={newCustName}
+                           onChange={e => setNewCustName(e.target.value)}
+                           placeholder="e.g. Sobha Realty" />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Tier</label>
+                    <select className="input" value={newCustTier}
+                            onChange={e => setNewCustTier(e.target.value as "Strategic" | "Key" | "Standard")}>
+                      <option value="Standard">Standard</option>
+                      <option value="Key">Key</option>
+                      <option value="Strategic">Strategic</option>
+                    </select>
+                    <div className="field-hint">
+                      Phone, email, address, and other details can be added later on the Customers page.
+                    </div>
+                  </div>
+                  {newCustErr && (
+                    <div style={{ font: "var(--t-small)", color: "var(--dan-700)" }}>
+                      <Icon name="alertCircle" size={13} /> {newCustErr}
+                    </div>
+                  )}
+                  <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+                    <button type="button" className="btn btn-ghost btn-sm"
+                            onClick={() => { setShowNewCustomer(false); setNewCustErr(null); }}>
+                      Cancel
+                    </button>
+                    <button type="button" className="btn btn-primary btn-sm"
+                            disabled={newCustBusy} onClick={submitNewCustomer}>
+                      {newCustBusy
+                        ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Creating…</>
+                        : <><Icon name="check" size={13} /> Create customer</>}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </Field>
           <Field label="Site">
             <SiteSelectField
@@ -1133,19 +1201,6 @@ function ProjectForm() {
           </Section>
         </div>
       )}
-
-      <Section title="Lifecycle">
-        <Row>
-          <Field label="Status">
-            <Select value={f.status} onChange={v => setF({ ...f, status: v as ProjectStatus })}
-              options={PROJECT_STATUSES.map(s => ({ value: s, label: PROJECT_STATUS_LABEL[s] }))} />
-          </Field>
-          <Field label="Stage">
-            <Select value={f.stage} onChange={v => setF({ ...f, stage: v as ProjectStage })}
-              options={PROJECT_STAGES.map(s => ({ value: s, label: PROJECT_STAGE_LABEL[s] }))} />
-          </Field>
-        </Row>
-      </Section>
     </FormShell>
   );
 }
@@ -1847,7 +1902,7 @@ function WorkOrderForm({ fixedType }: { fixedType?: "DELIVERY" }) {
 
 /* ─── REPAIR TICKET ─────────────────────────────────────── */
 function RepairForm() {
-  const { closeCreate, fireToast, bumpData } = useApp();
+  const { closeCreate, fireToast, bumpData, role: viewerRole } = useApp();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [f, setF] = useState({
@@ -1856,6 +1911,13 @@ function RepairForm() {
     priority: "normal" as "high" | "normal",
     sla_target_min: 240,
   });
+  // Inline new-customer mini-form (mirrors AmcForm).
+  const canCreateCustomer = CAN_CREATE_CUSTOMER_INLINE.has(viewerRole);
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
+  const [newCustName, setNewCustName] = useState("");
+  const [newCustTier, setNewCustTier] = useState<"Strategic" | "Key" | "Standard">("Standard");
+  const [newCustBusy, setNewCustBusy] = useState(false);
+  const [newCustErr, setNewCustErr] = useState<string | null>(null);
   const customers = Object.values(db.CUSTOMERS);
   const leadTechs = useMemo(() => Object.values(db.USERS).filter(u => u.role === "lead_worker"), []);
 
@@ -1877,6 +1939,22 @@ function RepairForm() {
     fireToast("Repair Service logged"); bumpData(); closeCreate();
   };
 
+  const submitNewCustomer = async () => {
+    setNewCustErr(null);
+    const trimmed = newCustName.trim();
+    if (!trimmed) { setNewCustErr("Customer name is required."); return; }
+    setNewCustBusy(true);
+    const res = await createCustomer({ name: trimmed, tier: newCustTier });
+    setNewCustBusy(false);
+    if (!res.ok) { setNewCustErr(res.error); return; }
+    setF({ ...f, customer_id: res.id, site_id: "" });
+    setShowNewCustomer(false);
+    setNewCustName("");
+    setNewCustTier("Standard");
+    fireToast(`Customer "${trimmed}" created`);
+    bumpData();
+  };
+
   return (
     <FormShell icon="wrench" title="Log Repair Service"
       sub="Own product or third-party - multi-visit, SLA-tracked"
@@ -1887,9 +1965,61 @@ function RepairForm() {
         </Field>
         <Row>
           <Field label="Customer" required>
-            <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
-              placeholder="- Select -"
-              options={customers.map(c => ({ value: c.id, label: c.name }))} />
+            <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+              <div style={{ flex: 1 }}>
+                <Select required value={f.customer_id} onChange={v => setF({ ...f, customer_id: v, site_id: "" })}
+                  placeholder="- Select -"
+                  options={customers.map(c => ({ value: c.id, label: c.name }))} />
+              </div>
+              {canCreateCustomer && (
+                <button type="button" className="btn btn-ghost btn-sm"
+                        onClick={() => setShowNewCustomer(v => !v)}
+                        title="Create a new customer without leaving this form">
+                  <Icon name="plus" size={13} /> New
+                </button>
+              )}
+            </div>
+            {showNewCustomer && (
+              <div className="card card-pad" style={{ marginTop: 8, background: "var(--bg-muted)" }}>
+                <div className="col gap-3">
+                  <div className="field">
+                    <label className="field-label">New customer name<span className="req">*</span></label>
+                    <input className="input" autoFocus value={newCustName}
+                           onChange={e => setNewCustName(e.target.value)}
+                           placeholder="e.g. Sobha Realty" />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Tier</label>
+                    <select className="input" value={newCustTier}
+                            onChange={e => setNewCustTier(e.target.value as "Strategic" | "Key" | "Standard")}>
+                      <option value="Standard">Standard</option>
+                      <option value="Key">Key</option>
+                      <option value="Strategic">Strategic</option>
+                    </select>
+                    <div className="field-hint">
+                      Phone, email, address, and other details can be added later on the Customers page.
+                    </div>
+                  </div>
+                  {newCustErr && (
+                    <div style={{ font: "var(--t-small)", color: "var(--dan-700)" }}>
+                      <Icon name="alertCircle" size={13} /> {newCustErr}
+                    </div>
+                  )}
+                  <div className="row gap-2" style={{ justifyContent: "flex-end" }}>
+                    <button type="button" className="btn btn-ghost btn-sm"
+                            onClick={() => { setShowNewCustomer(false); setNewCustErr(null); }}>
+                      Cancel
+                    </button>
+                    <button type="button" className="btn btn-primary btn-sm"
+                            disabled={newCustBusy} onClick={submitNewCustomer}>
+                      {newCustBusy
+                        ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Creating…</>
+                        : <><Icon name="check" size={13} /> Create customer</>}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </Field>
           <Field label="Site">
             <SiteSelectField

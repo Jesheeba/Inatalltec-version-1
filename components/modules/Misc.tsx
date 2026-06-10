@@ -28,6 +28,7 @@ import {
   AdvancePhaseButton, PhaseBadge, PhaseHistoryTimeline, PhaseStepper,
 } from "../PhaseTracker";
 import { MaterialRequestsSection } from "./MaterialRequests";
+import { MaterialSubmittalSummaryCard } from "./design/MaterialSubmittal";
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
@@ -540,6 +541,11 @@ export function ProjectDetail({ id }: { id: string }) {
         </div>
         <PhaseStepper phase={p.currentPhase} />
       </section>
+
+      {/* Design phase activities (migration 0040+). Each card self-gates by
+          role and links to its dedicated sub-route. More cards (Shop Drawing,
+          JCA) land in later slices. */}
+      <MaterialSubmittalSummaryCard projectId={id} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Contract value" value={fmtMoney(p.value, { compact: true })} />

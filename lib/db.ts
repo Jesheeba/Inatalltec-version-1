@@ -11,6 +11,7 @@
 import type {
   AmcContract, AmcDocument, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
   InventoryItem, MaterialRequest, Notification, Organization, Project, Quotation, RepairTicket,
+  MaterialSubmittal, MaterialSubmittalRevision, MaterialItem,
   ReplacementRequest, ReplacementDocument, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoTask,
@@ -197,6 +198,11 @@ export const REPLACEMENTS: Record<string, ReplacementRequest> = {};
 export const REPLACEMENT_DOCUMENTS: Record<string, ReplacementDocument> = {};
 // Migration 0038 — material/parts requests raised from a Work Order.
 export const MATERIAL_REQUESTS: Record<string, MaterialRequest> = {};
+// Migration 0040 — Material Submittal (Design phase activity 1): one
+// submittal per project, multiple revisions, items per revision.
+export const MATERIAL_SUBMITTALS: Record<string, MaterialSubmittal> = {};
+export const MATERIAL_SUBMITTAL_REVISIONS: Record<string, MaterialSubmittalRevision> = {};
+export const MATERIAL_ITEMS: Record<string, MaterialItem> = {};
 export const FEED: FeedItem[] = [];
 export const NOTIFICATIONS: Notification[] = [];
 export const RISKS: Risk[] = [];
@@ -230,6 +236,7 @@ export const db = {
   SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTORS, WORK_ORDER_SUB_CONTRACTOR_HOURS,
   FREE_CALLS, QUOTATIONS, WO_TASKS, AMC_DOCUMENTS,
   APPROVALS, REPLACEMENTS, REPLACEMENT_DOCUMENTS, MATERIAL_REQUESTS,
+  MATERIAL_SUBMITTALS, MATERIAL_SUBMITTAL_REVISIONS, MATERIAL_ITEMS,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
   org: (id?: string | null): Organization | null => (id && ORGANIZATIONS[id]) || null,
@@ -340,4 +347,16 @@ export const db = {
     Object.values(REPLACEMENT_DOCUMENTS)
       .filter(d => d.replacementRequestId === rrId)
       .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
+
+  // Migration 0040 — Material Submittal selectors.
+  submittalForProject: (projectId: string): MaterialSubmittal | null =>
+    Object.values(MATERIAL_SUBMITTALS).find(s => s.projectId === projectId) ?? null,
+  revisionsForSubmittal: (submittalId: string): MaterialSubmittalRevision[] =>
+    Object.values(MATERIAL_SUBMITTAL_REVISIONS)
+      .filter(r => r.submittalId === submittalId)
+      .sort((a, b) => a.revisionNumber - b.revisionNumber),
+  itemsForRevision: (revisionId: string): MaterialItem[] =>
+    Object.values(MATERIAL_ITEMS)
+      .filter(i => i.revisionId === revisionId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
 };
