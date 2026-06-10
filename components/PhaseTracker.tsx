@@ -167,7 +167,8 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
   currentPhase: ProjectPhase | null | undefined;
   onAdvanced?: () => void;
 }) {
-  const { role, fireToast, bumpData } = useApp();
+  const { role, fireToast, bumpData, dataVersion } = useApp();
+  void dataVersion;
   const [open, setOpen] = useState(false);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -192,6 +193,18 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
     );
   }
 
+  // Slice D — design completion gate.
+  // The Design → Material Supply transition requires all three Design
+  // activities to be in their done state. The DB trigger in migration
+  // 0044 enforces the same rule server-side; this UI check just stops
+  // the user from getting a confusing error back from the DB.
+  const isDesignExit = currentPhase === "design" && target === "material_supply";
+  const readiness = isDesignExit ? db.designReadiness(projectId) : null;
+  const gateBlocked = readiness != null && !readiness.isComplete;
+  const gateTooltip = gateBlocked
+    ? "Complete the Design activities first:\n• " + readiness!.missing.join("\n• ")
+    : undefined;
+
   const close = () => { if (!busy) { setOpen(false); setNote(""); setErr(null); } };
 
   const submit = async (e: React.FormEvent) => {
@@ -212,7 +225,12 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
 
   return (
     <>
-      <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>
+      <button
+        className="btn btn-primary btn-sm"
+        onClick={() => { if (!gateBlocked) setOpen(true); }}
+        disabled={gateBlocked}
+        title={gateTooltip}
+        aria-disabled={gateBlocked}>
         <Icon name="arrowRight" size={13} /> {label}
       </button>
       {open && (
@@ -246,6 +264,28 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
               </div>
             </div>
 
+            {isDesignExit && (
+              <div style={{
+                padding: "12px 14px", background: "var(--warn-50)",
+                color: "var(--warn-700)", borderRadius: "var(--r-md)",
+                border: "1px solid var(--warn-100)",
+                font: "var(--t-small)", display: "flex", alignItems: "flex-start", gap: 10,
+              }}>
+                <Icon name="lock" size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+                <div>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                    Design activities will be locked
+                  </div>
+                  <div>
+                    Once you advance past Design, the Material Submittal, Shop
+                    Drawing, and JCA pages become permanently read-only.
+                    Existing data and history stay visible, but no further
+                    revisions, uploads, or edits will be allowed.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div>
               <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
                               textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
@@ -272,13 +312,56 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
               <button type="submit" className="btn btn-primary" disabled={busy}>
                 {busy
                   ? <><Icon name="loader" size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
-                  : <>Confirm <Icon name="arrowRight" size={13} /></>}
+                  : <>{isDesignExit ? "Confirm & lock" : "Confirm"} <Icon name="arrowRight" size={13} /></>}
               </button>
             </div>
           </form>
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * DesignGateHint
+ *
+ * Renders a small inline panel under the PhaseTracker explaining
+ * what's still incomplete when the project sits at Design but isn't
+ * yet ready to advance. Hidden when:
+ *   • currentPhase is not 'design' (no gate to display)
+ *   • all three Design activities are already complete
+ *
+ * Intentionally permission-agnostic: every viewer should see why the
+ * project is stuck. The hint contains no actionable controls — it's
+ * pure messaging.
+ */
+export function DesignGateHint({ projectId, currentPhase }: {
+  projectId: string;
+  currentPhase: ProjectPhase | null | undefined;
+}) {
+  const { dataVersion } = useApp();
+  void dataVersion;
+  if (currentPhase !== "design") return null;
+  const readiness = db.designReadiness(projectId);
+  if (readiness.isComplete) return null;
+
+  return (
+    <div style={{
+      marginTop: 12, padding: "10px 14px",
+      background: "var(--warn-50)", color: "var(--warn-700)",
+      borderRadius: "var(--r-md)", border: "1px solid var(--warn-100)",
+      display: "flex", gap: 10, alignItems: "flex-start",
+    }}>
+      <Icon name="alertCircle" size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+      <div style={{ font: "var(--t-small)", flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>
+          Complete the Design activities to advance
+        </div>
+        <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+          {readiness.missing.map(m => <li key={m}>{m}</li>)}
+        </ul>
+      </div>
+    </div>
   );
 }
 

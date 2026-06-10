@@ -171,7 +171,6 @@ export interface Project {
   // (migration 0018). Empty string when no Lead is assigned yet.
   leadTechId: string;
   status: string;
-  stage: string;
   // Execution phase (migration 0020). NULL for projects created before
   // the migration — Operations Manager backfills via "Set Phase" UI.
   // New projects default to 'design' server-side.
@@ -622,6 +621,81 @@ export interface MaterialItem {
   datasheetName: string | null;
   sortOrder: number;
   createdAt: string;
+}
+
+// Shop Drawing — Design phase activity 2 (migration 0042). Identical
+// lifecycle to Material Submittal; the payload is uploaded DRAWING FILES
+// (PDF for sharing + DWG AutoCAD source) instead of material items.
+//   draft → submitted → (approved | returned | rejected)
+export type ShopDrawingStatus =
+  | "draft" | "submitted" | "approved" | "returned" | "rejected";
+
+export interface ShopDrawing {
+  id: string;
+  projectId: string;
+  code: string;                    // SD-YYYY-NNNN
+  currentRevision: number;
+  approvedRevision: number | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShopDrawingRevision {
+  id: string;
+  drawingId: string;
+  revisionNumber: number;
+  status: ShopDrawingStatus;
+  description: string | null;
+  submittedAt: string | null;
+  respondedAt: string | null;
+  clientComments: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShopDrawingFile {
+  id: string;
+  revisionId: string;
+  filePath: string;                // path inside the project-design-docs bucket
+  fileName: string;
+  fileSize: number;                // bytes
+  mimeType: string | null;
+  kind: "pdf" | "dwg" | "other";
+  sortOrder: number;
+  createdAt: string;
+}
+
+// Job Cost Analysis — Design phase activity 3 (migration 0043). An
+// INTERNAL budget; no revision / client cycle. One per project, five
+// numeric inputs; subtotal/profit/total are derived in the UI. Every
+// save appends a ProjectJcaHistory snapshot (permanent audit trail).
+export interface ProjectJca {
+  id: string;
+  projectId: string;
+  materialsBudget: number;
+  manpowerBudget: number;
+  subcontractorBudget: number;
+  otherCharges: number;
+  profitMarginPct: number;
+  createdBy: string | null;
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectJcaHistory {
+  id: string;
+  jcaId: string;
+  materialsBudget: number;
+  manpowerBudget: number;
+  subcontractorBudget: number;
+  otherCharges: number;
+  profitMarginPct: number;
+  note: string | null;
+  editedBy: string | null;
+  editedAt: string;
 }
 
 // Material Requests — on-site material/parts procurement flow

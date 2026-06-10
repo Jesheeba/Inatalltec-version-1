@@ -267,7 +267,7 @@ export function CustomerDetail({ id }: { id: string }) {
                 </div>
                 <div style={{ font: "var(--t-body-md)", marginTop: 8 }}>{p.name}</div>
                 <div className="row between" style={{ marginTop: 12 }}>
-                  <span className="numeric" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{fmtMoney(p.value, { compact: true })} · {p.stage}</span>
+                  <span className="numeric" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{fmtMoney(p.value, { compact: true })}</span>
                   <span className="numeric" style={{ font: "var(--t-small)", fontWeight: 600 }}>{p.progress}%</span>
                 </div>
                 <div className="progress" style={{ marginTop: 6 }}><div style={{ width: p.progress + "%" }} /></div>

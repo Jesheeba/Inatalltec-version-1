@@ -14,9 +14,9 @@ import { can, listScopeFor } from "@/lib/permissions";
 import { hasWorkerConflict } from "@/lib/conflicts";
 import {
   deleteUser, updateProject,
-  PROJECT_STATUSES, PROJECT_STAGES,
-  PROJECT_STATUS_LABEL, PROJECT_STAGE_LABEL,
-  type ProjectStatus, type ProjectStage,
+  PROJECT_STATUSES,
+  PROJECT_STATUS_LABEL,
+  type ProjectStatus,
 } from "@/lib/create";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import { formatLongDateTime, formatMonthDay } from "@/lib/dates";
@@ -25,10 +25,12 @@ import {
   CardHead, ChoicePill, EmptyState, FeedItem, FilterBar, KPI, PageHeader, RowMenu, StatusBadge, WoCard,
 } from "../shared";
 import {
-  AdvancePhaseButton, PhaseBadge, PhaseHistoryTimeline, PhaseStepper,
+  AdvancePhaseButton, DesignGateHint, PhaseBadge, PhaseHistoryTimeline, PhaseStepper,
 } from "../PhaseTracker";
 import { MaterialRequestsSection } from "./MaterialRequests";
 import { MaterialSubmittalSummaryCard } from "./design/MaterialSubmittal";
+import { ShopDrawingSummaryCard } from "./design/ShopDrawing";
+import { JcaSummaryCard } from "./design/Jca";
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
@@ -182,7 +184,7 @@ function ProjectCard({ p, onClick }: { p: Project; onClick: () => void }) {
       <div className="row between" style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--divider)" }}>
         <div className="row gap-2">
           <span className={"avatar avatar-sm avatar-" + (mgr.tint || "primary")}>{mgr.initials}</span>
-          <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{p.stage}</span>
+          <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{mgr.name}</span>
         </div>
         <span style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>Due {p.dueAt.slice(5).replace("-", "/")}</span>
       </div>
@@ -460,22 +462,6 @@ export function ProjectDetail({ id }: { id: string }) {
     setHistoryTick(t => t + 1);
   };
 
-  const onChangeStage = async (next: ProjectStage) => {
-    if (next === p.stage) return;
-    const prev = p.stage as ProjectStage;
-    db.PROJECTS[id] = { ...p, stage: next };
-    bumpData();
-    const res = await updateProject(id, { stage: next });
-    if (!res.ok) {
-      db.PROJECTS[id] = { ...p, stage: prev };
-      bumpData();
-      fireToast(`Couldn't update stage: ${res.error}`);
-      return;
-    }
-    fireToast(`Stage → ${PROJECT_STAGE_LABEL[next]}`);
-    setHistoryTick(t => t + 1);
-  };
-
   const onChangeLeadTech = async (nextId: string) => {
     if (nextId === p.leadTechId) return;
     const prevId = p.leadTechId;
@@ -495,9 +481,6 @@ export function ProjectDetail({ id }: { id: string }) {
   const statusOptions = PROJECT_STATUSES.map(s => ({
     value: s, label: PROJECT_STATUS_LABEL[s], cls: STATUS_PILL_CLS[s],
   }));
-  const stageOptions = PROJECT_STAGES.map(s => ({
-    value: s, label: PROJECT_STAGE_LABEL[s],
-  }));
 
   return (
     <div className="main-pad">
@@ -514,12 +497,6 @@ export function ProjectDetail({ id }: { id: string }) {
               value={p.status as ProjectStatus}
               options={statusOptions}
               onChange={onChangeStatus}
-            />
-            <ChoicePill<ProjectStage>
-              ariaLabel="Job stage"
-              value={p.stage as ProjectStage}
-              options={stageOptions}
-              onChange={onChangeStage}
             />
           </div>
         } />
@@ -540,19 +517,21 @@ export function ProjectDetail({ id }: { id: string }) {
             onAdvanced={() => setHistoryTick(t => t + 1)} />
         </div>
         <PhaseStepper phase={p.currentPhase} />
+        <DesignGateHint projectId={id} currentPhase={p.currentPhase} />
       </section>
 
       {/* Design phase activities (migration 0040+). Each card self-gates by
           role and links to its dedicated sub-route. More cards (Shop Drawing,
           JCA) land in later slices. */}
       <MaterialSubmittalSummaryCard projectId={id} />
+      <ShopDrawingSummaryCard projectId={id} />
+      <JcaSummaryCard projectId={id} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Contract value" value={fmtMoney(p.value, { compact: true })} />
         <KPI label="Progress" value={p.progress + "%"}>
           <div className="progress" style={{ marginTop: 8 }}><div style={{ width: p.progress + "%" }} /></div>
         </KPI>
-        <KPI label="Stage" value={PROJECT_STAGE_LABEL[p.stage as ProjectStage] ?? p.stage} />
         <KPI label="Due" value={p.dueAt} />
         <ProjectManHoursKpi projectId={id} />
         <ProjectManpowerKpi projectId={id} />
@@ -844,7 +823,7 @@ function LeadTechRow({
   );
 }
 
-/* ─── Project status / stage helpers ─────────────────── */
+/* ─── Project status helpers ─────────────────────────── */
 
 const STATUS_PILL_CLS: Record<ProjectStatus, string> = {
   planned: "badge-info",
@@ -855,13 +834,16 @@ const STATUS_PILL_CLS: Record<ProjectStatus, string> = {
 };
 
 /* ─── Project status history ─────────────────────────── */
+// Note: the project_status_history table still records the legacy
+// 'stage' column for in-flight audit rows (the trigger from 0008 logs
+// both). The UI no longer surfaces stage transitions — only status
+// changes. Rows with a stage-only change (i.e. no status delta) are
+// filtered out so they don't render as empty entries.
 
 interface HistoryRow {
   id: string;
   old_status: ProjectStatus | null;
   new_status: ProjectStatus;
-  old_stage: ProjectStage | null;
-  new_stage: ProjectStage | null;
   changed_by: string | null;
   changed_at: string;
 }
@@ -877,13 +859,19 @@ function ProjectStatusHistory({ projectId, reloadKey }: { projectId: string; rel
       setError(null);
       const { data, error } = await supabaseBrowser()
         .from("project_status_history")
-        .select("id, old_status, new_status, old_stage, new_stage, changed_by, changed_at")
+        .select("id, old_status, new_status, changed_by, changed_at")
         .eq("project_id", projectId)
         .order("changed_at", { ascending: false })
         .limit(100);
       if (cancelled) return;
       if (error) { setError(error.message); setRows([]); return; }
-      setRows((data ?? []) as HistoryRow[]);
+      // Drop stage-only audit rows: the row exists in the table but
+      // both old_status and new_status are equal (the change was only
+      // on the stage column, which the UI no longer cares about).
+      const filtered = ((data ?? []) as HistoryRow[]).filter(
+        r => r.old_status !== r.new_status,
+      );
+      setRows(filtered);
     })();
     return () => { cancelled = true; };
   }, [projectId, reloadKey]);
@@ -895,14 +883,14 @@ function ProjectStatusHistory({ projectId, reloadKey }: { projectId: string; rel
 
   return (
     <section className="card card-pad" style={{ marginTop: 20 }}>
-      <CardHead title="Status history" sub="Every status / stage change with actor and timestamp" />
+      <CardHead title="Status history" sub="Every status change with actor and timestamp" />
       {rows === null ? (
         <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", padding: 8 }}>Loading…</div>
       ) : error ? (
         <div style={{ font: "var(--t-small)", color: "var(--dan-700)", padding: 8 }}>Couldn't load history: {error}</div>
       ) : rows.length === 0 ? (
         <EmptyState icon="clock" title="No changes yet"
-          sub="Change the status or stage above - every change is recorded here." />
+          sub="Change the status above - every change is recorded here." />
       ) : (
         <>
           <div className="col" style={{ gap: 8 }}>
@@ -924,8 +912,6 @@ function ProjectStatusHistory({ projectId, reloadKey }: { projectId: string; rel
 function HistoryEntry({ row }: { row: HistoryRow }) {
   const actor = row.changed_by ? db.user(row.changed_by) : null;
   const when = formatHistoryDate(row.changed_at);
-  const statusChanged = row.old_status !== row.new_status;
-  const stageChanged = row.old_stage !== row.new_stage && row.old_stage !== null;
 
   return (
     <div className="row gap-3" style={{
@@ -941,21 +927,9 @@ function HistoryEntry({ row }: { row: HistoryRow }) {
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ font: "var(--t-body-md)" }}>
-          {statusChanged && (
-            <>
-              Status <span style={{ color: "var(--ink-mute)" }}>
-                {row.old_status ? PROJECT_STATUS_LABEL[row.old_status] : "-"}
-              </span> → <strong>{PROJECT_STATUS_LABEL[row.new_status]}</strong>
-            </>
-          )}
-          {statusChanged && stageChanged && <span style={{ color: "var(--ink-quiet)" }}> · </span>}
-          {stageChanged && row.new_stage && (
-            <>
-              Stage <span style={{ color: "var(--ink-mute)" }}>
-                {row.old_stage ? PROJECT_STAGE_LABEL[row.old_stage] : "-"}
-              </span> → <strong>{PROJECT_STAGE_LABEL[row.new_stage]}</strong>
-            </>
-          )}
+          Status <span style={{ color: "var(--ink-mute)" }}>
+            {row.old_status ? PROJECT_STATUS_LABEL[row.old_status] : "-"}
+          </span> → <strong>{PROJECT_STATUS_LABEL[row.new_status]}</strong>
         </div>
         <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 2 }}>
           {actor ? actor.name : "Unknown user"} · {when}

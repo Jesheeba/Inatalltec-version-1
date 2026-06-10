@@ -13,6 +13,8 @@ import type {
   AmcContract, AmcDocument, AmcService, AmcServiceStatus, AmcStatus, Approval, ApprovalStep, Customer, FreeCall,
   MaterialRequest, MaterialRequestStatus, MaterialRequestUrgency,
   MaterialSubmittal, MaterialSubmittalRevision, MaterialSubmittalStatus, MaterialItem,
+  ShopDrawing, ShopDrawingRevision, ShopDrawingStatus, ShopDrawingFile,
+  ProjectJca, ProjectJcaHistory,
   Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
   ReplacementRequest, ReplacementDocument, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
   WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
@@ -78,6 +80,13 @@ export interface HydrationBundle {
   materialSubmittals: MaterialSubmittal[];
   materialSubmittalRevisions: MaterialSubmittalRevision[];
   materialItems: MaterialItem[];
+  // Migration 0042 — Shop Drawing (Design phase). Same RLS matrix.
+  shopDrawings: ShopDrawing[];
+  shopDrawingRevisions: ShopDrawingRevision[];
+  shopDrawingFiles: ShopDrawingFile[];
+  // Migration 0043 — JCA. RLS restricts to admin/md/manager/accounts.
+  projectJca: ProjectJca[];
+  projectJcaHistory: ProjectJcaHistory[];
 }
 
 type Row = Record<string, unknown>;
@@ -168,7 +177,6 @@ function mapProject(r: Row, milestones: Milestone[]): Project {
     team: asString(r.team_id),
     leadTechId: asString(r.lead_tech_id),
     status: asString(r.status, "In Progress"),
-    stage: asString(r.stage, "Mobilisation"),
     // Execution phase (migration 0020). Pre-0020 rows have no column
     // and rows created after but never advanced have NULL — both
     // hydrate as null and trigger the "Set Phase" UI.
@@ -263,6 +271,75 @@ function mapMaterialItem(r: Row): MaterialItem {
     datasheetName: (r.datasheet_name as string | null) ?? null,
     sortOrder: asNumber(r.sort_order, 0),
     createdAt: asString(r.created_at),
+  };
+}
+
+// Migration 0042 — Shop Drawing.
+function mapShopDrawing(r: Row): ShopDrawing {
+  return {
+    id: asString(r.id), projectId: asString(r.project_id), code: asString(r.code),
+    currentRevision: asNumber(r.current_revision, 1),
+    approvedRevision: (r.approved_revision as number | null) ?? null,
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: asString(r.created_at), updatedAt: asString(r.updated_at),
+  };
+}
+function mapShopDrawingRevision(r: Row): ShopDrawingRevision {
+  return {
+    id: asString(r.id), drawingId: asString(r.drawing_id),
+    revisionNumber: asNumber(r.revision_number, 1),
+    status: ((r.status as ShopDrawingStatus) ?? "draft"),
+    description: (r.description as string | null) ?? null,
+    submittedAt: (r.submitted_at as string | null) ?? null,
+    respondedAt: (r.responded_at as string | null) ?? null,
+    clientComments: (r.client_comments as string | null) ?? null,
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: asString(r.created_at), updatedAt: asString(r.updated_at),
+  };
+}
+function mapShopDrawingFile(r: Row): ShopDrawingFile {
+  const kind = r.kind === "pdf" || r.kind === "dwg" ? r.kind : "other";
+  return {
+    id: asString(r.id), revisionId: asString(r.revision_id),
+    filePath: asString(r.file_path), fileName: asString(r.file_name),
+    fileSize: asNumber(r.file_size, 0),
+    mimeType: (r.mime_type as string | null) ?? null,
+    kind: kind as ShopDrawingFile["kind"],
+    sortOrder: asNumber(r.sort_order, 0),
+    createdAt: asString(r.created_at),
+  };
+}
+
+// Migration 0043 — JCA. Numeric columns arrive as strings from PostgREST
+// (numeric type), so coerce via Number rather than the typeof-number asNumber.
+function jcaNumber(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function mapProjectJca(r: Row): ProjectJca {
+  return {
+    id: asString(r.id), projectId: asString(r.project_id),
+    materialsBudget: jcaNumber(r.materials_budget),
+    manpowerBudget: jcaNumber(r.manpower_budget),
+    subcontractorBudget: jcaNumber(r.subcontractor_budget),
+    otherCharges: jcaNumber(r.other_charges),
+    profitMarginPct: jcaNumber(r.profit_margin_pct),
+    createdBy: (r.created_by as string | null) ?? null,
+    updatedBy: (r.updated_by as string | null) ?? null,
+    createdAt: asString(r.created_at), updatedAt: asString(r.updated_at),
+  };
+}
+function mapProjectJcaHistory(r: Row): ProjectJcaHistory {
+  return {
+    id: asString(r.id), jcaId: asString(r.jca_id),
+    materialsBudget: jcaNumber(r.materials_budget),
+    manpowerBudget: jcaNumber(r.manpower_budget),
+    subcontractorBudget: jcaNumber(r.subcontractor_budget),
+    otherCharges: jcaNumber(r.other_charges),
+    profitMarginPct: jcaNumber(r.profit_margin_pct),
+    note: (r.note as string | null) ?? null,
+    editedBy: (r.edited_by as string | null) ?? null,
+    editedAt: asString(r.edited_at),
   };
 }
 
@@ -589,6 +666,8 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     freeCallsRaw, quotationsRaw, woTasksRaw, amcDocumentsRaw, materialRequestsRaw,
     replacementDocumentsRaw,
     materialSubmittalsRaw, materialSubmittalRevisionsRaw, materialItemsRaw,
+    shopDrawingsRaw, shopDrawingRevisionsRaw, shopDrawingFilesRaw,
+    projectJcaRaw, projectJcaHistoryRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -617,6 +696,11 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "material_submittals"),
     fetchAll(admin, "material_submittal_revisions"),
     fetchAll(admin, "material_items"),
+    fetchAll(admin, "shop_drawings"),
+    fetchAll(admin, "shop_drawing_revisions"),
+    fetchAll(admin, "shop_drawing_files"),
+    fetchAll(admin, "project_jca"),
+    fetchAll(admin, "project_jca_history"),
   ]);
 
   // Group milestones by project_id.
@@ -690,5 +774,10 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     materialSubmittals: materialSubmittalsRaw.map(mapMaterialSubmittal),
     materialSubmittalRevisions: materialSubmittalRevisionsRaw.map(mapMaterialSubmittalRevision),
     materialItems: materialItemsRaw.map(mapMaterialItem),
+    shopDrawings: shopDrawingsRaw.map(mapShopDrawing),
+    shopDrawingRevisions: shopDrawingRevisionsRaw.map(mapShopDrawingRevision),
+    shopDrawingFiles: shopDrawingFilesRaw.map(mapShopDrawingFile),
+    projectJca: projectJcaRaw.map(mapProjectJca),
+    projectJcaHistory: projectJcaHistoryRaw.map(mapProjectJcaHistory),
   };
 }

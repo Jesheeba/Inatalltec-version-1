@@ -53,7 +53,7 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Jobs", items: [
-      { id: "projects", label: "Projects", icon: "briefcase", roles: ["admin", "md", "manager", "lead_worker"] },
+      { id: "projects", label: "Projects", icon: "briefcase", roles: ["admin", "md", "manager", "lead_worker", "accounts"] },
       { id: "amc", label: "AMC contracts", icon: "shieldCheck", roles: ["admin", "md", "manager", "sales", "accounts", "lead_worker"] },
       { id: "repair", label: "Repair Services", icon: "wrench", roles: ["admin", "md", "manager", "service_support", "lead_worker"] },
     ]

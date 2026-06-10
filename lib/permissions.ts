@@ -44,6 +44,11 @@ export type PermissionAction =
   // Sales may discuss with the client). JCA visibility is separate (Accounts).
   | "MANAGE_DESIGN"
   | "VIEW_DESIGN_DOCS"
+  // JCA (migration 0043). Internal budget — different audience from the
+  // design docs: Accounts can VIEW (billing/finance) but not edit; Sales
+  // and Lead Tech are excluded entirely. MANAGE_JCA = edit/create.
+  | "MANAGE_JCA"
+  | "VIEW_JCA"
   // "View all" gates — when false, the page either hides or scopes
   // its list to rows the user is directly involved in. The page
   // helpers below resolve "what does involved mean" per entity.
@@ -86,6 +91,10 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   // here — they get JCA-only visibility via a separate gate in a later slice.
   MANAGE_DESIGN:            ["admin", "md", "manager"],
   VIEW_DESIGN_DOCS:         ["admin", "md", "manager", "lead_worker", "sales"],
+  // JCA — edit = OM/Admin/MD; view adds Accounts (read-only). Sales /
+  // Lead Tech / Workers see nothing.
+  MANAGE_JCA:               ["admin", "md", "manager"],
+  VIEW_JCA:                 ["admin", "md", "manager", "accounts"],
 
   // ── View-all gates ───────────────────────────────────────
   VIEW_ALL_PROJECTS:        ["admin", "md", "manager"],
@@ -150,9 +159,12 @@ export function listScopeFor(role: Role, entity: ListEntity): ListScope {
 
   switch (entity) {
     case "projects":
-      if (role === "admin" || role === "md" || role === "manager") return "all";
+      // accounts gets the full list so they can open any project and reach
+      // the JCA card (migration 0043). They still don't see the Material
+      // Submittal / Shop Drawing cards — VIEW_DESIGN_DOCS excludes them.
+      if (role === "admin" || role === "md" || role === "manager" || role === "accounts") return "all";
       if (role === "lead_worker") return "mine";
-      // workers / drivers / subcontractors / sales / accounts / etc.
+      // workers / drivers / subcontractors / sales / etc.
       return "hidden";
 
     case "amc":

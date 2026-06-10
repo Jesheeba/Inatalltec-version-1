@@ -119,7 +119,7 @@ export function projectToCalendarEvent(p: Project): CalendarEvent | null {
     status:       p.status,
     color:        getEventColor("project", p.status),
     source:       { table: "projects", id: p.id },
-    metadata:     { code: p.code, progress: p.progress, stage: p.stage },
+    metadata:     { code: p.code, progress: p.progress },
   };
 }
 

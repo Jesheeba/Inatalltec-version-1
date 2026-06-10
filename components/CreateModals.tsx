@@ -26,7 +26,7 @@ import {
   createSubContractor, assignSubContractorToWO,
   logSubContractorHours, editSubContractorHoursEntry,
   createFreeCall, createQuotation, linkFreeCallToWorkOrder,
-  type ProjectStatus, type ProjectStage, type AmcPaymentMethod,
+  type ProjectStatus, type AmcPaymentMethod,
   type JobCategory, type ContractMeta,
 } from "@/lib/create";
 import { formatMonthDay } from "@/lib/dates";
@@ -932,7 +932,6 @@ function ProjectForm() {
     value_aed: "",
     started_at: today, due_at: "",
     status: "planned" as ProjectStatus,
-    stage: "quote" as ProjectStage,
     // Starting phase (migration 0020). Defaults to 'design' — the DB
     // default is the same, so this just makes the form's choice
     // visible. Operations Manager can pick a later phase if backfilling
@@ -997,7 +996,6 @@ function ProjectForm() {
       value_aed: Number(f.value_aed),
       started_at: f.started_at, due_at: f.due_at,
       status: f.status,
-      stage: f.stage,
       current_phase: f.current_phase,
       scope_description: f.scope_description.trim() || undefined,
       job_category: f.job_category || undefined,

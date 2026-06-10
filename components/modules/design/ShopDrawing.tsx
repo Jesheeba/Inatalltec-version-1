@@ -1,17 +1,17 @@
 "use client";
 // ============================================================
-// Material Submittal — Design phase activity 1 (migration 0040).
+// Shop Drawing — Design phase activity 2 (migration 0042).
 //
 // Two exports:
-//   • MaterialSubmittalSummaryCard — the status card shown on the
-//     project detail page; links into the dedicated sub-route.
-//   • MaterialSubmittalPage — the full management page at
-//     /projects/[id]/material-submittal.
+//   • ShopDrawingSummaryCard — the status card shown on the project
+//     detail page; links into the dedicated sub-route.
+//   • ShopDrawingPage — the full management page at
+//     /projects/[id]/shop-drawing.
 //
-// Client communication happens OUTSIDE the app (email/WhatsApp). This
-// page only records state: build a draft list → Submit to Client →
-// record the client's response (Approved / Returned / Rejected) →
-// start the next revision if needed. Full revision history is kept.
+// Identical lifecycle to Material Submittal; the payload is uploaded
+// DRAWING FILES (PDF for sharing + DWG AutoCAD source) plus a per-
+// revision description, instead of a list of materials. Client
+// communication happens OUTSIDE the app — this page only records state.
 //
 // Roles: VIEW_DESIGN_DOCS can view; MANAGE_DESIGN can edit. Once the
 // project advances past Design the activity is permanently read-only.
@@ -25,58 +25,28 @@ import { db } from "@/lib/db";
 import { can } from "@/lib/permissions";
 import { phaseIndex } from "@/lib/phases";
 import {
-  createMaterialSubmittal, addMaterialItem, deleteMaterialItem,
-  submitSubmittalRevision, markSubmittalApproved, markSubmittalReturned,
-  markSubmittalRejected, startNextSubmittalRevision, getDesignDocUrl,
+  createShopDrawing, addShopDrawingFiles, deleteShopDrawingFile,
+  submitShopDrawingRevision, markShopDrawingApproved, markShopDrawingReturned,
+  markShopDrawingRejected, startNextShopDrawingRevision, getDesignDocUrl,
 } from "@/lib/create";
-import type { MaterialSubmittal, MaterialSubmittalRevision } from "@/lib/types";
-import { CardHead, EmptyState, PageHeader, Modal } from "../../shared";
+import type { ShopDrawing, ShopDrawingRevision } from "@/lib/types";
+import { CardHead, EmptyState, PageHeader } from "../../shared";
+import { ConfirmDialog, type ConfirmConfig } from "./MaterialSubmittal";
 
-// ── in-app confirm dialog ───────────────────────────────────
-// Replaces the native window.confirm() so destructive / one-way
-// actions get a styled popup consistent with the rest of the app.
-export type ConfirmConfig = {
-  title: string;
-  message: string;
-  confirmLabel: string;
-  tone?: "primary" | "danger";
-  action: () => void;
-};
-
-export function ConfirmDialog({ config, busy, onClose }: {
-  config: ConfirmConfig | null;
-  busy: boolean;
-  onClose: () => void;
-}) {
-  return (
-    <Modal open={!!config} onClose={onClose}>
-      {config && (
-        <div className="col gap-3" style={{ padding: 22 }}>
-          <div style={{ font: "var(--t-h3)" }}>{config.title}</div>
-          <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-            {config.message}
-          </div>
-          <div className="row gap-2" style={{ justifyContent: "flex-end", flexWrap: "wrap", marginTop: 6 }}>
-            <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
-            <button className={"btn " + (config.tone === "danger" ? "btn-danger" : "btn-primary")}
-              disabled={busy}
-              onClick={() => { config.action(); onClose(); }}>
-              {config.confirmLabel}
-            </button>
-          </div>
-        </div>
-      )}
-    </Modal>
-  );
+// ── helpers ─────────────────────────────────────────────────
+function formatBytes(n: number): string {
+  if (!n || n < 1) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-// ── status badge ────────────────────────────────────────────
-function submittalBadge(
-  submittal: MaterialSubmittal | null,
-  current: MaterialSubmittalRevision | null,
+function drawingBadge(
+  drawing: ShopDrawing | null,
+  current: ShopDrawingRevision | null,
 ): { label: string; cls: string } {
-  if (!submittal) return { label: "Not started", cls: "badge-outline" };
-  if (submittal.approvedRevision != null) return { label: `Approved at Rev ${submittal.approvedRevision}`, cls: "badge-success" };
+  if (!drawing) return { label: "Not started", cls: "badge-outline" };
+  if (drawing.approvedRevision != null) return { label: `Approved at Rev ${drawing.approvedRevision}`, cls: "badge-success" };
   if (!current) return { label: "Draft", cls: "badge-outline" };
   switch (current.status) {
     case "submitted": return { label: `Rev ${current.revisionNumber} · Submitted to client`, cls: "badge-warning" };
@@ -87,33 +57,39 @@ function submittalBadge(
   }
 }
 
-function currentRevisionOf(submittalId: string | undefined): MaterialSubmittalRevision | null {
-  if (!submittalId) return null;
-  const revs = db.revisionsForSubmittal(submittalId);
+function currentRevisionOf(drawingId: string | undefined): ShopDrawingRevision | null {
+  if (!drawingId) return null;
+  const revs = db.revisionsForDrawing(drawingId);
   return revs.length ? revs[revs.length - 1] : null;
 }
 
+async function openFile(filePath: string, fireToast: (m: string) => void) {
+  const res = await getDesignDocUrl(filePath, 60);
+  if (!res.ok) { fireToast(`Couldn't open: ${res.error}`); return; }
+  window.open(res.url, "_blank", "noopener");
+}
+
 /* ─── Summary card (project detail page) ─────────────────── */
-export function MaterialSubmittalSummaryCard({ projectId }: { projectId: string }) {
+export function ShopDrawingSummaryCard({ projectId }: { projectId: string }) {
   const { role, dataVersion } = useApp();
   void dataVersion;
   const router = useRouter();
   if (!can(role, "VIEW_DESIGN_DOCS")) return null;
 
-  const submittal = db.submittalForProject(projectId);
-  const current = currentRevisionOf(submittal?.id);
-  const badge = submittalBadge(submittal, current);
+  const drawing = db.drawingForProject(projectId);
+  const current = currentRevisionOf(drawing?.id);
+  const badge = drawingBadge(drawing, current);
 
   return (
     <section className="card card-pad card-hover" style={{ marginBottom: 16, cursor: "pointer" }}
-      onClick={() => router.push(`/projects/${projectId}/material-submittal`)}>
+      onClick={() => router.push(`/projects/${projectId}/shop-drawing`)}>
       <div className="row between" style={{ alignItems: "center", gap: 12, flexWrap: "wrap" }}>
         <div className="row gap-3" style={{ alignItems: "center", minWidth: 0 }}>
-          <Icon name="package" size={18} style={{ color: "var(--ink-mute)" }} />
+          <Icon name="fileText" size={18} style={{ color: "var(--ink-mute)" }} />
           <div style={{ minWidth: 0 }}>
-            <div style={{ font: "var(--t-body-md)", fontWeight: 600 }}>Material Submittal</div>
+            <div style={{ font: "var(--t-body-md)", fontWeight: 600 }}>Shop Drawing</div>
             <div className="truncate" style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>
-              {submittal ? submittal.code : "Equipment list for client approval"}
+              {drawing ? drawing.code : "Technical drawings for client approval"}
             </div>
           </div>
         </div>
@@ -127,7 +103,7 @@ export function MaterialSubmittalSummaryCard({ projectId }: { projectId: string 
 }
 
 /* ─── Full management page (sub-route) ───────────────────── */
-export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
+export function ShopDrawingPage({ projectId }: { projectId: string }) {
   const { role, me, fireToast, bumpData, dataVersion } = useApp();
   void dataVersion;
   const router = useRouter();
@@ -135,16 +111,16 @@ export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
   if (!can(role, "VIEW_DESIGN_DOCS")) {
     return (
       <div className="main-pad">
-        <PageHeader eyebrow="Design" title="Material Submittal" />
+        <PageHeader eyebrow="Design" title="Shop Drawing" />
         <EmptyState icon="shield" title="Not available for your role"
-          sub="Material submittals are managed by Operations Manager / Admin / MD." />
+          sub="Shop drawings are managed by Operations Manager / Admin / MD." />
       </div>
     );
   }
 
   const project = db.proj(projectId);
-  const submittal = db.submittalForProject(projectId);
-  const revisions = submittal ? db.revisionsForSubmittal(submittal.id) : [];
+  const drawing = db.drawingForProject(projectId);
+  const revisions = drawing ? db.revisionsForDrawing(drawing.id) : [];
   const current = revisions.length ? revisions[revisions.length - 1] : null;
 
   const phaseLocked = !!project && phaseIndex(project.currentPhase) > phaseIndex("design");
@@ -160,7 +136,7 @@ export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
     bumpData(); if (ok) fireToast(ok);
   };
 
-  const badge = submittalBadge(submittal, current);
+  const badge = drawingBadge(drawing, current);
 
   return (
     <div className="main-pad">
@@ -171,27 +147,27 @@ export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
         </a>
       </div>
 
-      <PageHeader eyebrow="Design · Activity 1" title="Material Submittal"
-        sub={current ? `Revision ${current.revisionNumber}` : "Equipment list for client approval"}
+      <PageHeader eyebrow="Design · Activity 2" title="Shop Drawing"
+        sub={current ? `Revision ${current.revisionNumber}` : "Technical drawings for client approval"}
         right={<span className={"badge " + badge.cls} style={{ fontWeight: 600 }}>{badge.label}</span>} />
 
       {phaseLocked && (
         <div className="alert-banner tone-info" style={{ marginBottom: 16 }}>
           <div className="ic"><Icon name="lock" size={16} /></div>
           <div className="text"><div className="h">Design phase locked</div>
-            <div className="d">This project has moved past Design — the submittal is read-only.</div></div>
+            <div className="d">This project has moved past Design — the shop drawing is read-only.</div></div>
         </div>
       )}
       {err && <div style={{ font: "var(--t-small)", color: "var(--dan-700)", marginBottom: 12 }}>{err}</div>}
 
-      {!submittal ? (
+      {!drawing ? (
         <section className="card card-pad">
-          <EmptyState icon="package" title="No material submittal yet"
-            sub={canManage ? "Create it to start listing materials for the client." : "Not started yet."}
+          <EmptyState icon="fileText" title="No shop drawing yet"
+            sub={canManage ? "Create it to start uploading drawing files for the client." : "Not started yet."}
             action={canManage ? (
               <button className="btn btn-primary" disabled={busy}
-                onClick={() => run(() => createMaterialSubmittal(projectId, me.id), "Material submittal created")}>
-                <Icon name="plus" size={14} /> Create material submittal
+                onClick={() => run(() => createShopDrawing(projectId, me.id), "Shop drawing created")}>
+                <Icon name="plus" size={14} /> Create shop drawing
               </button>
             ) : undefined} />
         </section>
@@ -199,14 +175,14 @@ export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
         <>
           {current && (
             <CurrentRevisionPanel
-              revision={current} submittal={submittal} canManage={canManage} busy={busy}
-              onAddItem={(input, file) => run(() => addMaterialItem(current.id, input, file, me.id), "Material added")}
-              onDeleteItem={(itemId) => run(() => deleteMaterialItem(itemId), "Item removed")}
-              onSubmit={() => run(() => submitSubmittalRevision(current.id), "Submitted to client")}
-              onApprove={() => run(() => markSubmittalApproved(current.id), "Marked approved")}
-              onReturn={(c) => run(() => markSubmittalReturned(current.id, c), "Recorded client comments")}
-              onReject={(c) => run(() => markSubmittalRejected(current.id, c), "Marked rejected")}
-              onNextRevision={() => run(() => startNextSubmittalRevision(submittal.id, me.id), "New revision started")}
+              revision={current} canManage={canManage} busy={busy}
+              onAddFiles={(files, description) => run(() => addShopDrawingFiles(current.id, files, description, me.id), "Files uploaded")}
+              onDeleteFile={(fileId) => run(() => deleteShopDrawingFile(fileId), "File removed")}
+              onSubmit={() => run(() => submitShopDrawingRevision(current.id), "Submitted to client")}
+              onApprove={() => run(() => markShopDrawingApproved(current.id), "Marked approved")}
+              onReturn={(c) => run(() => markShopDrawingReturned(current.id, c), "Recorded client comments")}
+              onReject={(c) => run(() => markShopDrawingRejected(current.id, c), "Marked rejected")}
+              onNextRevision={() => run(() => startNextShopDrawingRevision(drawing.id, me.id), "New revision started")}
               fireToast={fireToast} />
           )}
 
@@ -225,25 +201,24 @@ export function MaterialSubmittalPage({ projectId }: { projectId: string }) {
 
 /* ─── Current revision panel ─────────────────────────────── */
 function CurrentRevisionPanel({
-  revision, canManage, busy, onAddItem, onDeleteItem, onSubmit, onApprove,
+  revision, canManage, busy, onAddFiles, onDeleteFile, onSubmit, onApprove,
   onReturn, onReject, onNextRevision, fireToast,
 }: {
-  revision: MaterialSubmittalRevision;
-  submittal: MaterialSubmittal;
+  revision: ShopDrawingRevision;
   canManage: boolean; busy: boolean;
-  onAddItem: (input: { description: string; model_number?: string; quantity?: number }, file: File | null) => void;
-  onDeleteItem: (itemId: string) => void;
+  onAddFiles: (files: File[], description: string | null) => void;
+  onDeleteFile: (fileId: string) => void;
   onSubmit: () => void; onApprove: () => void;
   onReturn: (comments: string) => void; onReject: (reason: string) => void;
   onNextRevision: () => void;
   fireToast: (m: string) => void;
 }) {
-  const items = db.itemsForRevision(revision.id);
+  const files = db.filesForRevision(revision.id);
   const isDraft = revision.status === "draft";
   const isSubmitted = revision.status === "submitted";
   const isClosed = revision.status === "returned" || revision.status === "rejected";
 
-  const [adding, setAdding] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [respMode, setRespMode] = useState<null | "return" | "reject">(null);
   const [note, setNote] = useState("");
   const [confirm, setConfirm] = useState<ConfirmConfig | null>(null);
@@ -251,60 +226,65 @@ function CurrentRevisionPanel({
   return (
     <section className="card card-pad">
       <CardHead title={`Revision ${revision.revisionNumber}`}
-        sub={revision.status === "draft" ? "Draft — add materials, then submit to the client"
+        sub={revision.status === "draft" ? "Draft — upload drawings, then submit to the client"
           : revision.status === "submitted" ? "Submitted — record the client's response"
           : revision.status === "approved" ? "Approved by the client"
           : revision.status === "returned" ? "Returned with comments" : "Rejected"}
         right={canManage && isDraft ? (
-          <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => setAdding(a => !a)}>
-            <Icon name="plus" size={13} /> Add Material
+          <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => setUploading(u => !u)}>
+            <Icon name="paperclip" size={13} /> Upload Files
           </button>
         ) : undefined} />
 
-      {/* Add-material form (draft only) */}
-      {canManage && isDraft && adding && (
-        <AddMaterialForm busy={busy} onCancel={() => setAdding(false)}
-          onSave={(input, file) => { onAddItem(input, file); setAdding(false); }} />
+      {/* Description */}
+      {revision.description && (
+        <div style={{ marginTop: 4, marginBottom: 12, padding: 12, borderRadius: "var(--r-md)", background: "var(--bg-muted)" }}>
+          <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Description</div>
+          <div style={{ font: "var(--t-small)", whiteSpace: "pre-wrap" }}>{revision.description}</div>
+        </div>
       )}
 
-      {/* Items table */}
-      {items.length === 0 ? (
-        <EmptyState icon="package" title="No materials yet"
-          sub={canManage && isDraft ? "Click “Add Material” to list the first item." : undefined} />
+      {/* Upload form (draft only) */}
+      {canManage && isDraft && uploading && (
+        <UploadFilesForm busy={busy} initialDescription={revision.description ?? ""}
+          onCancel={() => setUploading(false)}
+          onSave={(files, description) => { onAddFiles(files, description); setUploading(false); }} />
+      )}
+
+      {/* Files table */}
+      {files.length === 0 ? (
+        <EmptyState icon="fileText" title="No files yet"
+          sub={canManage && isDraft ? "Click “Upload Files” to attach the drawing PDFs and DWG sources." : undefined} />
       ) : (
         <div className="card" style={{ padding: 0, overflow: "hidden", marginTop: 4 }}>
           <div style={{ overflowX: "auto" }}>
             <table className="table">
               <thead><tr>
-                <th>#</th><th>Description</th><th className="hide-mobile">Model</th>
-                <th style={{ textAlign: "right" }}>Qty</th><th>Datasheet</th>
+                <th>#</th><th>File</th><th className="hide-mobile">Type</th>
+                <th style={{ textAlign: "right" }}>Size</th><th>Open</th>
                 {canManage && isDraft && <th style={{ width: 44 }}></th>}
               </tr></thead>
               <tbody>
-                {items.map((it, idx) => (
-                  <tr key={it.id}>
+                {files.map((f, idx) => (
+                  <tr key={f.id}>
                     <td data-th="#" className="numeric" style={{ color: "var(--ink-mute)" }}>{idx + 1}</td>
-                    <td data-th="Description" style={{ font: "var(--t-body-md)" }}>{it.description}</td>
-                    <td data-th="Model" className="hide-mobile" style={{ font: "var(--t-small)", color: "var(--ink-mute)" }}>{it.modelNumber ?? "—"}</td>
-                    <td data-th="Qty" className="numeric" style={{ textAlign: "right" }}>{it.quantity}</td>
-                    <td data-th="Datasheet">
-                      {it.datasheetPath ? (
-                        <button className="btn btn-ghost btn-sm" onClick={async () => {
-                          const res = await getDesignDocUrl(it.datasheetPath!, 60);
-                          if (!res.ok) { fireToast(`Couldn't open: ${res.error}`); return; }
-                          window.open(res.url, "_blank", "noopener");
-                        }}><Icon name="fileText" size={12} /> View</button>
-                      ) : <span style={{ font: "var(--t-micro)", color: "var(--ink-quiet)" }}>—</span>}
+                    <td data-th="File" style={{ font: "var(--t-body-md)", wordBreak: "break-word" }}>{f.fileName}</td>
+                    <td data-th="Type" className="hide-mobile" style={{ font: "var(--t-small)", color: "var(--ink-mute)", textTransform: "uppercase" }}>{f.kind}</td>
+                    <td data-th="Size" className="numeric" style={{ textAlign: "right" }}>{formatBytes(f.fileSize)}</td>
+                    <td data-th="Open">
+                      <button className="btn btn-ghost btn-sm" onClick={() => openFile(f.filePath, fireToast)}>
+                        <Icon name={f.kind === "pdf" ? "fileText" : "externalLink"} size={12} /> {f.kind === "pdf" ? "View" : "Download"}
+                      </button>
                     </td>
                     {canManage && isDraft && (
                       <td data-th="" style={{ textAlign: "right" }}>
                         <button className="btn btn-ghost btn-sm" disabled={busy} aria-label="Remove"
                           onClick={() => setConfirm({
-                            title: "Remove material",
-                            message: `Remove “${it.description}” from this list?`,
+                            title: "Remove file",
+                            message: `Remove “${f.fileName}” from this revision?`,
                             confirmLabel: "Remove",
                             tone: "danger",
-                            action: () => onDeleteItem(it.id),
+                            action: () => onDeleteFile(f.id),
                           })}>
                           <Icon name="trash" size={12} />
                         </button>
@@ -330,10 +310,10 @@ function CurrentRevisionPanel({
       {canManage && (
         <div className="row gap-2" style={{ marginTop: 16, flexWrap: "wrap" }}>
           {isDraft && (
-            <button className="btn btn-primary" disabled={busy || items.length === 0}
+            <button className="btn btn-primary" disabled={busy || files.length === 0}
               onClick={() => setConfirm({
                 title: "Submit to client",
-                message: "Submit this material list to the client for approval?\n\nYou won't be able to edit it until the client responds.",
+                message: "Submit these drawings to the client for approval?\n\nYou won't be able to add or remove files until the client responds.",
                 confirmLabel: "Submit to client",
                 action: onSubmit,
               })}>
@@ -345,7 +325,7 @@ function CurrentRevisionPanel({
               <button className="btn btn-primary" disabled={busy}
                 onClick={() => setConfirm({
                   title: "Mark as approved",
-                  message: "Mark this submittal as approved by the client?\n\nThe revision will be locked permanently.",
+                  message: "Mark this shop drawing as approved by the client?\n\nThe revision will be locked permanently.",
                   confirmLabel: "Mark approved",
                   action: onApprove,
                 })}>
@@ -365,7 +345,7 @@ function CurrentRevisionPanel({
                 {respMode === "return" ? "Client's requested changes" : "Reason for rejection"}
               </label>
               <textarea className="textarea" rows={3} value={note} onChange={e => setNote(e.target.value)}
-                placeholder={respMode === "return" ? "e.g. Change cameras to Dahua, cable to CAT6…" : "e.g. Wrong brands across the board"} />
+                placeholder={respMode === "return" ? "e.g. Move camera 23 to the corridor, reroute the main cable through the ceiling…" : "e.g. Layout doesn't match the approved BOQ"} />
               <div className="row gap-2">
                 <button className="btn btn-primary" disabled={busy}
                   onClick={() => { respMode === "return" ? onReturn(note) : onReject(note); setRespMode(null); }}>
@@ -388,48 +368,45 @@ function CurrentRevisionPanel({
   );
 }
 
-/* ─── Add-material form ──────────────────────────────────── */
-function AddMaterialForm({ busy, onSave, onCancel }: {
+/* ─── Upload-files form ──────────────────────────────────── */
+function UploadFilesForm({ busy, initialDescription, onSave, onCancel }: {
   busy: boolean;
-  onSave: (input: { description: string; model_number?: string; quantity?: number }, file: File | null) => void;
+  initialDescription: string;
+  onSave: (files: File[], description: string | null) => void;
   onCancel: () => void;
 }) {
-  const [description, setDescription] = useState("");
-  const [model, setModel] = useState("");
-  const [qty, setQty] = useState("1");
+  const [description, setDescription] = useState(initialDescription);
   const fileRef = useRef<HTMLInputElement>(null);
-  const [fileName, setFileName] = useState<string | null>(null);
+  const [fileNames, setFileNames] = useState<string[]>([]);
+
+  const pickedFiles = (): File[] => Array.from(fileRef.current?.files ?? []);
+  const canSave = !busy && (fileNames.length > 0 || description.trim() !== initialDescription.trim());
 
   return (
     <div className="card" style={{ padding: 14, margin: "12px 0", background: "var(--bg-muted)" }}>
-      <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
+      <div className="col" style={{ gap: 12 }}>
         <div className="col" style={{ gap: 4 }}>
-          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Material description *</label>
-          <input className="input input-sm" value={description} onChange={e => setDescription(e.target.value)} placeholder="Dahua 2MP IP Camera" />
-        </div>
-        <div className="col" style={{ gap: 4 }}>
-          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Model number</label>
-          <input className="input input-sm" value={model} onChange={e => setModel(e.target.value)} placeholder="DH-IPC-HFW2230S" />
-        </div>
-        <div className="col" style={{ gap: 4 }}>
-          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Quantity</label>
-          <input className="input input-sm" type="number" min={1} value={qty} onChange={e => setQty(e.target.value)} />
-        </div>
-        <div className="col" style={{ gap: 4 }}>
-          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Datasheet (PDF/JPG/PNG)</label>
-          <input ref={fileRef} type="file" accept=".pdf,.jpg,.jpeg,.png" style={{ display: "none" }}
-            onChange={e => setFileName(e.target.files?.[0]?.name ?? null)} />
-          <button className="btn btn-ghost btn-sm" onClick={() => fileRef.current?.click()}>
-            <Icon name="paperclip" size={12} /> {fileName ? fileName.slice(0, 22) : "Attach"}
+          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Drawing files (PDF / DWG) — you can pick several at once</label>
+          <input ref={fileRef} type="file" accept=".pdf,.dwg" multiple style={{ display: "none" }}
+            onChange={e => setFileNames(Array.from(e.target.files ?? []).map(f => f.name))} />
+          <button className="btn btn-ghost btn-sm" style={{ alignSelf: "flex-start" }} onClick={() => fileRef.current?.click()}>
+            <Icon name="paperclip" size={12} /> {fileNames.length ? `${fileNames.length} file${fileNames.length > 1 ? "s" : ""} selected` : "Select files"}
           </button>
+          {fileNames.length > 0 && (
+            <ul style={{ margin: "4px 0 0", paddingLeft: 18, font: "var(--t-micro)", color: "var(--ink-mute)" }}>
+              {fileNames.map((n, i) => <li key={i} style={{ wordBreak: "break-word" }}>{n}</li>)}
+            </ul>
+          )}
+        </div>
+        <div className="col" style={{ gap: 4 }}>
+          <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)" }}>Description</label>
+          <textarea className="textarea" rows={2} value={description} onChange={e => setDescription(e.target.value)}
+            placeholder="e.g. Initial floor plan with 40 camera positions across 3 floors" />
         </div>
       </div>
-      <div className="row gap-2" style={{ marginTop: 12 }}>
-        <button className="btn btn-primary btn-sm" disabled={busy || !description.trim()}
-          onClick={() => onSave(
-            { description, model_number: model || undefined, quantity: Number(qty) || 1 },
-            fileRef.current?.files?.[0] ?? null,
-          )}>Save item</button>
+      <div className="row gap-2" style={{ marginTop: 12, flexWrap: "wrap" }}>
+        <button className="btn btn-primary btn-sm" disabled={!canSave}
+          onClick={() => onSave(pickedFiles(), description)}>Save</button>
         <button className="btn btn-ghost btn-sm" disabled={busy} onClick={onCancel}>Cancel</button>
       </div>
     </div>
@@ -437,16 +414,14 @@ function AddMaterialForm({ busy, onSave, onCancel }: {
 }
 
 /* ─── Revision history row (expandable) ──────────────────── */
-function RevisionHistoryRow({ r, fireToast }: { r: MaterialSubmittalRevision; fireToast: (m: string) => void }) {
+function RevisionHistoryRow({ r, fireToast }: { r: ShopDrawingRevision; fireToast: (m: string) => void }) {
   const [open, setOpen] = useState(false);
-  const items = db.itemsForRevision(r.id);
-  const badge = submittalBadge(null, r); // status-only label
+  const files = db.filesForRevision(r.id);
   const label = r.status === "approved" ? { label: `Approved`, cls: "badge-success" }
     : r.status === "submitted" ? { label: "Submitted", cls: "badge-warning" }
     : r.status === "returned" ? { label: "Returned", cls: "badge-warning" }
     : r.status === "rejected" ? { label: "Rejected", cls: "badge-danger" }
     : { label: "Draft", cls: "badge-outline" };
-  void badge;
 
   return (
     <div style={{ border: "1px solid var(--border)", borderRadius: "var(--r-md)", overflow: "hidden" }}>
@@ -462,24 +437,27 @@ function RevisionHistoryRow({ r, fireToast }: { r: MaterialSubmittalRevision; fi
       </button>
       {open && (
         <div style={{ padding: "0 12px 12px", borderTop: "1px solid var(--divider)" }}>
+          {r.description && (
+            <div style={{ margin: "10px 0 0", font: "var(--t-small)", whiteSpace: "pre-wrap" }}>
+              <strong>Description:</strong> {r.description}
+            </div>
+          )}
           {r.clientComments && (
-            <div style={{ margin: "10px 0", padding: 10, borderRadius: "var(--r-sm)", background: "var(--bg-muted)", font: "var(--t-small)", whiteSpace: "pre-wrap" }}>
+            <div style={{ margin: "10px 0 0", padding: 10, borderRadius: "var(--r-sm)", background: "var(--bg-muted)", font: "var(--t-small)", whiteSpace: "pre-wrap" }}>
               <strong>Client:</strong> {r.clientComments}
             </div>
           )}
-          {items.length === 0 ? (
-            <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 10 }}>No items.</div>
+          {files.length === 0 ? (
+            <div style={{ font: "var(--t-small)", color: "var(--ink-mute)", marginTop: 10 }}>No files.</div>
           ) : (
             <ul style={{ margin: "10px 0 0", paddingLeft: 18, font: "var(--t-small)" }}>
-              {items.map(it => (
-                <li key={it.id} style={{ marginBottom: 4 }}>
-                  {it.quantity}× {it.description}{it.modelNumber ? ` (${it.modelNumber})` : ""}
-                  {it.datasheetPath && (
-                    <button className="btn-link" style={{ marginLeft: 8, font: "var(--t-micro)", color: "var(--pri-700)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-                      onClick={async () => { const res = await getDesignDocUrl(it.datasheetPath!, 60); if (res.ok) window.open(res.url, "_blank", "noopener"); else fireToast(res.error); }}>
-                      datasheet
-                    </button>
-                  )}
+              {files.map(f => (
+                <li key={f.id} style={{ marginBottom: 4, wordBreak: "break-word" }}>
+                  {f.fileName} <span style={{ color: "var(--ink-quiet)" }}>({f.kind.toUpperCase()} · {formatBytes(f.fileSize)})</span>
+                  <button className="btn-link" style={{ marginLeft: 8, font: "var(--t-micro)", color: "var(--pri-700)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+                    onClick={() => openFile(f.filePath, fireToast)}>
+                    open
+                  </button>
                 </li>
               ))}
             </ul>

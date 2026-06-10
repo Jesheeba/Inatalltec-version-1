@@ -205,6 +205,11 @@ export function AppProvider({
       for (const s of initialBundle.materialSubmittals) db.MATERIAL_SUBMITTALS[s.id] = s;
       for (const r of initialBundle.materialSubmittalRevisions) db.MATERIAL_SUBMITTAL_REVISIONS[r.id] = r;
       for (const i of initialBundle.materialItems) db.MATERIAL_ITEMS[i.id] = i;
+      for (const d of initialBundle.shopDrawings) db.SHOP_DRAWINGS[d.id] = d;
+      for (const r of initialBundle.shopDrawingRevisions) db.SHOP_DRAWING_REVISIONS[r.id] = r;
+      for (const f of initialBundle.shopDrawingFiles) db.SHOP_DRAWING_FILES[f.id] = f;
+      for (const j of initialBundle.projectJca) db.PROJECT_JCA[j.id] = j;
+      for (const h of initialBundle.projectJcaHistory) db.PROJECT_JCA_HISTORY[h.id] = h;
     }
     return true;
   });

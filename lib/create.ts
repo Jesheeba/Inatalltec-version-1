@@ -498,16 +498,12 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = typeof PROJECT_STATUSES[number];
 
-// Note: 'lead' stage was retired (per spec: a project enters the
-// system at the Quote stage). The DB enum still carries the 'lead'
-// label (Postgres won't let us drop an enum value cleanly) but no row
-// should ever hold it — migration 0041 backfills any leftovers to
-// 'quote' and the UI no longer offers it. Keep the type in sync.
-export const PROJECT_STAGES = [
-  "quote", "won", "mobilization", "execution",
-  "testing_commissioning", "handover", "dlp", "amc_handoff",
-] as const;
-export type ProjectStage = typeof PROJECT_STAGES[number];
+// Project lifecycle "stage" (Quote · Won · Mobilization · …) was
+// retired in favour of the richer Phase tracker (migration 0020). The
+// DB column `projects.stage` is left dormant — its NOT NULL default of
+// 'mobilization' keeps INSERTs alive, and `project_status_history`
+// stage-change rows stay readable for audit. No reads or writes from
+// the application.
 
 export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
   planned: "Planned",
@@ -515,16 +511,6 @@ export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
   on_hold: "On Hold",
   completed: "Completed",
   cancelled: "Cancelled",
-};
-export const PROJECT_STAGE_LABEL: Record<ProjectStage, string> = {
-  quote: "Quote",
-  won: "Won",
-  mobilization: "Mobilization",
-  execution: "Execution",
-  testing_commissioning: "Testing & Commissioning",
-  handover: "Handover",
-  dlp: "DLP",
-  amc_handoff: "AMC Handoff",
 };
 
 // Job-category dropdown values. Mirrors the CHECK constraint added in
@@ -576,7 +562,6 @@ export interface ProjectInput {
   started_at: string;
   due_at: string;
   status?: ProjectStatus;
-  stage?: ProjectStage;
   // Step B (migration 0012) — Main Contractor Job specifics.
   scope_description?: string;
   job_category?: JobCategory;
@@ -595,7 +580,6 @@ export async function createProject(input: ProjectInput): Promise<Result> {
   const code = input.code?.trim() || `PRJ-${new Date().getFullYear()}-${Math.floor(Math.random() * 900 + 100)}`;
   const id = shortId("p");
   const status: ProjectStatus = input.status || "planned";
-  const stage: ProjectStage = input.stage || "quote";
   const row: Project = {
     id, code, name: input.name.trim(),
     customer: input.customer_id,
@@ -604,7 +588,6 @@ export async function createProject(input: ProjectInput): Promise<Result> {
     team: "",
     leadTechId: input.lead_tech_id || "",
     status,
-    stage,
     currentPhase: input.current_phase ?? "design",
     progress: 0,
     value: input.value_aed,
@@ -628,7 +611,6 @@ export async function createProject(input: ProjectInput): Promise<Result> {
     manager_id: input.manager_id || null,
     lead_tech_id: input.lead_tech_id || null,
     status,
-    stage,
     // Send current_phase only when the form explicitly picked one.
     // Omitting lets the projects.current_phase DEFAULT 'design' apply
     // server-side (migration 0020:2b) so we never write a stale value.
@@ -657,14 +639,16 @@ export async function createProject(input: ProjectInput): Promise<Result> {
   return { ok: true, id: row.id };
 }
 
-// Patch an existing project. Status/stage changes are audited
-// server-side by trigger trg_project_status_change (see 0008).
+// Patch an existing project. Status changes are audited server-side
+// by trigger trg_project_status_change (see 0008). The legacy stage
+// column is retired from the application (migration 0008 keeps it on
+// the DB with a NOT NULL default so existing rows still validate),
+// so updateProject no longer accepts or writes a stage value.
 // Returns the updated Project so the caller can replace its
 // in-memory mirror without an extra round-trip.
 export interface ProjectPatch {
   name?: string;
   status?: ProjectStatus;
-  stage?: ProjectStage;
   progress?: number;
   manager_id?: string | null;
   lead_tech_id?: string | null;
@@ -682,7 +666,6 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
   const body: Record<string, unknown> = {};
   if (patch.name !== undefined) body.name = patch.name.trim();
   if (patch.status !== undefined) body.status = patch.status;
-  if (patch.stage !== undefined) body.stage = patch.stage;
   if (patch.progress !== undefined) body.progress = patch.progress;
   if (patch.manager_id !== undefined) body.manager_id = patch.manager_id;
   if (patch.lead_tech_id !== undefined) body.lead_tech_id = patch.lead_tech_id;
@@ -692,7 +675,7 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
 
   const { data, error } = await supabaseBrowser()
     .from("projects").update(body).eq("id", id)
-    .select("id, code, name, customer_id, site_id, manager_id, team_id, lead_tech_id, status, stage, current_phase, progress, value_aed, started_at, due_at")
+    .select("id, code, name, customer_id, site_id, manager_id, team_id, lead_tech_id, status, current_phase, progress, value_aed, started_at, due_at")
     .single();
   if (error) return { ok: false, error: error.message };
 
@@ -707,7 +690,6 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
     team: (data.team_id as string) ?? "",
     leadTechId: (data.lead_tech_id as string) ?? "",
     status: data.status as string,
-    stage: data.stage as string,
     currentPhase: (data.current_phase as ProjectPhase | null) ?? null,
     progress: (data.progress as number) ?? 0,
     value: (data.value_aed as number) ?? 0,
@@ -3013,6 +2995,367 @@ export async function startNextSubmittalRevision(
 
   db.MATERIAL_SUBMITTAL_REVISIONS[revision.id] = revision;
   return { ok: true, revision };
+}
+
+// ─────────────────────────────────────────────────────────
+// SHOP DRAWING — Design phase activity 2 (migration 0042)
+// All functions here are NEW. Mirrors the Material Submittal lifecycle
+// above; the payload is uploaded drawing FILES (PDF + DWG) instead of a
+// materials list. Reuses the shared project-design-docs bucket (files
+// under drawing/<projectId>/…) and getDesignDocUrl for downloads.
+// ─────────────────────────────────────────────────────────
+const SHOP_DRAWING_MAX_BYTES = 25 * 1024 * 1024; // 25 MB — DWG files run large
+
+const SD_COLS  = "id, project_id, code, current_revision, approved_revision, created_by, created_at, updated_at";
+const SDR_COLS = "id, drawing_id, revision_number, status, description, submitted_at, responded_at, client_comments, created_by, created_at, updated_at";
+const SDF_COLS = "id, revision_id, file_path, file_name, file_size, mime_type, kind, sort_order, created_at";
+
+type SdT  = import("./types").ShopDrawing;
+type SdrT = import("./types").ShopDrawingRevision;
+type SdfT = import("./types").ShopDrawingFile;
+type SdrStatus = import("./types").ShopDrawingStatus;
+
+function rowToSd(r: Record<string, unknown>): SdT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const n = (v: unknown): number | null => (typeof v === "number" ? v : null);
+  return {
+    id: s(r.id), projectId: s(r.project_id), code: s(r.code),
+    currentRevision: typeof r.current_revision === "number" ? r.current_revision : 1,
+    approvedRevision: n(r.approved_revision),
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: s(r.created_at), updatedAt: s(r.updated_at),
+  };
+}
+function rowToSdr(r: Record<string, unknown>): SdrT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const sn = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    id: s(r.id), drawingId: s(r.drawing_id),
+    revisionNumber: typeof r.revision_number === "number" ? r.revision_number : 1,
+    status: ((r.status as SdrStatus) ?? "draft"),
+    description: sn(r.description),
+    submittedAt: sn(r.submitted_at), respondedAt: sn(r.responded_at),
+    clientComments: sn(r.client_comments),
+    createdBy: (r.created_by as string | null) ?? null,
+    createdAt: s(r.created_at), updatedAt: s(r.updated_at),
+  };
+}
+function rowToSdf(r: Record<string, unknown>): SdfT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  const sn = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const kind = r.kind === "pdf" || r.kind === "dwg" ? r.kind : "other";
+  return {
+    id: s(r.id), revisionId: s(r.revision_id),
+    filePath: s(r.file_path), fileName: s(r.file_name),
+    fileSize: typeof r.file_size === "number" ? r.file_size : 0,
+    mimeType: sn(r.mime_type), kind: kind as SdfT["kind"],
+    sortOrder: typeof r.sort_order === "number" ? r.sort_order : 0,
+    createdAt: s(r.created_at),
+  };
+}
+
+export type SdResult  = { ok: true; drawing: SdT } | { ok: false; error: string };
+export type SdrResult = { ok: true; revision: SdrT } | { ok: false; error: string };
+
+// Create the shop drawing + its first (draft) revision for a project.
+export async function createShopDrawing(
+  projectId: string, createdBy: string | null,
+): Promise<{ ok: true; drawing: SdT; revision: SdrT } | { ok: false; error: string }> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  if (db.SHOP_DRAWINGS && Object.values(db.SHOP_DRAWINGS).some(d => d.projectId === projectId)) {
+    return { ok: false, error: "This project already has a shop drawing." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  let drawing: SdT | null = null;
+  for (let attempt = 0; attempt < MAX_CODE_RETRIES; attempt++) {
+    const { data, error } = await supa.from("shop_drawings")
+      .insert({ project_id: projectId, current_revision: 1, created_by: createdBy })
+      .select(SD_COLS).single();
+    if (!error && data) { drawing = rowToSd(data as Record<string, unknown>); break; }
+    const code = (error as { code?: string } | null)?.code;
+    if (code === UNIQUE_VIOLATION && /code/.test((error as { message?: string } | null)?.message ?? "")) continue;
+    return { ok: false, error: error?.message || "Failed to create shop drawing." };
+  }
+  if (!drawing) return { ok: false, error: "Could not allocate a drawing code — try again." };
+
+  const { data: revData, error: revErr } = await supa.from("shop_drawing_revisions")
+    .insert({ drawing_id: drawing.id, revision_number: 1, status: "draft", created_by: createdBy })
+    .select(SDR_COLS).single();
+  if (revErr || !revData) return { ok: false, error: revErr?.message || "Failed to create revision 1." };
+
+  const revision = rowToSdr(revData as Record<string, unknown>);
+  db.SHOP_DRAWINGS[drawing.id] = drawing;
+  db.SHOP_DRAWING_REVISIONS[revision.id] = revision;
+  return { ok: true, drawing, revision };
+}
+
+// Upload one or more files to a DRAFT revision and/or set its description.
+// At least one file or a description change must be supplied.
+export async function addShopDrawingFiles(
+  revisionId: string, files: File[], description: string | null, _uploaderId: string | null,
+): Promise<{ ok: true; files: SdfT[] } | { ok: false; error: string }> {
+  void _uploaderId;
+  if (!revisionId) return { ok: false, error: "Revision id is required." };
+  const rev = db.SHOP_DRAWING_REVISIONS[revisionId];
+  if (rev && rev.status !== "draft") return { ok: false, error: "This revision is locked — files can only be added while it's a draft." };
+  const list = (files ?? []).filter(Boolean);
+  const hasDesc = description != null;
+  if (list.length === 0 && !hasDesc) return { ok: false, error: "Attach at least one file (or edit the description)." };
+
+  const projectId = rev ? db.SHOP_DRAWINGS[rev.drawingId]?.projectId ?? "" : "";
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  // Validate every file up-front before uploading any.
+  for (const f of list) {
+    if (f.size > SHOP_DRAWING_MAX_BYTES) {
+      return { ok: false, error: `"${f.name}" is over the 25 MB limit (${(f.size / 1024 / 1024).toFixed(1)} MB).` };
+    }
+    if (!["pdf", "dwg"].includes(fileExt(f.name))) {
+      return { ok: false, error: `"${f.name}" must be a PDF or DWG file.` };
+    }
+  }
+
+  // Persist the description first (so it sticks even if a file fails).
+  if (hasDesc) {
+    const { data, error } = await supa.from("shop_drawing_revisions")
+      .update({ description: description?.trim() || null }).eq("id", revisionId).select(SDR_COLS).maybeSingle();
+    if (error) return { ok: false, error: error.message };
+    if (data) db.SHOP_DRAWING_REVISIONS[revisionId] = rowToSdr(data as Record<string, unknown>);
+  }
+
+  const baseOrder = Object.values(db.SHOP_DRAWING_FILES).filter(f => f.revisionId === revisionId).length;
+  const saved: SdfT[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i];
+    const ext = fileExt(f.name);
+    const kind = ext === "pdf" ? "pdf" : ext === "dwg" ? "dwg" : "other";
+    const safe = f.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "drawing";
+    const rand = Math.random().toString(36).slice(2, 10);
+    const filePath = `drawing/${projectId || "unknown"}/${rand}-${safe}`;
+    const { error: upErr } = await supa.storage.from(DESIGN_BUCKET)
+      .upload(filePath, f, { contentType: f.type || undefined, upsert: false });
+    if (upErr) return saved.length
+      ? { ok: true, files: saved } // some succeeded; surface those, stop on first failure
+      : { ok: false, error: `Upload failed: ${upErr.message}` };
+
+    const { data, error } = await supa.from("shop_drawing_files").insert({
+      revision_id: revisionId, file_path: filePath, file_name: f.name,
+      file_size: f.size, mime_type: f.type || null, kind, sort_order: baseOrder + i,
+    }).select(SDF_COLS).single();
+    if (error || !data) {
+      await supa.storage.from(DESIGN_BUCKET).remove([filePath]);
+      return saved.length ? { ok: true, files: saved } : { ok: false, error: error?.message || "Failed to record file." };
+    }
+    const file = rowToSdf(data as Record<string, unknown>);
+    db.SHOP_DRAWING_FILES[file.id] = file;
+    saved.push(file);
+  }
+  return { ok: true, files: saved };
+}
+
+// Delete a file row. Like deleteMaterialItem we leave the storage blob —
+// startNextShopDrawingRevision does NOT copy files, but keeping the blob
+// is harmless and avoids races; orphans are small and private.
+export async function deleteShopDrawingFile(fileId: string): Promise<Result> {
+  if (!fileId) return { ok: false, error: "File id is required." };
+  const file = db.SHOP_DRAWING_FILES[fileId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  delete db.SHOP_DRAWING_FILES[fileId]; // optimistic
+  const { error } = await supabaseBrowser().from("shop_drawing_files").delete().eq("id", fileId);
+  if (error) { if (file) db.SHOP_DRAWING_FILES[fileId] = file; return { ok: false, error: error.message }; }
+  return { ok: true, id: fileId };
+}
+
+// Generic guarded revision transition (optimistic concurrency on status).
+async function sdrTransition(
+  revisionId: string, expected: SdrStatus, patch: Record<string, unknown>,
+): Promise<SdrResult> {
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+  const { data, error } = await supa.from("shop_drawing_revisions")
+    .update(patch).eq("id", revisionId).eq("status", expected).select(SDR_COLS);
+  if (error) return { ok: false, error: error.message };
+  if (!data || data.length === 0) {
+    const { data: cur } = await supa.from("shop_drawing_revisions").select(SDR_COLS).eq("id", revisionId).maybeSingle();
+    if (cur) { const r = rowToSdr(cur as Record<string, unknown>); db.SHOP_DRAWING_REVISIONS[r.id] = r;
+      return { ok: false, error: `This revision is already "${r.status}".` }; }
+    return { ok: false, error: "Revision not found." };
+  }
+  const revision = rowToSdr(data[0] as Record<string, unknown>);
+  db.SHOP_DRAWING_REVISIONS[revision.id] = revision;
+  return { ok: true, revision };
+}
+
+export async function submitShopDrawingRevision(revisionId: string): Promise<SdrResult> {
+  const files = Object.values(db.SHOP_DRAWING_FILES).filter(f => f.revisionId === revisionId);
+  if (files.length === 0) return { ok: false, error: "Upload at least one drawing file before submitting." };
+  return sdrTransition(revisionId, "draft", { status: "submitted", submitted_at: new Date().toISOString() });
+}
+
+export async function markShopDrawingApproved(revisionId: string): Promise<SdrResult> {
+  const res = await sdrTransition(revisionId, "submitted", { status: "approved", responded_at: new Date().toISOString() });
+  if (res.ok) {
+    const draw = db.SHOP_DRAWINGS[res.revision.drawingId];
+    if (draw) {
+      const { data } = await supabaseBrowser().from("shop_drawings")
+        .update({ approved_revision: res.revision.revisionNumber }).eq("id", draw.id).select(SD_COLS).maybeSingle();
+      if (data) db.SHOP_DRAWINGS[draw.id] = rowToSd(data as Record<string, unknown>);
+    }
+  }
+  return res;
+}
+
+export async function markShopDrawingReturned(revisionId: string, comments: string): Promise<SdrResult> {
+  return sdrTransition(revisionId, "submitted", {
+    status: "returned", responded_at: new Date().toISOString(), client_comments: comments?.trim() || null,
+  });
+}
+
+export async function markShopDrawingRejected(revisionId: string, reason: string): Promise<SdrResult> {
+  return sdrTransition(revisionId, "submitted", {
+    status: "rejected", responded_at: new Date().toISOString(), client_comments: reason?.trim() || null,
+  });
+}
+
+// Start a new draft revision, inheriting the latest revision's description
+// (the OM re-uploads the corrected files; files are NOT copied forward).
+export async function startNextShopDrawingRevision(
+  drawingId: string, createdBy: string | null,
+): Promise<SdrResult> {
+  if (!drawingId) return { ok: false, error: "Drawing id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const revs = Object.values(db.SHOP_DRAWING_REVISIONS).filter(r => r.drawingId === drawingId);
+  const latest = revs.sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
+  const nextNum = (latest?.revisionNumber ?? 0) + 1;
+
+  const { data: revData, error: revErr } = await supa.from("shop_drawing_revisions")
+    .insert({ drawing_id: drawingId, revision_number: nextNum, status: "draft",
+              description: latest?.description ?? null, created_by: createdBy })
+    .select(SDR_COLS).single();
+  if (revErr || !revData) return { ok: false, error: revErr?.message || "Failed to start the next revision." };
+  const revision = rowToSdr(revData as Record<string, unknown>);
+
+  const { data: sdData } = await supa.from("shop_drawings")
+    .update({ current_revision: nextNum }).eq("id", drawingId).select(SD_COLS).maybeSingle();
+  if (sdData) db.SHOP_DRAWINGS[drawingId] = rowToSd(sdData as Record<string, unknown>);
+
+  db.SHOP_DRAWING_REVISIONS[revision.id] = revision;
+  return { ok: true, revision };
+}
+
+// ─────────────────────────────────────────────────────────
+// JOB COST ANALYSIS / JCA — Design phase activity 3 (migration 0043)
+// All functions here are NEW. Internal budget, no revision/client cycle.
+// One JCA per project; every save appends a permanent history snapshot.
+// Subtotal/profit/total are derived in the UI, never stored.
+// ─────────────────────────────────────────────────────────
+const JCA_COLS      = "id, project_id, materials_budget, manpower_budget, subcontractor_budget, other_charges, profit_margin_pct, created_by, updated_by, created_at, updated_at";
+const JCA_HIST_COLS = "id, jca_id, materials_budget, manpower_budget, subcontractor_budget, other_charges, profit_margin_pct, note, edited_by, edited_at";
+
+type JcaT     = import("./types").ProjectJca;
+type JcaHistT = import("./types").ProjectJcaHistory;
+
+const jcaNum = (v: unknown): number => {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+};
+
+function rowToJca(r: Record<string, unknown>): JcaT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  return {
+    id: s(r.id), projectId: s(r.project_id),
+    materialsBudget: jcaNum(r.materials_budget),
+    manpowerBudget: jcaNum(r.manpower_budget),
+    subcontractorBudget: jcaNum(r.subcontractor_budget),
+    otherCharges: jcaNum(r.other_charges),
+    profitMarginPct: jcaNum(r.profit_margin_pct),
+    createdBy: (r.created_by as string | null) ?? null,
+    updatedBy: (r.updated_by as string | null) ?? null,
+    createdAt: s(r.created_at), updatedAt: s(r.updated_at),
+  };
+}
+function rowToJcaHist(r: Record<string, unknown>): JcaHistT {
+  const s = (v: unknown): string => (typeof v === "string" ? v : "");
+  return {
+    id: s(r.id), jcaId: s(r.jca_id),
+    materialsBudget: jcaNum(r.materials_budget),
+    manpowerBudget: jcaNum(r.manpower_budget),
+    subcontractorBudget: jcaNum(r.subcontractor_budget),
+    otherCharges: jcaNum(r.other_charges),
+    profitMarginPct: jcaNum(r.profit_margin_pct),
+    note: (r.note as string | null) ?? null,
+    editedBy: (r.edited_by as string | null) ?? null,
+    editedAt: s(r.edited_at),
+  };
+}
+
+export interface JcaInput {
+  materials_budget: number;
+  manpower_budget: number;
+  subcontractor_budget: number;
+  other_charges: number;
+  profit_margin_pct: number;
+}
+
+export type JcaResult = { ok: true; jca: JcaT } | { ok: false; error: string };
+
+// Create-or-update the project's JCA, then append a history snapshot.
+// The snapshot (with an optional note/reason) is the permanent audit row.
+export async function saveJca(
+  projectId: string, input: JcaInput, note: string | null, userId: string | null,
+): Promise<JcaResult> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const values = {
+    materials_budget:     jcaNum(input.materials_budget),
+    manpower_budget:      jcaNum(input.manpower_budget),
+    subcontractor_budget: jcaNum(input.subcontractor_budget),
+    other_charges:        jcaNum(input.other_charges),
+    profit_margin_pct:    jcaNum(input.profit_margin_pct),
+  };
+
+  const existing = Object.values(db.PROJECT_JCA).find(j => j.projectId === projectId) ?? null;
+
+  let jca: JcaT;
+  if (existing) {
+    const { data, error } = await supa.from("project_jca")
+      .update({ ...values, updated_by: userId }).eq("id", existing.id).select(JCA_COLS).single();
+    if (error || !data) return { ok: false, error: error?.message || "Failed to update the JCA." };
+    jca = rowToJca(data as Record<string, unknown>);
+  } else {
+    const { data, error } = await supa.from("project_jca")
+      .insert({ project_id: projectId, ...values, created_by: userId, updated_by: userId })
+      .select(JCA_COLS).single();
+    if (error || !data) return { ok: false, error: error?.message || "Failed to create the JCA." };
+    jca = rowToJca(data as Record<string, unknown>);
+  }
+  db.PROJECT_JCA[jca.id] = jca;
+
+  // Append the audit snapshot. Best-effort: a save that succeeded should
+  // not be reported as failed just because the history row didn't land,
+  // but record any successful row into the mirror so the UI updates.
+  const { data: histData, error: histErr } = await supa.from("project_jca_history")
+    .insert({ jca_id: jca.id, ...values, note: note?.trim() || null, edited_by: userId })
+    .select(JCA_HIST_COLS).single();
+  if (!histErr && histData) {
+    const hist = rowToJcaHist(histData as Record<string, unknown>);
+    db.PROJECT_JCA_HISTORY[hist.id] = hist;
+  }
+
+  return { ok: true, jca };
 }
 
 export async function createMaterialRequest(input: MaterialRequestInput): Promise<MrResult> {

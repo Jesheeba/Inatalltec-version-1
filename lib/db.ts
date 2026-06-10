@@ -12,6 +12,8 @@ import type {
   AmcContract, AmcDocument, AmcService, Approval, AssetRecord, CommEntry, Customer, FeedItem, FreeCall,
   InventoryItem, MaterialRequest, Notification, Organization, Project, Quotation, RepairTicket,
   MaterialSubmittal, MaterialSubmittalRevision, MaterialItem,
+  ShopDrawing, ShopDrawingRevision, ShopDrawingFile,
+  ProjectJca, ProjectJcaHistory,
   ReplacementRequest, ReplacementDocument, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoTask,
@@ -203,6 +205,15 @@ export const MATERIAL_REQUESTS: Record<string, MaterialRequest> = {};
 export const MATERIAL_SUBMITTALS: Record<string, MaterialSubmittal> = {};
 export const MATERIAL_SUBMITTAL_REVISIONS: Record<string, MaterialSubmittalRevision> = {};
 export const MATERIAL_ITEMS: Record<string, MaterialItem> = {};
+// Migration 0042 — Shop Drawing (Design phase activity 2): one drawing
+// per project, multiple revisions, uploaded files per revision.
+export const SHOP_DRAWINGS: Record<string, ShopDrawing> = {};
+export const SHOP_DRAWING_REVISIONS: Record<string, ShopDrawingRevision> = {};
+export const SHOP_DRAWING_FILES: Record<string, ShopDrawingFile> = {};
+// Migration 0043 — Job Cost Analysis (Design phase activity 3): one JCA
+// per project + an append-only edit-history audit trail.
+export const PROJECT_JCA: Record<string, ProjectJca> = {};
+export const PROJECT_JCA_HISTORY: Record<string, ProjectJcaHistory> = {};
 export const FEED: FeedItem[] = [];
 export const NOTIFICATIONS: Notification[] = [];
 export const RISKS: Risk[] = [];
@@ -237,6 +248,8 @@ export const db = {
   FREE_CALLS, QUOTATIONS, WO_TASKS, AMC_DOCUMENTS,
   APPROVALS, REPLACEMENTS, REPLACEMENT_DOCUMENTS, MATERIAL_REQUESTS,
   MATERIAL_SUBMITTALS, MATERIAL_SUBMITTAL_REVISIONS, MATERIAL_ITEMS,
+  SHOP_DRAWINGS, SHOP_DRAWING_REVISIONS, SHOP_DRAWING_FILES,
+  PROJECT_JCA, PROJECT_JCA_HISTORY,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
   org: (id?: string | null): Organization | null => (id && ORGANIZATIONS[id]) || null,
@@ -359,4 +372,80 @@ export const db = {
     Object.values(MATERIAL_ITEMS)
       .filter(i => i.revisionId === revisionId)
       .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
+
+  // Migration 0042 — Shop Drawing selectors.
+  drawingForProject: (projectId: string): ShopDrawing | null =>
+    Object.values(SHOP_DRAWINGS).find(d => d.projectId === projectId) ?? null,
+  revisionsForDrawing: (drawingId: string): ShopDrawingRevision[] =>
+    Object.values(SHOP_DRAWING_REVISIONS)
+      .filter(r => r.drawingId === drawingId)
+      .sort((a, b) => a.revisionNumber - b.revisionNumber),
+  filesForRevision: (revisionId: string): ShopDrawingFile[] =>
+    Object.values(SHOP_DRAWING_FILES)
+      .filter(f => f.revisionId === revisionId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
+
+  // Migration 0043 — JCA selectors.
+  jcaForProject: (projectId: string): ProjectJca | null =>
+    Object.values(PROJECT_JCA).find(j => j.projectId === projectId) ?? null,
+  jcaHistoryForJca: (jcaId: string): ProjectJcaHistory[] =>
+    Object.values(PROJECT_JCA_HISTORY)
+      .filter(h => h.jcaId === jcaId)
+      .sort((a, b) => a.editedAt.localeCompare(b.editedAt)),
+
+  // Slice D — Design-phase readiness check.
+  //
+  // Used by the PhaseTracker "Move to Material Supply" gate AND by any
+  // UI surface that wants to show "what's still missing" before the
+  // project can leave Design. The DB trigger added in migration 0044
+  // enforces the same rule server-side; this selector is the
+  // user-facing mirror of that rule.
+  //
+  // Complete = Material Submittal has an approved revision
+  //          + Shop Drawing has an approved revision
+  //          + JCA row exists for the project.
+  designReadiness: (projectId: string): DesignReadiness => {
+    const submittal = Object.values(MATERIAL_SUBMITTALS).find(s => s.projectId === projectId) ?? null;
+    const drawing   = Object.values(SHOP_DRAWINGS).find(d => d.projectId === projectId) ?? null;
+    const jca       = Object.values(PROJECT_JCA).find(j => j.projectId === projectId) ?? null;
+
+    const submittalApproved = submittal != null && submittal.approvedRevision != null;
+    const drawingApproved   = drawing   != null && drawing.approvedRevision   != null;
+    const jcaCreated        = jca != null;
+
+    const missing: string[] = [];
+    if (!submittalApproved) {
+      missing.push(submittal == null
+        ? "Material Submittal — not created"
+        : "Material Submittal — no revision approved yet");
+    }
+    if (!drawingApproved) {
+      missing.push(drawing == null
+        ? "Shop Drawing — not created"
+        : "Shop Drawing — no revision approved yet");
+    }
+    if (!jcaCreated) {
+      missing.push("Job Cost Analysis — not created");
+    }
+
+    return {
+      submittalApproved,
+      drawingApproved,
+      jcaCreated,
+      isComplete: submittalApproved && drawingApproved && jcaCreated,
+      missing,
+    };
+  },
 };
+
+// Shape returned by db.designReadiness. Exposed so the UI can pass it
+// between components (AdvancePhaseButton renders the missing-items
+// hint; the Design summary cards could surface it too).
+export interface DesignReadiness {
+  submittalApproved: boolean;
+  drawingApproved:   boolean;
+  jcaCreated:        boolean;
+  isComplete:        boolean;
+  /** Human-readable list of what's still missing, ordered M → S → J. */
+  missing:           string[];
+}
