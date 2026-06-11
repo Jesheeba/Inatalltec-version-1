@@ -49,6 +49,26 @@ export type PermissionAction =
   // and Lead Tech are excluded entirely. MANAGE_JCA = edit/create.
   | "MANAGE_JCA"
   | "VIEW_JCA"
+  // Accountant module (migration 0045+). Isolated finance area. VIEW_ACCOUNTING
+  // gates the whole module (incl. Manager, read-mostly). MANAGE_ACCOUNTING_SETTINGS
+  // gates editing the configurable settings (tax, prefixes, terms, aging, payment
+  // methods). Phase-specific powers (manage invoices, approve, etc.) get their own
+  // actions in later phases.
+  | "VIEW_ACCOUNTING"
+  | "MANAGE_ACCOUNTING_SETTINGS"
+  // Invoices (migration 0046). MANAGE_INVOICES = create/edit drafts, send,
+  // record payments, void (Accountant + Admin/MD). APPROVE_INVOICES =
+  // approve a submitted invoice (Manager + Admin/MD) — segregation of duties.
+  | "MANAGE_INVOICES"
+  | "APPROVE_INVOICES"
+  // Vendors + Purchase Orders (Phase 2, migrations 0047-0048). MANAGE_VENDORS
+  // = maintain the vendor master (Accountant + Admin/MD). MANAGE_POS =
+  // create/edit PO drafts, issue, receive goods, close (Accountant + Admin/MD).
+  // APPROVE_POS = approve a submitted PO (Manager + Admin/MD) — segregation
+  // of duties, mirroring invoices.
+  | "MANAGE_VENDORS"
+  | "MANAGE_POS"
+  | "APPROVE_POS"
   // "View all" gates — when false, the page either hides or scopes
   // its list to rows the user is directly involved in. The page
   // helpers below resolve "what does involved mean" per entity.
@@ -95,6 +115,17 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   // Lead Tech / Workers see nothing.
   MANAGE_JCA:               ["admin", "md", "manager"],
   VIEW_JCA:                 ["admin", "md", "manager", "accounts"],
+  // Accountant module. View = the finance audience (Manager sees it read-mostly);
+  // settings editing = Accountant + Admin/MD (Manager is view-only on config).
+  VIEW_ACCOUNTING:          ["admin", "md", "manager", "accounts"],
+  MANAGE_ACCOUNTING_SETTINGS: ["admin", "md", "accounts"],
+  // Invoices: Accountant does the work; Manager (+ Admin/MD) approves.
+  MANAGE_INVOICES:          ["admin", "md", "accounts"],
+  APPROVE_INVOICES:         ["admin", "md", "manager"],
+  // Vendors + POs: Accountant does the work; Manager (+ Admin/MD) approves POs.
+  MANAGE_VENDORS:           ["admin", "md", "accounts"],
+  MANAGE_POS:               ["admin", "md", "accounts"],
+  APPROVE_POS:              ["admin", "md", "manager"],
 
   // ── View-all gates ───────────────────────────────────────
   VIEW_ALL_PROJECTS:        ["admin", "md", "manager"],

@@ -1842,6 +1842,43 @@ function daysAgoYmd(n: number): string {
 }
 function twoDigits(n: number): string { return n < 10 ? `0${n}` : String(n); }
 
+// Quick-pick date ranges used by the Workers report (Round 1). Each
+// returns a YYYY-MM-DD pair anchored on the current calendar; chips
+// in the UI call setFrom/setTo with these values and highlight when
+// the active range matches.
+interface DateRange { from: string; to: string; }
+function ymdFromDate(d: Date): string {
+  return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
+}
+function thisMonthRange(): DateRange {
+  const now = new Date();
+  const from = new Date(now.getFullYear(), now.getMonth(), 1);
+  const to   = new Date(now.getFullYear(), now.getMonth() + 1, 0); // 0 = last day prev month
+  return { from: ymdFromDate(from), to: ymdFromDate(to) };
+}
+function lastMonthRange(): DateRange {
+  const now = new Date();
+  const from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const to   = new Date(now.getFullYear(), now.getMonth(), 0);
+  return { from: ymdFromDate(from), to: ymdFromDate(to) };
+}
+function thisQuarterRange(): DateRange {
+  const now = new Date();
+  const qStart = Math.floor(now.getMonth() / 3) * 3; // 0, 3, 6, 9
+  const from = new Date(now.getFullYear(), qStart, 1);
+  const to   = new Date(now.getFullYear(), qStart + 3, 0);
+  return { from: ymdFromDate(from), to: ymdFromDate(to) };
+}
+function lastQuarterRange(): DateRange {
+  const now = new Date();
+  const lastQStart = Math.floor(now.getMonth() / 3) * 3 - 3; // can be negative
+  const refYear  = lastQStart < 0 ? now.getFullYear() - 1 : now.getFullYear();
+  const refMonth = (lastQStart + 12) % 12;
+  const from = new Date(refYear, refMonth, 1);
+  const to   = new Date(refYear, refMonth + 3, 0);
+  return { from: ymdFromDate(from), to: ymdFromDate(to) };
+}
+
 function formatYmdShort(yyyyMmDd: string | null): string {
   if (!yyyyMmDd) return "—";
   const [y, m, d] = yyyyMmDd.split("-").map(Number);
@@ -2555,14 +2592,54 @@ function WorkerReport() {
   const [from, setFrom] = useState(daysAgoYmd(90));
   const [to,   setTo]   = useState(todayYmd());
   const [roleF, setRoleF] = useState<RoleFilter>("all");
+  // Round 1 — Project filter. "all" leaves the report at every-container
+  // scope; otherwise the value is "<kind>:<id>" matching the WorkOrder
+  // source discriminator so we can scope hour aggregations to a single
+  // Main Contractor / AMC / Repair container.
+  const [containerF, setContainerF] = useState<string>("all");
   const [sortKey, setSortKey] = useState<WorkerSortKey>("totalHrs");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
+  // Round 1 — Container options for the project filter. We surface every
+  // Project / AMC / Repair so a manager can ask "how many hours did
+  // worker X log on contract Y?" regardless of container kind. Grouped
+  // by kind in the dropdown for scanability.
+  const containerOptions = useMemo(() => {
+    const projects = Object.values(db.PROJECTS).map(p => ({
+      key: `project:${p.id}`,
+      label: `${p.code} · ${p.name}`,
+    })).sort((a, b) => a.label.localeCompare(b.label));
+    const amcs = Object.values(db.AMCS).map(a => {
+      const cust = db.cust(a.customer);
+      return {
+        key: `amc:${a.id}`,
+        label: `${a.code} · ${cust?.name ?? "—"}`,
+      };
+    }).sort((a, b) => a.label.localeCompare(b.label));
+    const repairs = Object.values(db.REPAIRS).map(r => ({
+      key: `repair:${r.id}`,
+      label: `${r.code} · ${r.title}`,
+    })).sort((a, b) => a.label.localeCompare(b.label));
+    return { projects, amcs, repairs };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataVersion]);
+
+  // Label of whichever container the filter currently points at — used
+  // by the table empty-state hint and the CSV filename.
+  const activeContainerLabel = useMemo(() => {
+    if (containerF === "all") return null;
+    const all = [...containerOptions.projects, ...containerOptions.amcs, ...containerOptions.repairs];
+    return all.find(c => c.key === containerF)?.label ?? null;
+  }, [containerF, containerOptions]);
+
   const rows = useMemo<WorkerReportRow[]>(() => {
+    const [filterKind, filterId] = containerF === "all"
+      ? [null, null]
+      : containerF.split(":") as ["project" | "amc" | "repair", string];
     const candidates = Object.values(db.USERS).filter(u => u.role === "worker" || u.role === "lead_worker");
     return candidates.map(u => {
       let totalMinutes = 0;
-      const projects = new Set<string>();
+      const containers = new Set<string>();
       const wos = new Set<string>();
       let last: string | null = null;
       for (const e of Object.values(db.WORK_ORDER_TIME_ENTRIES)) {
@@ -2570,22 +2647,30 @@ function WorkerReport() {
         if (!e.endedAt) continue;
         const ymd = e.endedAt.slice(0, 10);
         if (ymd < from || ymd > to) continue;
+        const wo = db.wo(e.workOrderId);
+        // Apply container filter at entry granularity so the totals,
+        // WO counts, last-entry date all respect the same scope.
+        if (filterKind) {
+          if (!wo || wo.source.kind !== filterKind || wo.source.id !== filterId) continue;
+        }
         totalMinutes += e.durationMinutes;
         wos.add(e.workOrderId);
-        const wo = db.wo(e.workOrderId);
-        if (wo?.source.kind === "project") projects.add(wo.source.id);
+        // Count distinct containers regardless of kind so the column is
+        // meaningful when an AMC / Repair is the active filter (would
+        // always be 0 if we only counted main-contractor projects).
+        if (wo) containers.add(`${wo.source.kind}:${wo.source.id}`);
         if (!last || ymd > last) last = ymd;
       }
       return {
         id: u.id, name: u.name, role: u.role,
         totalHrs: totalMinutes / 60,
-        projects: projects.size,
+        projects: containers.size,
         wos: wos.size,
         lastEntry: last,
       };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [from, to, dataVersion]);
+  }, [from, to, containerF, dataVersion]);
 
   const filtered = useMemo(() => {
     let out = rows;
@@ -2616,8 +2701,14 @@ function WorkerReport() {
   };
 
   const onExport = () => {
+    // CSV filename reflects the active filter scope so a Workers report
+    // exported for one project doesn't get confused with the global one
+    // on the user's desktop.
+    const scopeSlug = activeContainerLabel
+      ? "-" + activeContainerLabel.replace(/[^\w]+/g, "_").slice(0, 40)
+      : "";
     downloadCsv(
-      `team-report-${todayYmd()}.csv`,
+      `team-report${scopeSlug}-${todayYmd()}.csv`,
       ["Name", "Role", "Total Hours", "# Projects", "# WOs", "Last Entry"],
       sorted.map(r => [
         r.name, ROLE_LABELS[r.role as keyof typeof ROLE_LABELS] ?? r.role,
@@ -2626,20 +2717,95 @@ function WorkerReport() {
     );
   };
 
+  // Round 1 — quick-pick date chips. Each chip computes a YYYY-MM-DD
+  // range; the active chip is detected by exact-equality on the current
+  // from/to strings. Manually editing either date picker drops the
+  // highlight, which is the same UX the existing ReportToolbar already
+  // assumes.
+  const chips: { key: string; label: string; range: DateRange }[] = [
+    { key: "this_month",   label: "This Month",   range: thisMonthRange() },
+    { key: "last_month",   label: "Last Month",   range: lastMonthRange() },
+    { key: "this_quarter", label: "This Quarter", range: thisQuarterRange() },
+    { key: "last_quarter", label: "Last Quarter", range: lastQuarterRange() },
+  ];
+  const activeChip = chips.find(c => c.range.from === from && c.range.to === to)?.key ?? null;
+
   return (
     <>
+      <div className="card card-pad" style={{ marginBottom: 12, padding: "10px 14px" }}>
+        {/* Label on its own line so the chips can wrap cleanly underneath
+            on phones — keeps each chip a full tap target rather than
+            getting crammed into a half-row alongside the label. */}
+        <div style={{ font: "var(--t-micro)", color: "var(--ink-mute)",
+                      textTransform: "uppercase", letterSpacing: "0.06em",
+                      marginBottom: 6 }}>
+          Quick range
+        </div>
+        <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+          {chips.map(c => {
+            const isActive = c.key === activeChip;
+            return (
+              <button
+                key={c.key}
+                type="button"
+                className={"btn btn-sm " + (isActive ? "btn-primary" : "btn-ghost")}
+                onClick={() => { setFrom(c.range.from); setTo(c.range.to); }}
+                style={{ flex: "0 1 auto", whiteSpace: "nowrap" }}>
+                {c.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <ReportToolbar from={from} to={to} setFrom={setFrom} setTo={setTo}
         onExport={onExport}
         extra={
-          <div className="col" style={{ minWidth: 160 }}>
-            <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Role</label>
-            <select className="input input-sm" value={roleF}
-                    onChange={e => setRoleF(e.target.value as RoleFilter)}>
-              <option value="all">All</option>
-              <option value="worker">Technician</option>
-              <option value="lead_worker">Lead Technician</option>
-            </select>
-          </div>
+          <>
+            {/* minWidth: 0 + flex-basis 220 — desktop prefers a 220px
+                slot for readable project names, but on phones the
+                element can shrink (and the toolbar's flex-wrap will
+                still drop it onto its own row anyway). */}
+            <div className="col" style={{ minWidth: 0, flex: "1 1 220px" }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Project</label>
+              <select className="input input-sm" value={containerF}
+                      onChange={e => setContainerF(e.target.value)}
+                      style={{ width: "100%" }}>
+                <option value="all">All projects</option>
+                {containerOptions.projects.length > 0 && (
+                  <optgroup label="Main Contractor">
+                    {containerOptions.projects.map(c => (
+                      <option key={c.key} value={c.key}>{c.label}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {containerOptions.amcs.length > 0 && (
+                  <optgroup label="AMC contracts">
+                    {containerOptions.amcs.map(c => (
+                      <option key={c.key} value={c.key}>{c.label}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {containerOptions.repairs.length > 0 && (
+                  <optgroup label="Repair tickets">
+                    {containerOptions.repairs.map(c => (
+                      <option key={c.key} value={c.key}>{c.label}</option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+            </div>
+            <div className="col" style={{ minWidth: 0, flex: "1 1 160px" }}>
+              <label style={{ font: "var(--t-micro)", color: "var(--ink-mute)", marginBottom: 4 }}>Role</label>
+              <select className="input input-sm" value={roleF}
+                      onChange={e => setRoleF(e.target.value as RoleFilter)}
+                      style={{ width: "100%" }}>
+                <option value="all">All</option>
+                <option value="worker">Technician</option>
+                <option value="lead_worker">Lead Technician</option>
+              </select>
+            </div>
+          </>
         } />
 
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
@@ -2658,7 +2824,9 @@ function WorkerReport() {
             <tbody>
               {sorted.length === 0 ? (
                 <tr><td colSpan={6} style={{ textAlign: "center", padding: 24, color: "var(--ink-mute)" }}>
-                  No hours in this date range
+                  {activeContainerLabel
+                    ? `No hours on ${activeContainerLabel} in this date range`
+                    : "No hours in this date range"}
                 </td></tr>
               ) : sorted.map(r => (
                 <tr key={r.id}>

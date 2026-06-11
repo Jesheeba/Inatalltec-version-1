@@ -410,10 +410,54 @@ export function AppProvider({
   }, []);
 
   // Keep the bell fresh: pull once on mount, then again each time the user
-  // opens the dropdown. This is the "you see them when you open the app"
-  // Phase-1 behaviour — live/push delivery is a later phase.
+  // opens the dropdown. These two effects cover cold start + user-initiated
+  // refresh; the realtime subscription below adds live push delivery so the
+  // badge bumps without a refresh while the worker is in the field.
   useEffect(() => { void refreshNotifications(); }, [refreshNotifications]);
   useEffect(() => { if (notifOpen) void refreshNotifications(); }, [notifOpen, refreshNotifications]);
+
+  // Slice N1 — Live notification delivery via Supabase Realtime.
+  //
+  // Migration 0200 added `notifications` to the supabase_realtime publication
+  // and installed the trigger that writes rows on assignment events. This
+  // subscribes the client to INSERT/UPDATE on that table scoped to me.id.
+  // RLS already restricts each user to their own rows; the postgres_changes
+  // filter is for efficiency (server-side filtering, no over-the-wire spam).
+  //
+  // INSERT — a new notification arrived (e.g. you were just assigned a WO).
+  //   Map it via the existing mapNotificationRow helper and prepend to state.
+  //   De-dupe by id: StrictMode's double-mount in dev, plus the post-open
+  //   refresh, can both surface the same row a moment apart.
+  //
+  // UPDATE — typically a cross-tab mark-read sync (open the bell in tab A,
+  //   click a notification, tab B's bell badge should drop without refresh).
+  //
+  // Channel name keys on me.id so account switches tear down + recreate
+  // cleanly. The cleanup runs on unmount and on me.id change.
+  useEffect(() => {
+    if (!hasRealAuth || !me.id) return;
+    const supabase = supabaseBrowser();
+    const channel = supabase
+      .channel(`notif-${me.id}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
+        (payload: { new: Record<string, unknown> }) => {
+          const mapped = mapNotificationRow(payload.new);
+          setNotifications(ns => (ns.some(n => n.id === mapped.id) ? ns : [mapped, ...ns]));
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
+        (payload: { new: Record<string, unknown> }) => {
+          const mapped = mapNotificationRow(payload.new);
+          setNotifications(ns => ns.map(n => (n.id === mapped.id ? mapped : n)));
+        },
+      )
+      .subscribe();
+    return () => { void supabase.removeChannel(channel); };
+  }, [hasRealAuth, me.id]);
 
   // v1.2 — Surface every pending-confirmation item as a live notification.
   // Synthetic rows derived from the data mirror; they auto-vanish when the

@@ -272,7 +272,7 @@ export function AdvancePhaseButton({ projectId, currentPhase, onAdvanced }: {
                 font: "var(--t-small)", display: "flex", alignItems: "flex-start", gap: 10,
               }}>
                 <Icon name="lock" size={16} style={{ flexShrink: 0, marginTop: 1 }} />
-                <div>
+                <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600, marginBottom: 2 }}>
                     Design activities will be locked
                   </div>
