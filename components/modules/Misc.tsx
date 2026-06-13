@@ -31,6 +31,12 @@ import { MaterialRequestsSection } from "./MaterialRequests";
 import { MaterialSubmittalSummaryCard } from "./design/MaterialSubmittal";
 import { ShopDrawingSummaryCard } from "./design/ShopDrawing";
 import { JcaSummaryCard } from "./design/Jca";
+import { MaterialSupplySummaryCard } from "./supply/MaterialSupply";
+import { InstallationSummaryCard } from "./install/Installation";
+import { TcSummaryCard } from "./tc/TC";
+import { HandoverSummaryCard } from "./handover/Handover";
+import { DlpSummaryCard } from "./dlp/DLP";
+import { ClosedSummaryCard } from "./closed/Closed";
 
 /* ─── Scheduling ───────────────────────────────────────── */
 export function Scheduling() {
@@ -526,6 +532,18 @@ export function ProjectDetail({ id }: { id: string }) {
       <MaterialSubmittalSummaryCard projectId={id} />
       <ShopDrawingSummaryCard projectId={id} />
       <JcaSummaryCard projectId={id} />
+      {/* Phase 2 — Material Supply. Self-gates to projects at/past Material Supply phase. */}
+      <MaterialSupplySummaryCard projectId={id} />
+      {/* Phase 3 — Installation. Self-gates to projects at/past Installation phase. */}
+      <InstallationSummaryCard projectId={id} />
+      {/* Phase 4 — Testing & Commissioning. Self-gates to projects at/past T&C phase. */}
+      <TcSummaryCard projectId={id} />
+      {/* Phase 5 — Handover. Self-gates to projects at/past DLP phase. */}
+      <HandoverSummaryCard projectId={id} />
+      {/* Phase 6 — DLP. Self-gates to handed-over projects in DLP. */}
+      <DlpSummaryCard projectId={id} />
+      {/* Phase 7 — Closed. Self-gates to closed projects. */}
+      <ClosedSummaryCard projectId={id} />
 
       <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", marginBottom: 20 }}>
         <KPI accent="primary" label="Contract value" value={fmtMoney(p.value, { compact: true })} />

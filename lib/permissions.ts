@@ -69,6 +69,70 @@ export type PermissionAction =
   | "MANAGE_VENDORS"
   | "MANAGE_POS"
   | "APPROVE_POS"
+  // Vendor Payables (Phase 2, migration 0050). VIEW_PAYABLES gates the
+  // Payables tab (incl. Manager, read-only); MANAGE_PAYABLES = record
+  // bills, take payments, cancel (Accountant + Admin/MD).
+  | "VIEW_PAYABLES"
+  | "MANAGE_PAYABLES"
+  // Subcontractor Payments (Phase 3, migration 0051). MANAGE = set rates,
+  // record/reverse payments (Accountant + Admin/MD). Viewing rides on
+  // VIEW_ACCOUNTING (Manager sees it read-only).
+  | "MANAGE_SUBCONTRACTOR_PAYMENTS"
+  // Payroll (Phase 4, migration 0052+). CONFIDENTIAL — Manager is excluded
+  // (unlike the rest of the module). VIEW_PAYROLL gates the Payroll tab;
+  // MANAGE_PAYROLL = create/edit employees, change status. Both = admin/md/
+  // accounts only (salary confidentiality, standard UAE practice).
+  | "VIEW_PAYROLL"
+  | "MANAGE_PAYROLL"
+  // Expenses (Phase 5, migration 0055). VIEW_EXPENSES gates the Expenses tab
+  // (incl. Manager). MANAGE_EXPENSES = create/edit drafts, upload receipts,
+  // record payment (Accountant + Admin/MD). APPROVE_EXPENSES = approve/reject
+  // an above-threshold expense (Manager + Admin/MD) — segregation of duties.
+  | "VIEW_EXPENSES"
+  | "MANAGE_EXPENSES"
+  | "APPROVE_EXPENSES"
+  // Monthly reporting + Bank Reconciliation (Phase 7, migration 0056).
+  // VIEW_MONTHLY_REPORTS gates the cross-module Monthly View + reports
+  // (the finance audience). Bank reconciliation is accountant-only work.
+  | "VIEW_MONTHLY_REPORTS"
+  | "VIEW_BANK_RECON"
+  | "MANAGE_BANK_RECON"
+  // Main Contractor Phase 2 — Material Supply (migration 0201). VIEW
+  // adds Sales (client status updates); MANAGE adds Lead Tech (on-site
+  // status changes) and Accounts (PO linkage). Sales cannot edit.
+  | "VIEW_MATERIAL_SUPPLY"
+  | "MANAGE_MATERIAL_SUPPLY"
+  // Main Contractor Phase 3 — Installation (migration 0202). VIEW adds
+  // Sales (read-only status visibility). MANAGE includes Worker because
+  // field technicians mark their own tasks + upload photos on site —
+  // the UI further scopes a Worker to tasks assigned to them (the DB RLS
+  // is role-coarse). Accounts is intentionally excluded (no accounting
+  // tie to installation).
+  | "VIEW_INSTALLATION"
+  | "MANAGE_INSTALLATION"
+  // Main Contractor Phase 4 — Testing & Commissioning (migration 0203).
+  // VIEW adds Accounts + Sales (sign-off / cert visibility). MANAGE =
+  // admin/md/manager/lead_worker (run the walkthrough, log snags, record
+  // sign-offs, generate the certificate). Worker is NOT a manager here.
+  | "VIEW_TC"
+  | "MANAGE_TC"
+  // Main Contractor Phase 5 — Handover (migration 0204). Formal delivery
+  // of deliverables during the DLP phase. VIEW adds Accounts + Sales
+  // (document / sign-off visibility). MANAGE = admin/md/manager/
+  // lead_worker (upload docs, complete checklist, record sign-off).
+  | "VIEW_HANDOVER"
+  | "MANAGE_HANDOVER"
+  // Main Contractor Phase 6 — DLP (migration 0205). VIEW is broad (any
+  // field role can see + report a warranty ticket); MANAGE (assign /
+  // resolve) = admin/md/manager/lead_worker.
+  | "VIEW_DLP"
+  | "MANAGE_DLP"
+  // Main Contractor Phase 7 — Closed (migration 0206). VIEW_CLOSED shows
+  // the closure summary; MANAGE_CLOSED = complete checklist + edit the
+  // financial snapshot (admin/md/manager). REOPEN_PROJECT = admin/md only.
+  | "VIEW_CLOSED"
+  | "MANAGE_CLOSED"
+  | "REOPEN_PROJECT"
   // "View all" gates — when false, the page either hides or scopes
   // its list to rows the user is directly involved in. The page
   // helpers below resolve "what does involved mean" per entity.
@@ -126,6 +190,52 @@ export const PERMISSIONS: Record<PermissionAction, Role[]> = {
   MANAGE_VENDORS:           ["admin", "md", "accounts"],
   MANAGE_POS:               ["admin", "md", "accounts"],
   APPROVE_POS:              ["admin", "md", "manager"],
+  // Vendor Payables: Manager reads; Accountant (+ Admin/MD) manages.
+  VIEW_PAYABLES:            ["admin", "md", "manager", "accounts"],
+  MANAGE_PAYABLES:          ["admin", "md", "accounts"],
+  // Subcontractor Payments: Accountant (+ Admin/MD) sets rates & pays.
+  MANAGE_SUBCONTRACTOR_PAYMENTS: ["admin", "md", "accounts"],
+  // Payroll: CONFIDENTIAL — Manager excluded. Admin/MD/Accounts only.
+  VIEW_PAYROLL:             ["admin", "md", "accounts"],
+  MANAGE_PAYROLL:           ["admin", "md", "accounts"],
+  // Expenses: Manager reads + approves; Accountant (+ Admin/MD) manages & pays.
+  VIEW_EXPENSES:            ["admin", "md", "manager", "accounts"],
+  MANAGE_EXPENSES:          ["admin", "md", "accounts"],
+  APPROVE_EXPENSES:         ["admin", "md", "manager"],
+  // Monthly reporting (the finance audience) + bank reconciliation (accountant).
+  VIEW_MONTHLY_REPORTS:     ["admin", "md", "manager", "accounts"],
+  VIEW_BANK_RECON:          ["admin", "md", "accounts"],
+  MANAGE_BANK_RECON:        ["admin", "md", "accounts"],
+  // Phase 2 Material Supply (migration 0201). Read mirrors the RLS
+  // pm_read policy + sales (client visibility). Write mirrors pm_write
+  // (admin/md/manager/lead_worker/accounts) — sales is read-only.
+  VIEW_MATERIAL_SUPPLY:     ["admin", "md", "manager", "lead_worker", "accounts", "sales"],
+  MANAGE_MATERIAL_SUPPLY:   ["admin", "md", "manager", "lead_worker", "accounts"],
+  // Phase 3 Installation (migration 0202). Read mirrors the RLS it_read
+  // policy (admin/md/manager/lead_worker/worker/sales). Write mirrors
+  // it_write (adds Worker for on-site marking; the component scopes a
+  // Worker to their own assigned tasks). Sales is read-only; Accounts
+  // has no access (no accounting tie).
+  VIEW_INSTALLATION:        ["admin", "md", "manager", "lead_worker", "worker", "sales"],
+  MANAGE_INSTALLATION:      ["admin", "md", "manager", "lead_worker", "worker"],
+  // Phase 4 Testing & Commissioning (migration 0203). Read mirrors the
+  // RLS *_read policies (incl. accounts + sales). Write mirrors *_write
+  // (admin/md/manager/lead_worker). Worker is excluded from both.
+  VIEW_TC:                  ["admin", "md", "manager", "lead_worker", "accounts", "sales"],
+  MANAGE_TC:                ["admin", "md", "manager", "lead_worker"],
+  // Phase 5 Handover (migration 0204). Read incl. accounts + sales;
+  // write = admin/md/manager/lead_worker (mirrors the RLS).
+  VIEW_HANDOVER:            ["admin", "md", "manager", "lead_worker", "accounts", "sales"],
+  MANAGE_HANDOVER:          ["admin", "md", "manager", "lead_worker"],
+  // Phase 6 DLP (migration 0205). VIEW broad (report tickets); MANAGE =
+  // assign / resolve. Mirrors the RLS (write incl. worker for reporting;
+  // the UI scopes assignment/resolution to MANAGE_DLP).
+  VIEW_DLP:                 ["admin", "md", "manager", "lead_worker", "worker", "accounts", "sales"],
+  MANAGE_DLP:               ["admin", "md", "manager", "lead_worker"],
+  // Phase 7 Closed (migration 0206).
+  VIEW_CLOSED:              ["admin", "md", "manager", "lead_worker", "accounts", "sales"],
+  MANAGE_CLOSED:            ["admin", "md", "manager"],
+  REOPEN_PROJECT:           ["admin", "md"],
 
   // ── View-all gates ───────────────────────────────────────
   VIEW_ALL_PROJECTS:        ["admin", "md", "manager"],

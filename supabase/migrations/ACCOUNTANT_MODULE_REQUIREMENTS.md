@@ -15,74 +15,75 @@ The Accountant Module is also being designed to comply with UAE business require
 # Implementation Rules
 
 ## Critical Rule 1
-
 Do not modify existing business workflows unless integration is explicitly required.
 
 Examples:
-
-* AMC lifecycle must remain unchanged.
-* Quotation conversion must remain unchanged.
-* JCA workflow must remain unchanged.
-* Existing reports must remain unchanged.
-* Existing approvals must remain unchanged.
-* Phase 1 Main Contractor work (Material Submittal, Shop Drawing, JCA, Phase Gate from migrations 0040-0044) must remain unchanged.
-
----
+- AMC lifecycle must remain unchanged.
+- Quotation conversion must remain unchanged.
+- JCA workflow must remain unchanged.
+- Existing reports must remain unchanged.
+- Existing approvals must remain unchanged.
+- Phase 1 Main Contractor work (Material Submittal, Shop Drawing, JCA, Phase Gate from migrations 0040-0044) must remain unchanged.
 
 ## Critical Rule 2
-
 Prefer creating new files, components, services, tables, and routes.
 
 Modify existing files only when:
-
-* Adding Accountant navigation.
-* Adding Accountant dashboard widgets.
-* Integrating approval workflow.
-* Linking Projects to Invoices.
-* Linking Material Requests to Purchase Orders.
-
----
+- Adding Accountant navigation.
+- Adding Accountant dashboard widgets.
+- Integrating approval workflow.
+- Linking Projects to Invoices.
+- Linking Material Requests to Purchase Orders.
 
 ## Critical Rule 3
-
 Before modifying any existing file:
-
-* Analyze dependencies.
-* Verify impact.
-* Confirm the file is accountant-related.
+- Analyze dependencies.
+- Verify impact.
+- Confirm the file is accountant-related.
 
 Avoid changing shared utilities unless absolutely necessary.
 
----
+## Critical Rule 4 — PHASE BY PHASE EXECUTION
+Build ONE COMPLETE PHASE at a time. Do not stop within a phase.
 
-## Critical Rule 4
+When given a phase to build:
+- Build ALL features of that phase end-to-end in a single delivery
+- Schema + UI + data layer + reports all together
+- Type-check once at the end (npx tsc --noEmit returns exit 0)
+- Apply migrations as one batch with smoke tests
+- Deliver ONE structured report at the END of the phase only
 
-Build one phase at a time. Stop and report after each phase. Wait for verification before starting the next phase.
+Stop and report ONLY after the entire phase is complete. Wait for verification before starting the next phase.
 
-Within each phase, slice the work into smaller pieces. Stop and report after each slice. Each slice must independently:
+DO NOT slice phases into smaller pieces. DO NOT stop midway through a phase. DO NOT pause for intermediate verification.
 
-* Type-check clean (npx tsc --noEmit returns exit 0)
-* Apply its migration cleanly
-* Be manually verifiable before the next slice starts
-
----
+The ONLY pause point is between phases.
 
 ## Critical Rule 5
-
 Honest reporting of assumptions.
 
-Every report must include an "Assumptions Made" section listing every business decision the model made without explicit client direction.
+Every phase report must include an "Assumptions Made" section listing every business decision the model made without explicit client direction.
 
 Mark UI elements with a small visual indicator where the implementation uses an assumption that needs client confirmation.
 
 Do NOT make assumptions about tax rates, legal compliance requirements, or financial calculations without explicit acknowledgment in the report.
+
+## Critical Rule 6 — MOBILE RESPONSIVE
+All UI must be fully mobile-responsive:
+- Works on viewport widths from 360px to 1920px
+- No horizontal scrolling at any viewport width
+- Tables collapse to card layout below 720px
+- Forms stack vertically on mobile
+- Buttons have minimum 44px touch targets
+- Modals become full-screen bottom sheets on mobile
+- Text minimum 14px body text
+- No hover-only interactions
 
 ---
 
 # Accountant Module Scope
 
 The Accountant role is responsible for:
-
 1. Project Invoicing
 2. Receivable Tracking
 3. Vendor Management
@@ -102,23 +103,21 @@ The Accountant role is responsible for:
 Before any other module, build a settings module that holds configuration values used by every other module.
 
 ## Settings Fields
-
-* Company name
-* Tax Registration Number (TRN) — UAE issued, 15 digits
-* Company address
-* Company phone and email
-* Default VAT rate (default 5 percent)
-* Financial year start month (default January)
-* Default payment terms in days (default 30)
-* Invoice numbering prefix (default INV)
-* Credit note numbering prefix (default CN)
-* Purchase order numbering prefix (default PO)
-* Bank account details for receivable instructions
-* PO approval thresholds (configurable, see Module 4)
-* Document retention period in years (default 5)
+- Company name
+- Tax Registration Number (TRN) — UAE issued, 15 digits
+- Company address
+- Company phone and email
+- Default VAT rate (default 5 percent)
+- Financial year start month (default January)
+- Default payment terms in days (default 30)
+- Invoice numbering prefix (default INV)
+- Credit note numbering prefix (default CN)
+- Purchase order numbering prefix (default PO)
+- Bank account details for receivable instructions
+- PO approval thresholds (configurable, see Module 4)
+- Document retention period in years (default 5)
 
 ## Why Phase 0 Matters
-
 Without settings, every module would have hardcoded values that have to be edited later. The settings module ensures every other module references central configuration.
 
 ---
@@ -126,204 +125,150 @@ Without settings, every module would have hardcoded values that have to be edite
 # Module 1 - Project Invoicing
 
 ## Purpose
-
 Raise invoices against projects.
 
 ## Workflow
-
-Project
-→ Create Invoice
-→ Submit for Approval
-→ Approved
-→ Sent To Customer
-→ Payment Received
-→ Invoice Closed
+Project → Create Invoice → Submit for Approval → Approved → Sent To Customer → Payment Received → Invoice Closed
 
 ## Features
-
-* Create Invoice
-* Edit Draft Invoice
-* View Invoice
-* Approve Invoice
-* Void Invoice
-* Download PDF
-* Email Invoice
-* Invoice History
-* Credit Note generation
-* VAT calculation per line item
+- Create Invoice
+- Edit Draft Invoice
+- View Invoice
+- Approve Invoice
+- Void Invoice
+- Download PDF
+- Email Invoice
+- Invoice History
+- Credit Note generation
+- VAT calculation per line item
 
 ## Invoice Status
-
-Draft
-Pending Approval
-Approved
-Sent
-Partially Paid
-Paid
-Overdue
-Cancelled
+Draft, Pending Approval, Approved, Sent, Partially Paid, Paid, Overdue, Cancelled
 
 ## Invoice Fields
-
-* Invoice Number (auto-generated, format INV-YYYY-NNNN)
-* Invoice Date
-* Due Date (calculated from payment terms in settings)
-* Project (linked to project record)
-* Customer (linked to customer record)
-* Customer TRN (auto-populated from customer record)
-* Company TRN (auto-populated from settings)
-* Description
-* Line Items (description, quantity, unit price, VAT rate per line, line total)
-* Subtotal (sum of line totals before VAT)
-* VAT Amount (sum of VAT per line)
-* Total (Subtotal plus VAT)
-* Notes
-* Payment Terms
-* Bank Account for Payment (from settings)
+- Invoice Number (auto-generated, format INV-YYYY-NNNN)
+- Invoice Date
+- Due Date (calculated from payment terms in settings)
+- Project (linked to project record)
+- Customer (linked to customer record)
+- Customer TRN (auto-populated from customer record)
+- Company TRN (auto-populated from settings)
+- Description
+- Line Items (description, quantity, unit price, VAT rate per line, line total)
+- Subtotal (sum of line totals before VAT)
+- VAT Amount (sum of VAT per line)
+- Total (Subtotal plus VAT)
+- Notes
+- Payment Terms
+- Bank Account for Payment (from settings)
 
 ## Invoice Numbering
-
-* Format: INV-YYYY-NNNN (example: INV-2026-0042)
-* Sequential per fiscal year, starts at 0001 each year
-* Auto-generated by the system, not editable by user
-* Once generated, the number cannot be changed or reused
-* Voided invoices retain their number with VOID status (audit trail)
-* Credit Notes use separate sequence: CN-YYYY-NNNN
+- Format: INV-YYYY-NNNN (example: INV-2026-0042)
+- Sequential per fiscal year, starts at 0001 each year
+- Auto-generated by the system, not editable by user
+- Once generated, the number cannot be changed or reused
+- Voided invoices retain their number with VOID status (audit trail)
+- Credit Notes use separate sequence: CN-YYYY-NNNN
 
 ## UAE VAT Requirements
-
-* Standard VAT rate is 5 percent (configurable in settings)
-* VAT calculated on subtotal after discounts but before final total
-* Each line item supports VAT-inclusive or VAT-exclusive flag
-* VAT-exempt categories (residential lease, certain financial services) flagged on invoices
-* Customer TRN must appear on every invoice
-* Company TRN must appear on every invoice
-* Invoices retained for minimum 5 years per UAE Federal Tax Authority requirements
+- Standard VAT rate is 5 percent (configurable in settings)
+- VAT calculated on subtotal after discounts but before final total
+- Each line item supports VAT-inclusive or VAT-exclusive flag
+- VAT-exempt categories (residential lease, certain financial services) flagged on invoices
+- Customer TRN must appear on every invoice
+- Company TRN must appear on every invoice
+- Invoices retained for minimum 5 years per UAE Federal Tax Authority requirements
 
 ---
 
 # Module 2 - Receivables
 
 ## Purpose
-
 Track money owed to the company.
 
 ## Workflow
-
-Invoice Created
-→ Invoice Sent
-→ Outstanding Balance
-→ Payment Received
-→ Receivable Updated
+Invoice Created → Invoice Sent → Outstanding Balance → Payment Received → Receivable Updated
 
 ## Features
-
-* AR Aging
-* Customer Statement (PDF and email)
-* Outstanding Summary
-* Payment Entry
-* Payment History
-* Send Reminder
+- AR Aging
+- Customer Statement (PDF and email)
+- Outstanding Summary
+- Payment Entry
+- Payment History
+- Send Reminder
 
 ## Aging Buckets
-
-0-30 Days
-31-60 Days
-61-90 Days
-90+ Days
+0-30 Days, 31-60 Days, 61-90 Days, 90+ Days
 
 ## Customer Statement
-
 A PDF report showing all invoices, payments, and outstanding balance for a specific customer:
-
-* Filterable by date range
-* Shows aging buckets at the bottom
-* Emailable directly to customer from the system
-* Generated on demand
-* Auto-generated monthly for customers with outstanding balances above zero
+- Filterable by date range
+- Shows aging buckets at the bottom
+- Emailable directly to customer from the system
+- Generated on demand
+- Auto-generated monthly for customers with outstanding balances above zero
 
 ---
 
 # Module 3 - Vendors
 
 ## Purpose
-
 Manage vendors and suppliers.
 
 ## Features
-
-* Create Vendor
-* Edit Vendor
-* Vendor Status (Active, Inactive, Blacklisted)
-* Vendor Contacts
-* Vendor History
+- Create Vendor
+- Edit Vendor
+- Vendor Status (Active, Inactive, Blacklisted)
+- Vendor Contacts
+- Vendor History
 
 ## Vendor Fields
-
-* Vendor Name
-* Vendor Code (auto-generated, format VEN-NNNN)
-* Contact Person
-* Phone
-* Email
-* Address
-* Tax Registration Number (TRN) for UAE vendors
-* Tax/Registration Number for foreign vendors (where applicable)
-* Bank Account details for payment
-* Default payment terms in days
-* Vendor category (Materials Supplier, Service Provider, Subcontractor, Other)
-* Country of registration (UAE default, supports foreign vendors)
-* Status
+- Vendor Name
+- Vendor Code (auto-generated, format VEN-NNNN)
+- Contact Person
+- Phone
+- Email
+- Address
+- Tax Registration Number (TRN) for UAE vendors
+- Tax/Registration Number for foreign vendors (where applicable)
+- Bank Account details for payment
+- Default payment terms in days
+- Vendor category (Materials Supplier, Service Provider, Subcontractor, Other)
+- Country of registration (UAE default, supports foreign vendors)
+- Status
 
 ---
 
 # Module 4 - Purchase Orders
 
 ## Purpose
-
 Procure materials and services.
 
 ## Workflow
-
-Material Requirement
-→ Purchase Order
-→ Vendor Supplies
-→ Vendor Invoice
-→ Payable Created
-→ Payment Released
+Material Requirement → Purchase Order → Vendor Supplies → Vendor Invoice → Payable Created → Payment Released
 
 ## Features
-
-* Create PO
-* Approve PO (multi-level based on amount)
-* Receive Materials
-* Track Vendor Invoice
-* PO History
-* PO PDF generation
-* Email PO to vendor
+- Create PO
+- Approve PO (multi-level based on amount)
+- Receive Materials
+- Track Vendor Invoice
+- PO History
+- PO PDF generation
+- Email PO to vendor
 
 ## PO Status
-
-Draft
-Pending Approval
-Approved
-Issued
-Partially Received
-Received
-Closed
-Cancelled
+Draft, Pending Approval, Approved, Issued, Partially Received, Received, Closed, Cancelled
 
 ## PO Numbering
-
-* Format: PO-YYYY-NNNN
-* Sequential per fiscal year
-* Auto-generated, not editable
+- Format: PO-YYYY-NNNN
+- Sequential per fiscal year
+- Auto-generated, not editable
 
 ## PO Approval Thresholds (Defaults, Configurable in Settings)
-
-* Under 10,000 AED — Operations Manager can approve solo
-* 10,000 to 50,000 AED — Operations Manager AND Accountant approval required
-* 50,000 to 200,000 AED — Operations Manager AND Accountant AND MD approval required
-* Over 200,000 AED — Operations Manager AND Accountant AND MD AND Founder approval required
+- Under 10,000 AED — Operations Manager can approve solo
+- 10,000 to 50,000 AED — Operations Manager AND Accountant approval required
+- 50,000 to 200,000 AED — Operations Manager AND Accountant AND MD approval required
+- Over 200,000 AED — Operations Manager AND Accountant AND MD AND Founder approval required
 
 Approval logic built into the workflow. Thresholds editable in the settings module without code changes.
 
@@ -332,236 +277,174 @@ Approval logic built into the workflow. Thresholds editable in the settings modu
 # Module 5 - Vendor Payables
 
 ## Purpose
-
 Track company liabilities.
 
 ## Workflow
-
-Vendor Invoice
-→ Payable Created
-→ Payment Released
-→ Balance Updated
+Vendor Invoice → Payable Created → Payment Released → Balance Updated
 
 ## Features
-
-* AP Aging
-* Payable Ledger
-* Vendor Statement (PDF)
-* Payment Entry
-* Payment History
+- AP Aging
+- Payable Ledger
+- Vendor Statement (PDF)
+- Payment Entry
+- Payment History
 
 ## Aging Buckets
-
-0-30 Days
-31-60 Days
-61-90 Days
-90+ Days
+0-30 Days, 31-60 Days, 61-90 Days, 90+ Days
 
 ---
 
 # Module 6 - Subcontractor Payments
 
 ## Purpose
-
 Manage subcontractor settlements.
 
 ## Existing Reuse
-
 Reuse existing subcontractor hour logs from the time tracking module.
 
 ## Workflow
-
-Hours Logged
-→ Rate Applied
-→ Amount Calculated
-→ Payment Entry
-→ Settlement Completed
+Hours Logged → Rate Applied → Amount Calculated → Payment Entry → Settlement Completed
 
 ## Features
-
-* Rate Cards (per subcontractor, per skill type if applicable)
-* Payment Tracking
-* Outstanding Balance
-* Payment History
-* Monthly Settlement Reports
+- Rate Cards (per subcontractor, per skill type if applicable)
+- Payment Tracking
+- Outstanding Balance
+- Payment History
+- Monthly Settlement Reports
 
 ---
 
 # Module 7 - Payroll
 
 ## Purpose
-
 Manage employee salary processing in compliance with UAE labor law.
 
 ## Workflow
-
-Attendance/Hours
-→ Payroll Calculation
-→ Salary Approval
-→ Salary Payment
-→ Payslip Generation
+Attendance/Hours → Payroll Calculation → Salary Approval → Salary Payment → Payslip Generation
 
 ## Features
-
-* Employee Salary Master
-* Payroll Run (monthly)
-* Salary Payment
-* Payslip Generation (PDF)
-* Payroll Reports
-* WPS Salary File Export (UAE Wage Protection System)
-* End-of-Service Benefit Calculation
-* Leave Salary Tracking
+- Employee Salary Master
+- Payroll Run (monthly)
+- Salary Payment
+- Payslip Generation (PDF)
+- Payroll Reports
+- WPS Salary File Export (UAE Wage Protection System)
+- End-of-Service Benefit Calculation
+- Leave Salary Tracking
 
 ## Salary Structure (UAE Compliance)
-
-* Basic Salary
-* Housing Allowance
-* Transport Allowance
-* Other Allowances
-* Total Gross Salary
+- Basic Salary
+- Housing Allowance
+- Transport Allowance
+- Other Allowances
+- Total Gross Salary
 
 ## UAE Payroll Requirements
-
-* Basic Salary plus Housing Allowance plus Transport Allowance plus Other Allowances breakdown required
-* WPS (Wage Protection System) salary file format export required for bank submission
-* Gratuity calculation: 21 days basic salary per year for first 5 years, 30 days basic salary per year thereafter
-* End-of-service benefits calculated automatically when employee status changes to Resigned or Terminated
-* Leave salary tracking (annual leave entitlement: 30 days after first year of service)
-* Probation period handling (no end-of-service benefits during first 6 months)
-* Salary payment date must be within first 10 days of following month per UAE labor law
+- Basic Salary plus Housing Allowance plus Transport Allowance plus Other Allowances breakdown required
+- WPS (Wage Protection System) salary file format export required for bank submission
+- Gratuity calculation: 21 days basic salary per year for first 5 years, 30 days basic salary per year thereafter
+- End-of-service benefits calculated automatically when employee status changes to Resigned or Terminated
+- Leave salary tracking (annual leave entitlement: 30 days after first year of service)
+- Probation period handling (no end-of-service benefits during first 6 months)
+- Salary payment date must be within first 10 days of following month per UAE labor law
 
 ## Employee Fields
-
-* Employee Code
-* Name
-* Position
-* Department
-* Date of Joining
-* Date of Birth
-* Nationality
-* Passport Number
-* Emirates ID
-* Visa Status
-* Basic Salary
-* Housing Allowance
-* Transport Allowance
-* Other Allowances
-* Total Salary
-* Bank Account
-* IBAN
-* Status (Active, On Leave, Probation, Resigned, Terminated)
+- Employee Code
+- Name
+- Position
+- Department
+- Date of Joining
+- Date of Birth
+- Nationality
+- Passport Number
+- Emirates ID
+- Visa Status
+- Basic Salary
+- Housing Allowance
+- Transport Allowance
+- Other Allowances
+- Total Salary
+- Bank Account
+- IBAN
+- Status (Active, On Leave, Probation, Resigned, Terminated)
 
 ---
 
 # Module 8 - Expense Management
 
 ## Purpose
-
 Manage company operating expenses.
 
 ## Categories
-
-* Office Rent
-* Electricity
-* Water
-* Transportation
-* Fuel
-* Internet
-* Maintenance
-* Office Supplies
-* Communication
-* Travel
-* Miscellaneous
+Office Rent, Electricity, Water, Transportation, Fuel, Internet, Maintenance, Office Supplies, Communication, Travel, Miscellaneous
 
 ## Workflow
-
-Expense Entry
-→ Approval (if above threshold)
-→ Payment
-→ Expense Recorded
+Expense Entry → Approval (if above threshold) → Payment → Expense Recorded
 
 ## Features
-
-* Add Expense
-* Expense Categories
-* Attach Receipts (mandatory, photo or PDF)
-* Monthly Expense Reports
-* Category Summary
-* Recurring Expense Setup (for monthly rent, utilities, etc.)
+- Add Expense
+- Expense Categories
+- Attach Receipts (mandatory, photo or PDF)
+- Monthly Expense Reports
+- Category Summary
+- Recurring Expense Setup (for monthly rent, utilities, etc.)
 
 ## Expense Fields
-
-* Expense Date
-* Category
-* Vendor (optional link to vendor record)
-* Description
-* Amount
-* VAT included flag
-* VAT amount (if applicable)
-* Total
-* Receipt attachment (mandatory)
-* Notes
-* Payment method
-* Status (Draft, Approved, Paid)
+- Expense Date
+- Category
+- Vendor (optional link to vendor record)
+- Description
+- Amount
+- VAT included flag
+- VAT amount (if applicable)
+- Total
+- Receipt attachment (mandatory)
+- Notes
+- Payment method
+- Status (Draft, Approved, Paid)
 
 ---
 
 # Module 9 - Inventory Transactions
 
 ## Purpose
-
 Convert inventory into a proper stock ledger.
 
 ## Existing Reuse
-
 Reuse existing inventory_items table.
 
 ## Transaction Types
-
-* Receive (from PO or direct purchase)
-* Issue (to project or work order)
-* Transfer (between locations if applicable)
-* Adjustment (for stock take corrections)
-* Return (back to vendor)
+- Receive (from PO or direct purchase)
+- Issue (to project or work order)
+- Transfer (between locations if applicable)
+- Adjustment (for stock take corrections)
+- Return (back to vendor)
 
 ## Workflow
-
-Purchase
-→ Receive Stock
-→ Store
-→ Issue To Project
-→ Track Balance
+Purchase → Receive Stock → Store → Issue To Project → Track Balance
 
 ## Features
-
-* Stock Movement History
-* Current Balance per Item
-* Stock Valuation
-* Reorder Alerts
+- Stock Movement History
+- Current Balance per Item
+- Stock Valuation
+- Reorder Alerts
 
 ---
 
 # Module 10 - Bank Reconciliation
 
 ## Purpose
-
 Ensure recorded transactions match actual bank activity.
 
 ## Features
-
-* Import bank statement (CSV upload)
-* Match bank transactions to recorded payments
-* Flag unmatched transactions for review
-* Reconcile cash balance with bank balance monthly
-* Monthly reconciliation report
+- Import bank statement (CSV upload)
+- Match bank transactions to recorded payments
+- Flag unmatched transactions for review
+- Reconcile cash balance with bank balance monthly
+- Monthly reconciliation report
 
 ## Workflow
-
-Upload Bank Statement
-→ Auto-match by amount and date
-→ Review unmatched items
-→ Manual matching or create adjustment entries
-→ Generate reconciliation report
+Upload Bank Statement → Auto-match by amount and date → Review unmatched items → Manual matching or create adjustment entries → Generate reconciliation report
 
 ---
 
@@ -570,74 +453,63 @@ Upload Bank Statement
 ## Reports Required
 
 ### Receivable Reports (Phase 1 deliverable)
-
-* Customer Outstanding
-* AR Aging
-* Collection Report
-* Customer Statement
+- Customer Outstanding
+- AR Aging
+- Collection Report
+- Customer Statement
 
 ### Payable Reports (Phase 2 deliverable)
-
-* Vendor Outstanding
-* AP Aging
-* Vendor Statement
-* Subcontractor Outstanding (Phase 3 deliverable)
+- Vendor Outstanding
+- AP Aging
+- Vendor Statement
+- Subcontractor Outstanding (Phase 3 deliverable)
 
 ### Payroll Reports (Phase 4 deliverable)
-
-* Monthly Payroll
-* Salary Register
-* WPS File Export
-* End-of-Service Provision Report
+- Monthly Payroll
+- Salary Register
+- WPS File Export
+- End-of-Service Provision Report
 
 ### Expense Reports (Phase 5 deliverable)
-
-* Monthly Expenses
-* Expense Category Summary
-* Vendor-wise Expense Report
+- Monthly Expenses
+- Expense Category Summary
+- Vendor-wise Expense Report
 
 ### Inventory Reports (Phase 6 deliverable)
-
-* Stock Summary
-* Stock Movement
-* Stock Valuation
+- Stock Summary
+- Stock Movement
+- Stock Valuation
 
 ### Project Reports
-
-* Budget vs Actual
-* JCA vs Actual Cost
+- Budget vs Actual
+- JCA vs Actual Cost
 
 ### Management Reports (Phase 7 deliverable)
-
-* Monthly Status Report
-* CNL Report (definition required from client — build as monthly liability summary placeholder until clarified)
-* Financial Summary
-* Profit and Loss Summary
-* Cash Flow Summary
+- Monthly Status Report
+- CNL Report (definition required from client — build as monthly liability summary placeholder until clarified)
+- Financial Summary
+- Profit and Loss Summary
+- Cash Flow Summary
 
 ---
 
 # Document Storage Requirements
 
 Every financial module must support document storage:
-
-* Invoices: Generated PDF stored permanently. Attached vendor invoices uploaded.
-* Purchase Orders: Generated PO PDF stored. Vendor invoices when received.
-* Expenses: Receipt photos or PDFs attached per expense entry (mandatory).
-* Payroll: Generated payslips stored per employee per month.
-* Bank Statements: CSV files retained for reconciliation history.
+- Invoices: Generated PDF stored permanently. Attached vendor invoices uploaded.
+- Purchase Orders: Generated PO PDF stored. Vendor invoices when received.
+- Expenses: Receipt photos or PDFs attached per expense entry (mandatory).
+- Payroll: Generated payslips stored per employee per month.
+- Bank Statements: CSV files retained for reconciliation history.
 
 ## Storage Pattern
-
 Use the same Supabase Storage pattern as existing modules:
-
-* Private bucket per document category (e.g., invoice-docs, po-docs, expense-receipts, payslip-docs, bank-statements)
-* Signed URLs for access
-* RLS policies matching the parent record's permissions
-* Bucket creation in migration SQL via INSERT INTO storage.buckets with ON CONFLICT DO NOTHING
+- Private bucket per document category (e.g., invoice-docs, po-docs, expense-receipts, payslip-docs, bank-statements)
+- Signed URLs for access
+- RLS policies matching the parent record's permissions
+- Bucket creation in migration SQL via INSERT INTO storage.buckets with ON CONFLICT DO NOTHING
 
 ## Document Retention
-
 Minimum 5 years per UAE Federal Tax Authority requirements. Configurable in settings.
 
 ---
@@ -647,75 +519,71 @@ Minimum 5 years per UAE Federal Tax Authority requirements. Configurable in sett
 Every financial record must have an immutable audit log.
 
 ## Audit Log Captures
-
-* Who made the change
-* When the change happened
-* What was changed
-* Previous value
-* New value
-* Optional reason for the change
+- Who made the change
+- When the change happened
+- What was changed
+- Previous value
+- New value
+- Optional reason for the change
 
 ## Audit Log Rules
-
-* Audit logs cannot be deleted by any user, including admin
-* Audit logs cannot be edited after creation
-* Audit log accessible only to MD, Accountant, and Admin roles
-* Mirror the Phase 1 JCA edit history pattern (append-only history table)
-* History table policies: read and insert only, no update or delete
+- Audit logs cannot be deleted by any user, including admin
+- Audit logs cannot be edited after creation
+- Audit log accessible only to MD, Accountant, and Admin roles
+- Mirror the Phase 1 JCA edit history pattern (append-only history table)
+- History table policies: read and insert only, no update or delete
 
 ## Tables Requiring Audit Trail
-
-* invoices
-* invoice_payments
-* purchase_orders
-* po_payments
-* vendor_payments
-* subcontractor_payments
-* payroll_runs
-* salary_payments
-* expenses
-* inventory_transactions
-* bank_reconciliations
+- invoices
+- invoice_payments
+- purchase_orders
+- po_payments
+- vendor_payments
+- subcontractor_payments
+- payroll_runs
+- salary_payments
+- expenses
+- inventory_transactions
+- bank_reconciliations
 
 ---
 
 # Currency Policy
 
 For Phase 1 through Phase 7 of the Accountant Module:
-
-* Primary currency: AED (United Arab Emirates Dirham)
-* All invoices, PO totals, payables, payroll, and expenses are in AED
-* Multi-currency is NOT supported in this version
-* Foreign supplier invoices are converted to AED at time of entry using a manually entered exchange rate
-* Multi-currency support deferred to a future version
+- Primary currency: AED (United Arab Emirates Dirham)
+- All invoices, PO totals, payables, payroll, and expenses are in AED
+- Multi-currency is NOT supported in this version
+- Foreign supplier invoices are converted to AED at time of entry using a manually entered exchange rate
+- Multi-currency support deferred to a future version
 
 ---
 
 # Build Philosophy
 
-* Build fully working flows where requirements are clear
-* For unclear requirements, build with reasonable defaults and clearly flag them in the report
-* Each phase report must include an "Assumptions Made" section listing every business decision made without explicit client direction
-* Mark UI elements with a small visual indicator where the implementation uses an assumption that needs client confirmation
-* Do NOT make assumptions about tax rates, legal compliance requirements, or financial calculations without explicit acknowledgment in the report
-* Priority order: working implementation, extensible design, configurable workflows, minimal impact on existing modules
+- Build fully working flows where requirements are clear
+- For unclear requirements, build with reasonable defaults and clearly flag them in the report
+- Each phase report must include an "Assumptions Made" section listing every business decision made without explicit client direction
+- Mark UI elements with a small visual indicator where the implementation uses an assumption that needs client confirmation
+- Do NOT make assumptions about tax rates, legal compliance requirements, or financial calculations without explicit acknowledgment in the report
+- Priority order: working implementation, extensible design, configurable workflows, minimal impact on existing modules
+- BUILD COMPLETE PHASES IN ONE GO — do not pause mid-phase
 
 ---
 
 # Safety Rules
 
 DO NOT BREAK:
-
-* AMC lifecycle
-* AMC payments
-* Quotations
-* Project conversion
-* JCA budgeting
-* Material Requests
-* Existing Reports
-* Existing Approval workflows
-* Phase 1 Main Contractor work (Material Submittal, Shop Drawing, JCA, Phase Gate from migrations 0040-0044)
-* v1.0.1 modules: Free Calls, Quotations, Sub-contractors, Time Tracking, Calendar conflicts
+- AMC lifecycle
+- AMC payments
+- Quotations
+- Project conversion
+- JCA budgeting
+- Material Requests
+- Existing Reports
+- Existing Approval workflows
+- Phase 1 Main Contractor work (Material Submittal, Shop Drawing, JCA, Phase Gate from migrations 0040-0044)
+- v1.0.1 modules: Free Calls, Quotations, Sub-contractors, Time Tracking, Calendar conflicts
 
 Reuse them whenever possible.
 
@@ -724,70 +592,58 @@ Reuse them whenever possible.
 # Permissions
 
 ## Accountant Role
-
-* Full access to accountant module
-* Read access to projects
-* Read access to quotations
-* Read access to JCA
-* Read access to inventory
-* Read access to subcontractor hours
-* Full access to bank reconciliation
-* Full access to audit logs of their actions
+- Full access to accountant module
+- Read access to projects
+- Read access to quotations
+- Read access to JCA
+- Read access to inventory
+- Read access to subcontractor hours
+- Full access to bank reconciliation
+- Full access to audit logs of their actions
 
 ## Manager Role
-
-* Approve invoices (under threshold)
-* Approve POs (under threshold)
-* View reports
-* Limited write access to operational financial data
+- Approve invoices (under threshold)
+- Approve POs (under threshold)
+- View reports
+- Limited write access to operational financial data
 
 ## MD Role
-
-* Approve high-value invoices and POs
-* View all financial data
-* View all audit logs
-* Approve payroll runs
+- Approve high-value invoices and POs
+- View all financial data
+- View all audit logs
+- Approve payroll runs
 
 ## Admin Role
-
-* Full access to everything
-* Settings module management
-* User management
+- Full access to everything
+- Settings module management
+- User management
 
 ---
 
 # Reusable Existing Features
 
 ## AMC Payment Pattern
-
 Copy the AMC payment recording UI and helper functions exactly when building Invoice payment recording. Reference: existing AMC payment flow.
 
 ## Receivables AR Aging
-
 Reuse the existing AR Aging component from current Accountant module. Extend to cover invoice receivables.
 
 ## File Uploads
-
 Reuse the replacement_documents pattern from migrations 0017 and 0039.
 
 ## Notifications
-
 Reuse fn_notify() and trigger patterns from migration 0036.
 
 ## Approval Workflow
-
 Reuse the existing approvals table and flow.
 
 ## Audit History
-
 Reuse the project_jca_history pattern from migration 0043 — append-only history table with read and insert policies only, no update or delete.
 
 ## Document Storage Bucket Pattern
-
 Reuse the project-design-docs bucket pattern from migration 0040.
 
 ## Phase Gate Pattern
-
 Reuse the phase gate UI plus database trigger pattern from migration 0044 if any new workflow requires advancement gating.
 
 ---
@@ -796,73 +652,43 @@ Reuse the phase gate UI plus database trigger pattern from migration 0044 if any
 
 Implement in phases. Each phase is independently testable. No phase should break existing functionality.
 
-## Phase 0 — Settings Module
+Each phase is delivered ONCE COMPLETE. No intermediate pauses within a phase.
 
+## Phase 0 — Settings Module
 Build first. Foundation for every other phase.
 
 ## Phase 1 — Invoices and Receivables
-
-* Module 1 (Project Invoicing)
-* Module 2 (Receivables)
-* AR Aging Report
+- Module 1 (Project Invoicing)
+- Module 2 (Receivables)
+- AR Aging Report
 
 ## Phase 2 — Vendors, POs, and Payables
-
-* Module 3 (Vendors)
-* Module 4 (Purchase Orders)
-* Module 5 (Vendor Payables)
-* AP Aging Report
+- Module 3 (Vendors)
+- Module 4 (Purchase Orders)
+- Module 5 (Vendor Payables)
+- AP Aging Report
 
 ## Phase 3 — Subcontractor Payments
-
-* Module 6 (Subcontractor Payments)
-* Subcontractor Payment Report
+- Module 6 (Subcontractor Payments)
+- Subcontractor Payment Report
 
 ## Phase 4 — Payroll
-
-* Module 7 (Payroll)
-* Payroll Reports
-* WPS File Export
-* End-of-Service Provision Report
+- Module 7 (Payroll)
+- Payroll Reports
+- WPS File Export
+- End-of-Service Provision Report
 
 ## Phase 5 — Expenses
-
-* Module 8 (Expense Management)
-* Expense Reports
+- Module 8 (Expense Management)
+- Expense Reports
 
 ## Phase 6 — Inventory Transactions
-
-* Module 9 (Inventory Transactions)
-* Stock Reports
+- Module 9 (Inventory Transactions)
+- Stock Reports
 
 ## Phase 7 — Bank Reconciliation and Cross-Module Reports
-
-* Module 10 (Bank Reconciliation)
-* Module 11 Management Reports (Monthly Status, CNL Report, Financial Summary, P&L Summary, Cash Flow)
-
----
-
-# Slicing Strategy Within Each Phase
-
-Each phase must be broken into smaller slices. Recommended approach for Phase 1 as a template:
-
-## Phase 1 Slicing Example
-
-* Slice A: Database schema for invoices (tables, status enum, history table, code generation trigger)
-* Slice B: Invoice creation UI and list view
-* Slice C: Invoice approval workflow and PDF generation
-* Slice D: Payment recording and receivables view
-* Slice E: AR aging buckets, customer statements, and Phase 1 financial report
-
-Stop and report after each slice. Wait for verification before proceeding.
-
-## Verification After Each Slice
-
-* npx tsc --noEmit exits 0
-* Migration applied cleanly with smoke test passing
-* Manual verification of the slice's feature in the application
-* No regression in existing modules
-* Honest report of any assumptions made
+- Module 10 (Bank Reconciliation)
+- Module 11 Management Reports (Monthly Status, CNL Report, Financial Summary, P&L Summary, Cash Flow)
 
 ---
 
@@ -886,11 +712,10 @@ These questions should be raised with the client before final delivery. Build wi
 # Goal
 
 A complete Accountant Module integrated into the existing Installtec platform that:
-
-* Complies with UAE business and tax requirements
-* Maintains all existing functionality intact
-* Provides full audit trails for financial transparency
-* Supports the complete accountant workflow from invoice to payment to reporting
-* Can be extended in future versions for multi-currency, advanced analytics, and additional reports
+- Complies with UAE business and tax requirements
+- Maintains all existing functionality intact
+- Provides full audit trails for financial transparency
+- Supports the complete accountant workflow from invoice to payment to reporting
+- Can be extended in future versions for multi-currency, advanced analytics, and additional reports
 
 Total estimated build time: 60 to 80 hours across all 7 phases, equivalent to 2 to 3 weeks of focused work. Build only what is required per phase. Do not attempt to compress phases or skip verification steps.

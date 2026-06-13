@@ -26,6 +26,7 @@ export interface AccountingSettings {
   taxLabel: string;
   invoicePrefix: string;
   poPrefix: string;
+  billPrefix: string;
   invoiceDueDays: number;
   agingBucket1Days: number;
   agingBucket2Days: number;
@@ -35,6 +36,14 @@ export interface AccountingSettings {
   poApprovalThreshold1: number;
   poApprovalThreshold2: number;
   poApprovalThreshold3: number;
+  // WPS employer identifiers — added in migration 0054. Stable MOHRE / bank
+  // values used to generate the UAE WPS salary file (Module 7).
+  wpsEstablishmentId: string;
+  wpsAgentId: string;
+  wpsBankName: string;
+  // Expense approval threshold (AED) — added in migration 0055. Expenses at or
+  // below this auto-approve; above it they need APPROVE_EXPENSES (Module 8).
+  expenseApprovalThreshold: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -51,6 +60,7 @@ export interface AccountingLookup {
 
 // Well-known lookup types (extend as later phases add lists).
 export const LOOKUP_PAYMENT_METHOD = "payment_method";
+export const LOOKUP_EXPENSE_CATEGORY = "expense_category";
 
 // Hardcoded fallback ONLY for the brief window before the settings row
 // is read (or if the migration hasn't been applied). Mirrors the SQL
@@ -60,6 +70,7 @@ export const SETTINGS_FALLBACK: Omit<AccountingSettings, "id" | "orgKey" | "crea
   taxLabel: "VAT",
   invoicePrefix: "INV",
   poPrefix: "PO",
+  billPrefix: "BILL",
   invoiceDueDays: 30,
   agingBucket1Days: 30,
   agingBucket2Days: 60,
@@ -67,10 +78,14 @@ export const SETTINGS_FALLBACK: Omit<AccountingSettings, "id" | "orgKey" | "crea
   poApprovalThreshold1: 10000,
   poApprovalThreshold2: 50000,
   poApprovalThreshold3: 200000,
+  wpsEstablishmentId: "",
+  wpsAgentId: "",
+  wpsBankName: "",
+  expenseApprovalThreshold: 5000,
 };
 
 const SETTINGS_COLS =
-  "id, org_key, default_tax_rate_pct, tax_label, invoice_prefix, po_prefix, invoice_due_days, aging_bucket_1_days, aging_bucket_2_days, aging_bucket_3_days, po_approval_threshold_1, po_approval_threshold_2, po_approval_threshold_3, created_at, updated_at";
+  "id, org_key, default_tax_rate_pct, tax_label, invoice_prefix, po_prefix, bill_prefix, invoice_due_days, aging_bucket_1_days, aging_bucket_2_days, aging_bucket_3_days, po_approval_threshold_1, po_approval_threshold_2, po_approval_threshold_3, wps_establishment_id, wps_agent_id, wps_bank_name, expense_approval_threshold, created_at, updated_at";
 const LOOKUP_COLS = "id, org_key, lookup_type, code, label, sort_order, is_active";
 
 // PostgREST returns numeric columns as strings — coerce defensively.
@@ -88,6 +103,7 @@ function rowToSettings(r: Record<string, unknown>): AccountingSettings {
     taxLabel: s(r.tax_label, SETTINGS_FALLBACK.taxLabel),
     invoicePrefix: s(r.invoice_prefix, SETTINGS_FALLBACK.invoicePrefix),
     poPrefix: s(r.po_prefix, SETTINGS_FALLBACK.poPrefix),
+    billPrefix: s(r.bill_prefix, SETTINGS_FALLBACK.billPrefix),
     invoiceDueDays: n(r.invoice_due_days, SETTINGS_FALLBACK.invoiceDueDays),
     agingBucket1Days: n(r.aging_bucket_1_days, SETTINGS_FALLBACK.agingBucket1Days),
     agingBucket2Days: n(r.aging_bucket_2_days, SETTINGS_FALLBACK.agingBucket2Days),
@@ -95,6 +111,10 @@ function rowToSettings(r: Record<string, unknown>): AccountingSettings {
     poApprovalThreshold1: n(r.po_approval_threshold_1, SETTINGS_FALLBACK.poApprovalThreshold1),
     poApprovalThreshold2: n(r.po_approval_threshold_2, SETTINGS_FALLBACK.poApprovalThreshold2),
     poApprovalThreshold3: n(r.po_approval_threshold_3, SETTINGS_FALLBACK.poApprovalThreshold3),
+    wpsEstablishmentId: s(r.wps_establishment_id),
+    wpsAgentId: s(r.wps_agent_id),
+    wpsBankName: s(r.wps_bank_name),
+    expenseApprovalThreshold: n(r.expense_approval_threshold, SETTINGS_FALLBACK.expenseApprovalThreshold),
     createdAt: s(r.created_at),
     updatedAt: s(r.updated_at),
   };
@@ -135,6 +155,7 @@ export interface AccountingSettingsPatch {
   taxLabel?: string;
   invoicePrefix?: string;
   poPrefix?: string;
+  billPrefix?: string;
   invoiceDueDays?: number;
   agingBucket1Days?: number;
   agingBucket2Days?: number;
@@ -142,6 +163,10 @@ export interface AccountingSettingsPatch {
   poApprovalThreshold1?: number;
   poApprovalThreshold2?: number;
   poApprovalThreshold3?: number;
+  wpsEstablishmentId?: string;
+  wpsAgentId?: string;
+  wpsBankName?: string;
+  expenseApprovalThreshold?: number;
 }
 
 export async function updateAccountingSettings(
@@ -153,6 +178,7 @@ export async function updateAccountingSettings(
   if (patch.taxLabel !== undefined) body.tax_label = patch.taxLabel.trim();
   if (patch.invoicePrefix !== undefined) body.invoice_prefix = patch.invoicePrefix.trim();
   if (patch.poPrefix !== undefined) body.po_prefix = patch.poPrefix.trim();
+  if (patch.billPrefix !== undefined) body.bill_prefix = patch.billPrefix.trim();
   if (patch.invoiceDueDays !== undefined) body.invoice_due_days = patch.invoiceDueDays;
   if (patch.agingBucket1Days !== undefined) body.aging_bucket_1_days = patch.agingBucket1Days;
   if (patch.agingBucket2Days !== undefined) body.aging_bucket_2_days = patch.agingBucket2Days;
@@ -160,6 +186,10 @@ export async function updateAccountingSettings(
   if (patch.poApprovalThreshold1 !== undefined) body.po_approval_threshold_1 = patch.poApprovalThreshold1;
   if (patch.poApprovalThreshold2 !== undefined) body.po_approval_threshold_2 = patch.poApprovalThreshold2;
   if (patch.poApprovalThreshold3 !== undefined) body.po_approval_threshold_3 = patch.poApprovalThreshold3;
+  if (patch.wpsEstablishmentId !== undefined) body.wps_establishment_id = patch.wpsEstablishmentId.trim();
+  if (patch.wpsAgentId !== undefined) body.wps_agent_id = patch.wpsAgentId.trim();
+  if (patch.wpsBankName !== undefined) body.wps_bank_name = patch.wpsBankName.trim();
+  if (patch.expenseApprovalThreshold !== undefined) body.expense_approval_threshold = patch.expenseApprovalThreshold;
   if (Object.keys(body).length === 0) return { ok: false, error: "Nothing to update." };
 
   const { data, error } = await supabaseBrowser()
@@ -187,6 +217,10 @@ export async function fetchLookups(lookupType: string): Promise<AcctResult<Accou
 
 export async function fetchPaymentMethods(): Promise<AcctResult<AccountingLookup[]>> {
   return fetchLookups(LOOKUP_PAYMENT_METHOD);
+}
+
+export async function fetchExpenseCategories(): Promise<AcctResult<AccountingLookup[]>> {
+  return fetchLookups(LOOKUP_EXPENSE_CATEGORY);
 }
 
 // Slugify a label into a stable code when the caller doesn't supply one.

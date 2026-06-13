@@ -26,10 +26,41 @@ import type {
   AmcContract, AmcStatus, Approval, Customer, FreeCall, FreeCallsMode,
   MaterialRequest, MaterialRequestStatus, MaterialRequestUrgency,
   Organization, Project, ProjectPhase,
+  ProjectMaterial, ProjectMaterialStatus,
+  InstallationTask, InstallationTaskCategory, InstallationTaskStatus, InstallationTaskPhoto,
+  SnaggingItem, SnaggingSeverity, SnaggingStatus, SnaggingPhoto, ZoneAcceptance, AcceptanceCertificate,
+  HandoverDocument, HandoverDocCategory, HandoverChecklistItem, HandoverSignoff,
+  DlpTicket, DlpTicketStatus, DlpTicketPhoto, SnaggingSeverity as DlpSeverity, ClosureChecklistItem, ClosureSummary,
   Quotation, QuotationStatus, RepairTicket, ReplacementContext, ReplacementRequest,
   ReplacementStatus, Role, Site, SubContractor, Tint, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
 } from "./types";
+import {
+  PROJECT_MATERIAL_COLUMNS, PROJECT_MATERIAL_HISTORY_COLUMNS,
+  mapProjectMaterialRow, mapProjectMaterialHistoryRow,
+} from "./projects/materialSupply";
+import {
+  INSTALLATION_TASK_COLUMNS, INSTALLATION_TASK_HISTORY_COLUMNS, INSTALLATION_TASK_PHOTO_COLUMNS,
+  mapInstallationTaskRow, mapInstallationTaskHistoryRow, mapInstallationTaskPhotoRow,
+} from "./projects/installation";
+import {
+  SNAGGING_ITEM_COLUMNS, SNAGGING_PHOTO_COLUMNS, ZONE_ACCEPTANCE_COLUMNS,
+  ACCEPTANCE_CERTIFICATE_COLUMNS, TC_HISTORY_COLUMNS,
+  mapSnaggingItemRow, mapSnaggingPhotoRow, mapZoneAcceptanceRow,
+  mapAcceptanceCertificateRow, mapTcHistoryRow,
+} from "./projects/tc";
+import {
+  HANDOVER_DOCUMENT_COLUMNS, HANDOVER_CHECKLIST_COLUMNS, HANDOVER_SIGNOFF_COLUMNS, HANDOVER_HISTORY_COLUMNS,
+  mapHandoverDocumentRow, mapHandoverChecklistRow, mapHandoverSignoffRow, mapHandoverHistoryRow,
+} from "./projects/handover";
+import {
+  DLP_TICKET_COLUMNS, DLP_TICKET_PHOTO_COLUMNS, DLP_HISTORY_COLUMNS,
+  mapDlpTicketRow, mapDlpTicketPhotoRow, mapDlpHistoryRow,
+} from "./projects/dlp";
+import {
+  CLOSURE_CHECKLIST_COLUMNS, CLOSURE_SUMMARY_COLUMNS, CLOSURE_HISTORY_COLUMNS,
+  mapClosureChecklistRow, mapClosureSummaryRow, mapClosureHistoryRow,
+} from "./projects/closed";
 
 // Returns null when Supabase is configured, otherwise a Result-shaped
 // failure so callers surface the misconfiguration as a normal error
@@ -589,6 +620,8 @@ export async function createProject(input: ProjectInput): Promise<Result> {
     leadTechId: input.lead_tech_id || "",
     status,
     currentPhase: input.current_phase ?? "design",
+    handoverCompletedAt: null,
+    dlpDurationMonths: 12,
     progress: 0,
     value: input.value_aed,
     startedAt: input.started_at,
@@ -691,6 +724,8 @@ export async function updateProject(id: string, patch: ProjectPatch): Promise<{ 
     leadTechId: (data.lead_tech_id as string) ?? "",
     status: data.status as string,
     currentPhase: (data.current_phase as ProjectPhase | null) ?? null,
+    handoverCompletedAt: current?.handoverCompletedAt ?? null,
+    dlpDurationMonths: current?.dlpDurationMonths ?? 12,
     progress: (data.progress as number) ?? 0,
     value: (data.value_aed as number) ?? 0,
     startedAt: (data.started_at as string) ?? "",
@@ -3356,6 +3391,1336 @@ export async function saveJca(
   }
 
   return { ok: true, jca };
+}
+
+// ============================================================
+// Phase 2 — Material Supply mutators (migration 0201).
+//
+// Four operations. All set last_action_by so the audit trigger
+// (trg_pm_audit_upd) records the actor. After a successful mutation
+// we re-fetch the affected row + its history rows and merge them into
+// the in-memory mirror so the UI updates without a full hydration round.
+// ============================================================
+
+export interface CreateProjectMaterialInput {
+  projectId: string;
+  description: string;
+  modelNumber?: string | null;
+  quantityPlanned: number;
+}
+
+export type ProjectMaterialResult =
+  | { ok: true; material: ProjectMaterial }
+  | { ok: false; error: string };
+
+async function refreshMaterialHistoryFor(materialId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa
+      .from("project_material_history")
+      .select(PROJECT_MATERIAL_HISTORY_COLUMNS)
+      .eq("material_id", materialId);
+    if (!data) return;
+    // Replace any existing mirror rows for this material with the fresh
+    // server-truth set (idempotent — handles delete-then-re-add edge cases
+    // and silently catches up missed audit rows).
+    for (const id of Object.keys(db.PROJECT_MATERIAL_HISTORY)) {
+      if (db.PROJECT_MATERIAL_HISTORY[id]?.materialId === materialId) {
+        delete db.PROJECT_MATERIAL_HISTORY[id];
+      }
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapProjectMaterialHistoryRow(row);
+      db.PROJECT_MATERIAL_HISTORY[h.id] = h;
+    }
+  } catch {
+    /* best-effort — mirror just stays stale until next page load */
+  }
+}
+
+/** Add a material to a project mid-phase (not part of the auto-seeded BOM). */
+export async function createProjectMaterial(
+  input: CreateProjectMaterialInput,
+  userId: string | null,
+): Promise<ProjectMaterialResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const desc = (input.description ?? "").trim();
+  if (!desc) return { ok: false, error: "Description is required." };
+  const qty = Math.floor(Number(input.quantityPlanned));
+  if (!Number.isFinite(qty) || qty < 1) {
+    return { ok: false, error: "Quantity must be at least 1." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("project_materials")
+    .insert({
+      project_id: input.projectId,
+      // source_material_item_id intentionally null — this is a mid-phase add.
+      description: desc,
+      model_number: (input.modelNumber ?? null)?.toString().trim() || null,
+      quantity_planned: qty,
+      created_by: userId,
+      last_action_by: userId,
+    })
+    .select(PROJECT_MATERIAL_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't add the material." };
+  }
+  const material = mapProjectMaterialRow(data as unknown as Record<string, unknown>);
+  db.PROJECT_MATERIALS[material.id] = material;
+  await refreshMaterialHistoryFor(material.id);
+  return { ok: true, material };
+}
+
+/** Move a material through its status workflow. The audit trigger records the transition. */
+export async function updateProjectMaterialStatus(
+  id: string,
+  newStatus: ProjectMaterialStatus,
+  userId: string | null,
+): Promise<ProjectMaterialResult> {
+  if (!id) return { ok: false, error: "Material id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("project_materials")
+    .update({ status: newStatus, last_action_by: userId })
+    .eq("id", id)
+    .select(PROJECT_MATERIAL_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the status." };
+  }
+  const material = mapProjectMaterialRow(data as unknown as Record<string, unknown>);
+  db.PROJECT_MATERIALS[material.id] = material;
+  await refreshMaterialHistoryFor(material.id);
+  return { ok: true, material };
+}
+
+/** Update one of the two quantity counters; the audit trigger logs the delta. */
+export async function updateProjectMaterialQuantity(
+  id: string,
+  kind: "warehouse" | "site",
+  newValue: number,
+  userId: string | null,
+): Promise<ProjectMaterialResult> {
+  if (!id) return { ok: false, error: "Material id is required." };
+  const v = Number(newValue);
+  if (!Number.isFinite(v) || v < 0) {
+    return { ok: false, error: "Quantity must be zero or greater." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const patch: Record<string, unknown> = { last_action_by: userId };
+  if (kind === "warehouse") patch.quantity_received_warehouse = v;
+  else patch.quantity_delivered_site = v;
+
+  const { data, error } = await supa
+    .from("project_materials")
+    .update(patch)
+    .eq("id", id)
+    .select(PROJECT_MATERIAL_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the quantity." };
+  }
+  const material = mapProjectMaterialRow(data as unknown as Record<string, unknown>);
+  db.PROJECT_MATERIALS[material.id] = material;
+  await refreshMaterialHistoryFor(material.id);
+  return { ok: true, material };
+}
+
+/**
+ * Link (or unlink) a material to a PO line. Pass null to unlink.
+ * Slice MS-B uses a paste-the-uuid input — a proper picker is a follow-up.
+ */
+export async function linkProjectMaterialToPoLine(
+  id: string,
+  poLineItemId: string | null,
+  userId: string | null,
+): Promise<ProjectMaterialResult> {
+  if (!id) return { ok: false, error: "Material id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("project_materials")
+    .update({ po_line_item_id: poLineItemId, last_action_by: userId })
+    .eq("id", id)
+    .select(PROJECT_MATERIAL_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the PO link." };
+  }
+  const material = mapProjectMaterialRow(data as unknown as Record<string, unknown>);
+  db.PROJECT_MATERIALS[material.id] = material;
+  return { ok: true, material };
+}
+
+// ============================================================
+// Phase 3 — Installation mutators (migration 0202).
+//
+// All set last_action_by so the audit trigger (trg_it_audit_upd)
+// records the actor. After a successful mutation we re-fetch the
+// affected row + its history rows and merge them into the in-memory
+// mirror so the UI updates without a full hydration round.
+//
+// completed_at / completed_by are managed by the DB (trg_it_before_write)
+// — we never send them; we just read them back off the returned row.
+// ============================================================
+
+const INSTALL_BUCKET = "project-install-photos";
+
+export type InstallationTaskResult =
+  | { ok: true; task: InstallationTask }
+  | { ok: false; error: string };
+
+async function refreshInstallationHistoryFor(taskId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa
+      .from("installation_task_history")
+      .select(INSTALLATION_TASK_HISTORY_COLUMNS)
+      .eq("task_id", taskId);
+    if (!data) return;
+    for (const id of Object.keys(db.INSTALLATION_TASK_HISTORY)) {
+      if (db.INSTALLATION_TASK_HISTORY[id]?.taskId === taskId) {
+        delete db.INSTALLATION_TASK_HISTORY[id];
+      }
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapInstallationTaskHistoryRow(row);
+      db.INSTALLATION_TASK_HISTORY[h.id] = h;
+    }
+  } catch {
+    /* best-effort — mirror stays stale until next page load */
+  }
+}
+
+async function refreshInstallationPhotosFor(taskId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa
+      .from("installation_task_photos")
+      .select(INSTALLATION_TASK_PHOTO_COLUMNS)
+      .eq("task_id", taskId);
+    if (!data) return;
+    for (const id of Object.keys(db.INSTALLATION_TASK_PHOTOS)) {
+      if (db.INSTALLATION_TASK_PHOTOS[id]?.taskId === taskId) {
+        delete db.INSTALLATION_TASK_PHOTOS[id];
+      }
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const p = mapInstallationTaskPhotoRow(row);
+      db.INSTALLATION_TASK_PHOTOS[p.id] = p;
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+export interface CreateInstallationTaskInput {
+  projectId: string;
+  title: string;
+  description?: string | null;
+  zone?: string | null;
+  category?: InstallationTaskCategory;
+  assignedTo?: string | null;
+  sourceMaterialId?: string | null;
+}
+
+/** Add a task to a project's installation checklist (manual, zone-grouped). */
+export async function createInstallationTask(
+  input: CreateInstallationTaskInput,
+  userId: string | null,
+): Promise<InstallationTaskResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const title = (input.title ?? "").trim();
+  if (!title) return { ok: false, error: "Task title is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("installation_tasks")
+    .insert({
+      project_id: input.projectId,
+      title,
+      description: (input.description ?? null)?.toString().trim() || null,
+      zone: (input.zone ?? null)?.toString().trim() || null,
+      category: input.category ?? "other",
+      assigned_to: input.assignedTo ?? null,
+      source_material_id: input.sourceMaterialId ?? null,
+      created_by: userId,
+      last_action_by: userId,
+    })
+    .select(INSTALLATION_TASK_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't add the task." };
+  }
+  const task = mapInstallationTaskRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASKS[task.id] = task;
+  await refreshInstallationHistoryFor(task.id);
+  return { ok: true, task };
+}
+
+/**
+ * Move a task through its status workflow. The audit trigger records the
+ * transition; completed_at/completed_by auto-stamp in the DB. Pass
+ * `notes` to store a block reason / defect note on the row (used by the
+ * "Block" action, which requires one).
+ */
+export async function updateInstallationTaskStatus(
+  id: string,
+  newStatus: InstallationTaskStatus,
+  userId: string | null,
+  notes?: string | null,
+): Promise<InstallationTaskResult> {
+  if (!id) return { ok: false, error: "Task id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const patch: Record<string, unknown> = { status: newStatus, last_action_by: userId };
+  if (notes !== undefined) patch.notes = (notes ?? null)?.toString().trim() || null;
+
+  const { data, error } = await supa
+    .from("installation_tasks")
+    .update(patch)
+    .eq("id", id)
+    .select(INSTALLATION_TASK_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the task." };
+  }
+  const task = mapInstallationTaskRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASKS[task.id] = task;
+  await refreshInstallationHistoryFor(task.id);
+  return { ok: true, task };
+}
+
+/** Assign (or unassign) a task to a worker. Pass null to unassign. */
+export async function assignInstallationTask(
+  id: string,
+  assignedTo: string | null,
+  userId: string | null,
+): Promise<InstallationTaskResult> {
+  if (!id) return { ok: false, error: "Task id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("installation_tasks")
+    .update({ assigned_to: assignedTo, last_action_by: userId })
+    .eq("id", id)
+    .select(INSTALLATION_TASK_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the assignment." };
+  }
+  const task = mapInstallationTaskRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASKS[task.id] = task;
+  await refreshInstallationHistoryFor(task.id);
+  return { ok: true, task };
+}
+
+/** Link (or unlink) a task to a delivered material for provenance. */
+export async function linkInstallationTaskToMaterial(
+  id: string,
+  sourceMaterialId: string | null,
+  userId: string | null,
+): Promise<InstallationTaskResult> {
+  if (!id) return { ok: false, error: "Task id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("installation_tasks")
+    .update({ source_material_id: sourceMaterialId, last_action_by: userId })
+    .eq("id", id)
+    .select(INSTALLATION_TASK_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the material link." };
+  }
+  const task = mapInstallationTaskRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASKS[task.id] = task;
+  return { ok: true, task };
+}
+
+export interface UpdateInstallationTaskDetailsInput {
+  title?: string;
+  description?: string | null;
+  zone?: string | null;
+  category?: InstallationTaskCategory;
+}
+
+/**
+ * Edit a task's descriptive fields (title/zone/category/description).
+ * Not audited by the trigger (only status / assignment / photo events
+ * are) — this is a manager-only metadata edit.
+ */
+export async function updateInstallationTaskDetails(
+  id: string,
+  input: UpdateInstallationTaskDetailsInput,
+  userId: string | null,
+): Promise<InstallationTaskResult> {
+  if (!id) return { ok: false, error: "Task id is required." };
+  const patch: Record<string, unknown> = { last_action_by: userId };
+  if (input.title !== undefined) {
+    const title = input.title.trim();
+    if (!title) return { ok: false, error: "Task title is required." };
+    patch.title = title;
+  }
+  if (input.description !== undefined) patch.description = (input.description ?? null)?.toString().trim() || null;
+  if (input.zone !== undefined) patch.zone = (input.zone ?? null)?.toString().trim() || null;
+  if (input.category !== undefined) patch.category = input.category;
+
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("installation_tasks")
+    .update(patch)
+    .eq("id", id)
+    .select(INSTALLATION_TASK_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the task." };
+  }
+  const task = mapInstallationTaskRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASKS[task.id] = task;
+  return { ok: true, task };
+}
+
+export type InstallationPhotoResult =
+  | { ok: true; photo: InstallationTaskPhoto }
+  | { ok: false; error: string };
+
+/** Upload a proof-of-install photo for a task. */
+export async function addInstallationTaskPhoto(
+  taskId: string,
+  projectId: string,
+  file: File,
+  caption: string | null,
+  uploaderId: string | null,
+): Promise<InstallationPhotoResult> {
+  if (!taskId) return { ok: false, error: "Task id is required." };
+  if (!file) return { ok: false, error: "Choose a photo to upload." };
+  if (file.size > REPLACEMENT_DOC_MAX_BYTES) {
+    return { ok: false, error: `Photo is over the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!IMG_EXTS.includes(fileExt(file.name))) {
+    return { ok: false, error: "Photo must be a JPG or PNG." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const safe = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "photo";
+  const rand = Math.random().toString(36).slice(2, 10);
+  const storagePath = `install/${projectId || "unknown"}/${taskId}/${rand}-${safe}`;
+  const { error: upErr } = await supa.storage.from(INSTALL_BUCKET)
+    .upload(storagePath, file, { contentType: file.type || undefined, upsert: false });
+  if (upErr) return { ok: false, error: `Photo upload failed: ${upErr.message}` };
+
+  const { data, error } = await supa
+    .from("installation_task_photos")
+    .insert({
+      task_id: taskId,
+      storage_path: storagePath,
+      caption: (caption ?? null)?.toString().trim() || null,
+      uploaded_by: uploaderId,
+    })
+    .select(INSTALLATION_TASK_PHOTO_COLUMNS)
+    .single();
+  if (error || !data) {
+    await supa.storage.from(INSTALL_BUCKET).remove([storagePath]); // rollback
+    return { ok: false, error: error?.message ?? "Couldn't save the photo." };
+  }
+  const photo = mapInstallationTaskPhotoRow(data as unknown as Record<string, unknown>);
+  db.INSTALLATION_TASK_PHOTOS[photo.id] = photo;
+  await refreshInstallationHistoryFor(taskId);   // the photo_added audit row
+  return { ok: true, photo };
+}
+
+/** Delete a photo (storage object + metadata row). */
+export async function deleteInstallationTaskPhoto(
+  photoId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!photoId) return { ok: false, error: "Photo id is required." };
+  const existing = db.INSTALLATION_TASK_PHOTOS[photoId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  if (existing?.storagePath) {
+    await supa.storage.from(INSTALL_BUCKET).remove([existing.storagePath]);
+  }
+  const { error } = await supa.from("installation_task_photos").delete().eq("id", photoId);
+  if (error) return { ok: false, error: error.message };
+  delete db.INSTALLATION_TASK_PHOTOS[photoId];
+  return { ok: true };
+}
+
+/** Signed download URL for a photo in the private install-photos bucket. */
+export async function getInstallPhotoUrl(
+  storagePath: string, expiresInSeconds = 120,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!storagePath) return { ok: false, error: "storagePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+  const { data, error } = await supabaseBrowser()
+    .storage.from(INSTALL_BUCKET).createSignedUrl(storagePath, expiresInSeconds);
+  if (error || !data?.signedUrl) return { ok: false, error: error?.message || "Could not create signed URL." };
+  return { ok: true, url: data.signedUrl };
+}
+
+// ============================================================
+// Phase 4 — Testing & Commissioning mutators (migration 0203).
+//
+// Snagging items, per-zone customer acceptances, and acceptance
+// certificates. All set last_action_by / actor columns so the
+// tc_history audit trigger records who did what. After a mutation we
+// refresh the project's tc_history mirror so the activity feed updates
+// without a full hydration round.
+// ============================================================
+
+const TC_SNAG_BUCKET = "project-snagging-photos";
+
+async function refreshTcHistoryFor(projectId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa
+      .from("tc_history")
+      .select(TC_HISTORY_COLUMNS)
+      .eq("project_id", projectId);
+    if (!data) return;
+    for (const id of Object.keys(db.TC_HISTORY)) {
+      if (db.TC_HISTORY[id]?.projectId === projectId) delete db.TC_HISTORY[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapTcHistoryRow(row);
+      db.TC_HISTORY[h.id] = h;
+    }
+  } catch {
+    /* best-effort — mirror stays stale until next page load */
+  }
+}
+
+async function refreshSnaggingPhotosFor(itemId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa
+      .from("snagging_photos")
+      .select(SNAGGING_PHOTO_COLUMNS)
+      .eq("snagging_item_id", itemId);
+    if (!data) return;
+    for (const id of Object.keys(db.SNAGGING_PHOTOS)) {
+      if (db.SNAGGING_PHOTOS[id]?.snaggingItemId === itemId) delete db.SNAGGING_PHOTOS[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const p = mapSnaggingPhotoRow(row);
+      db.SNAGGING_PHOTOS[p.id] = p;
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+export type SnaggingItemResult =
+  | { ok: true; item: SnaggingItem }
+  | { ok: false; error: string };
+
+export interface CreateSnaggingItemInput {
+  projectId: string;
+  description: string;
+  zone?: string | null;
+  severity?: SnaggingSeverity;
+  assignedTo?: string | null;
+}
+
+/** Raise a snag found during the customer walkthrough. */
+export async function createSnaggingItem(
+  input: CreateSnaggingItemInput,
+  userId: string | null,
+): Promise<SnaggingItemResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const desc = (input.description ?? "").trim();
+  if (!desc) return { ok: false, error: "Description is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("snagging_items")
+    .insert({
+      project_id: input.projectId,
+      description: desc,
+      zone: (input.zone ?? null)?.toString().trim() || null,
+      severity: input.severity ?? "medium",
+      assigned_to: input.assignedTo ?? null,
+      reported_by: userId,
+      created_by: userId,
+      last_action_by: userId,
+    })
+    .select(SNAGGING_ITEM_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't raise the snag." };
+  }
+  const item = mapSnaggingItemRow(data as unknown as Record<string, unknown>);
+  db.SNAGGING_ITEMS[item.id] = item;
+  await refreshTcHistoryFor(item.projectId);
+  return { ok: true, item };
+}
+
+/**
+ * Move a snag through its workflow (open → in_progress → fixed →
+ * verified). The DB validates the transition and stamps completed_at/by.
+ * Pass `notes` to record a fix note.
+ */
+export async function updateSnaggingStatus(
+  id: string,
+  newStatus: SnaggingStatus,
+  userId: string | null,
+  notes?: string | null,
+): Promise<SnaggingItemResult> {
+  if (!id) return { ok: false, error: "Snag id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const patch: Record<string, unknown> = { status: newStatus, last_action_by: userId };
+  if (notes !== undefined) patch.notes = (notes ?? null)?.toString().trim() || null;
+
+  const { data, error } = await supa
+    .from("snagging_items")
+    .update(patch)
+    .eq("id", id)
+    .select(SNAGGING_ITEM_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the snag." };
+  }
+  const item = mapSnaggingItemRow(data as unknown as Record<string, unknown>);
+  db.SNAGGING_ITEMS[item.id] = item;
+  await refreshTcHistoryFor(item.projectId);
+  return { ok: true, item };
+}
+
+/** Assign (or unassign) a snag to a worker. */
+export async function assignSnaggingItem(
+  id: string,
+  assignedTo: string | null,
+  userId: string | null,
+): Promise<SnaggingItemResult> {
+  if (!id) return { ok: false, error: "Snag id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("snagging_items")
+    .update({ assigned_to: assignedTo, last_action_by: userId })
+    .eq("id", id)
+    .select(SNAGGING_ITEM_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the assignment." };
+  }
+  const item = mapSnaggingItemRow(data as unknown as Record<string, unknown>);
+  db.SNAGGING_ITEMS[item.id] = item;
+  await refreshTcHistoryFor(item.projectId);
+  return { ok: true, item };
+}
+
+export type SnaggingPhotoResult =
+  | { ok: true; photo: SnaggingPhoto }
+  | { ok: false; error: string };
+
+/** Upload a photo for a snag (proof of the defect / the fix). */
+export async function addSnaggingPhoto(
+  itemId: string,
+  projectId: string,
+  file: File,
+  caption: string | null,
+  uploaderId: string | null,
+): Promise<SnaggingPhotoResult> {
+  if (!itemId) return { ok: false, error: "Snag id is required." };
+  if (!file) return { ok: false, error: "Choose a photo to upload." };
+  if (file.size > REPLACEMENT_DOC_MAX_BYTES) {
+    return { ok: false, error: `Photo is over the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!IMG_EXTS.includes(fileExt(file.name))) {
+    return { ok: false, error: "Photo must be a JPG or PNG." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const safe = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "photo";
+  const rand = Math.random().toString(36).slice(2, 10);
+  const storagePath = `snagging/${projectId || "unknown"}/${itemId}/${rand}-${safe}`;
+  const { error: upErr } = await supa.storage.from(TC_SNAG_BUCKET)
+    .upload(storagePath, file, { contentType: file.type || undefined, upsert: false });
+  if (upErr) return { ok: false, error: `Photo upload failed: ${upErr.message}` };
+
+  const { data, error } = await supa
+    .from("snagging_photos")
+    .insert({
+      snagging_item_id: itemId,
+      storage_path: storagePath,
+      caption: (caption ?? null)?.toString().trim() || null,
+      uploaded_by: uploaderId,
+    })
+    .select(SNAGGING_PHOTO_COLUMNS)
+    .single();
+  if (error || !data) {
+    await supa.storage.from(TC_SNAG_BUCKET).remove([storagePath]); // rollback
+    return { ok: false, error: error?.message ?? "Couldn't save the photo." };
+  }
+  const photo = mapSnaggingPhotoRow(data as unknown as Record<string, unknown>);
+  db.SNAGGING_PHOTOS[photo.id] = photo;
+  await refreshSnaggingPhotosFor(itemId);
+  if (projectId) await refreshTcHistoryFor(projectId);
+  return { ok: true, photo };
+}
+
+/** Delete a snag photo (storage object + metadata row). */
+export async function deleteSnaggingPhoto(
+  photoId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!photoId) return { ok: false, error: "Photo id is required." };
+  const existing = db.SNAGGING_PHOTOS[photoId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  if (existing?.storagePath) {
+    await supa.storage.from(TC_SNAG_BUCKET).remove([existing.storagePath]);
+  }
+  const { error } = await supa.from("snagging_photos").delete().eq("id", photoId);
+  if (error) return { ok: false, error: error.message };
+  delete db.SNAGGING_PHOTOS[photoId];
+  return { ok: true };
+}
+
+/** Signed download URL for a snag photo in the private bucket. */
+export async function getSnaggingPhotoUrl(
+  storagePath: string, expiresInSeconds = 120,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!storagePath) return { ok: false, error: "storagePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+  const { data, error } = await supabaseBrowser()
+    .storage.from(TC_SNAG_BUCKET).createSignedUrl(storagePath, expiresInSeconds);
+  if (error || !data?.signedUrl) return { ok: false, error: error?.message || "Could not create signed URL." };
+  return { ok: true, url: data.signedUrl };
+}
+
+export type ZoneAcceptanceResult =
+  | { ok: true; acceptance: ZoneAcceptance }
+  | { ok: false; error: string };
+
+export interface RecordZoneAcceptanceInput {
+  projectId: string;
+  zone: string;
+  customerName: string;
+  customerEmail?: string | null;
+  notes?: string | null;
+}
+
+/**
+ * Record (or re-record) a per-zone customer sign-off. Upserts on
+ * (project_id, zone) so signing the same zone again updates it.
+ */
+export async function recordZoneAcceptance(
+  input: RecordZoneAcceptanceInput,
+  userId: string | null,
+): Promise<ZoneAcceptanceResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const zone = (input.zone ?? "").trim();
+  if (!zone) return { ok: false, error: "Zone is required." };
+  const customer = (input.customerName ?? "").trim();
+  if (!customer) return { ok: false, error: "Customer name is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("zone_acceptances")
+    .upsert({
+      project_id: input.projectId,
+      zone,
+      customer_name: customer,
+      customer_email: (input.customerEmail ?? null)?.toString().trim() || null,
+      notes: (input.notes ?? null)?.toString().trim() || null,
+      signed_at: new Date().toISOString(),
+      signed_by_user_id: userId,
+    }, { onConflict: "project_id,zone" })
+    .select(ZONE_ACCEPTANCE_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't record the sign-off." };
+  }
+  const acceptance = mapZoneAcceptanceRow(data as unknown as Record<string, unknown>);
+  db.ZONE_ACCEPTANCES[acceptance.id] = acceptance;
+  await refreshTcHistoryFor(acceptance.projectId);
+  return { ok: true, acceptance };
+}
+
+export type AcceptanceCertificateResult =
+  | { ok: true; certificate: AcceptanceCertificate }
+  | { ok: false; error: string };
+
+export interface GenerateCertificateInput {
+  issuedTo?: string | null;
+  scopeSummary?: string | null;
+}
+
+/**
+ * Generate the final acceptance certificate (auto-numbered AC-YYYY-NNNN
+ * by the DB trigger). The number trigger uses COUNT+1, so retry on a
+ * unique-violation race (same pattern as the other code-gen mutators).
+ */
+export async function generateAcceptanceCertificate(
+  projectId: string,
+  input: GenerateCertificateInput,
+  userId: string | null,
+): Promise<AcceptanceCertificateResult> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  for (let attempt = 0; attempt < MAX_CODE_RETRIES; attempt++) {
+    const { data, error } = await supa
+      .from("acceptance_certificates")
+      .insert({
+        project_id: projectId,
+        issued_to: (input.issuedTo ?? null)?.toString().trim() || null,
+        scope_summary: (input.scopeSummary ?? null)?.toString().trim() || null,
+        generated_by: userId,
+      })
+      .select(ACCEPTANCE_CERTIFICATE_COLUMNS)
+      .single();
+    if (!error && data) {
+      const certificate = mapAcceptanceCertificateRow(data as unknown as Record<string, unknown>);
+      db.ACCEPTANCE_CERTIFICATES[certificate.id] = certificate;
+      await refreshTcHistoryFor(projectId);
+      return { ok: true, certificate };
+    }
+    const code = (error as { code?: string } | null)?.code;
+    if (code === UNIQUE_VIOLATION) continue; // racy AC-number — retry
+    return { ok: false, error: error?.message ?? "Couldn't generate the certificate." };
+  }
+  return { ok: false, error: "Could not allocate a certificate number — try again." };
+}
+
+// ============================================================
+// Phase 5 — Handover mutators (migration 0204).
+//
+// Documents (by category), a mandatory checklist (auto-seeded on entry
+// to DLP), and a one-time customer sign-off. The sign-off insert is
+// gated by the DB (mandatory checklist done + a document per required
+// category) and stamps projects.handover_completed_at + notifies the
+// lead tech. After each mutation we refresh the project's handover
+// history mirror.
+// ============================================================
+
+const HANDOVER_BUCKET = "project-handover-docs";
+export const HANDOVER_DOC_MAX_BYTES = 25 * 1024 * 1024; // 25 MB
+const HANDOVER_DOC_EXTS = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "png", "jpg", "jpeg", "dwg", "zip"];
+
+async function refreshHandoverHistoryFor(projectId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa.from("handover_history").select(HANDOVER_HISTORY_COLUMNS).eq("project_id", projectId);
+    if (!data) return;
+    for (const id of Object.keys(db.HANDOVER_HISTORY)) {
+      if (db.HANDOVER_HISTORY[id]?.projectId === projectId) delete db.HANDOVER_HISTORY[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapHandoverHistoryRow(row);
+      db.HANDOVER_HISTORY[h.id] = h;
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+export type HandoverDocumentResult =
+  | { ok: true; document: HandoverDocument }
+  | { ok: false; error: string };
+
+/** Upload a handover deliverable into a category. */
+export async function uploadHandoverDocument(
+  projectId: string,
+  category: HandoverDocCategory,
+  file: File,
+  description: string | null,
+  uploaderId: string | null,
+): Promise<HandoverDocumentResult> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  if (!file) return { ok: false, error: "Choose a file to upload." };
+  if (file.size > HANDOVER_DOC_MAX_BYTES) {
+    return { ok: false, error: `File is over the 25 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!HANDOVER_DOC_EXTS.includes(fileExt(file.name))) {
+    return { ok: false, error: "Unsupported file type. Allowed: PDF, Office docs, images, DWG, ZIP." };
+  }
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const safe = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 140) || "document";
+  const rand = Math.random().toString(36).slice(2, 10);
+  const filePath = `handover/${projectId}/${category}/${rand}-${safe}`;
+  const { error: upErr } = await supa.storage.from(HANDOVER_BUCKET)
+    .upload(filePath, file, { contentType: file.type || undefined, upsert: false });
+  if (upErr) return { ok: false, error: `Upload failed: ${upErr.message}` };
+
+  const { data, error } = await supa
+    .from("handover_documents")
+    .insert({
+      project_id: projectId,
+      category,
+      file_path: filePath,
+      file_name: file.name,
+      file_size: file.size,
+      mime_type: file.type || null,
+      description: (description ?? null)?.toString().trim() || null,
+      uploaded_by: uploaderId,
+    })
+    .select(HANDOVER_DOCUMENT_COLUMNS)
+    .single();
+  if (error || !data) {
+    await supa.storage.from(HANDOVER_BUCKET).remove([filePath]); // rollback
+    return { ok: false, error: error?.message ?? "Couldn't save the document." };
+  }
+  const document = mapHandoverDocumentRow(data as unknown as Record<string, unknown>);
+  db.HANDOVER_DOCUMENTS[document.id] = document;
+  await refreshHandoverHistoryFor(projectId);
+  return { ok: true, document };
+}
+
+/** Delete a handover document (storage object + metadata row). */
+export async function deleteHandoverDocument(
+  docId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!docId) return { ok: false, error: "Document id is required." };
+  const existing = db.HANDOVER_DOCUMENTS[docId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  if (existing?.filePath) await supa.storage.from(HANDOVER_BUCKET).remove([existing.filePath]);
+  const { error } = await supa.from("handover_documents").delete().eq("id", docId);
+  if (error) return { ok: false, error: error.message };
+  delete db.HANDOVER_DOCUMENTS[docId];
+  if (existing?.projectId) await refreshHandoverHistoryFor(existing.projectId);
+  return { ok: true };
+}
+
+/** Signed download URL for a handover document. */
+export async function getHandoverDocUrl(
+  filePath: string, expiresInSeconds = 120,
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!filePath) return { ok: false, error: "filePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+  const { data, error } = await supabaseBrowser()
+    .storage.from(HANDOVER_BUCKET).createSignedUrl(filePath, expiresInSeconds);
+  if (error || !data?.signedUrl) return { ok: false, error: error?.message || "Could not create signed URL." };
+  return { ok: true, url: data.signedUrl };
+}
+
+export type HandoverChecklistResult =
+  | { ok: true; item: HandoverChecklistItem }
+  | { ok: false; error: string };
+
+/** Toggle a checklist item complete/incomplete. */
+export async function setHandoverChecklistItem(
+  id: string,
+  isCompleted: boolean,
+  userId: string | null,
+): Promise<HandoverChecklistResult> {
+  if (!id) return { ok: false, error: "Item id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("handover_checklist_items")
+    .update({ is_completed: isCompleted, completed_by: isCompleted ? userId : null, last_action_by: userId })
+    .eq("id", id)
+    .select(HANDOVER_CHECKLIST_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't update the checklist item." };
+  }
+  const item = mapHandoverChecklistRow(data as unknown as Record<string, unknown>);
+  db.HANDOVER_CHECKLIST_ITEMS[item.id] = item;
+  await refreshHandoverHistoryFor(item.projectId);
+  return { ok: true, item };
+}
+
+/** Add a custom checklist item (mandatory by default). */
+export async function addHandoverChecklistItem(
+  projectId: string,
+  itemDescription: string,
+  category: HandoverDocCategory | null,
+  isRequired: boolean,
+  userId: string | null,
+): Promise<HandoverChecklistResult> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const desc = (itemDescription ?? "").trim();
+  if (!desc) return { ok: false, error: "Item description is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("handover_checklist_items")
+    .insert({ project_id: projectId, item_description: desc, category, is_required: isRequired, last_action_by: userId })
+    .select(HANDOVER_CHECKLIST_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't add the checklist item." };
+  }
+  const item = mapHandoverChecklistRow(data as unknown as Record<string, unknown>);
+  db.HANDOVER_CHECKLIST_ITEMS[item.id] = item;
+  await refreshHandoverHistoryFor(projectId);
+  return { ok: true, item };
+}
+
+export type HandoverSignoffResult =
+  | { ok: true; signoff: HandoverSignoff }
+  | { ok: false; error: string };
+
+export interface RecordHandoverSignoffInput {
+  projectId: string;
+  customerName: string;
+  customerEmail?: string | null;
+  notes?: string | null;
+}
+
+/**
+ * Record the one-time customer handover sign-off. The DB gate
+ * (fn_handover_signoff_gate) rejects it unless every mandatory checklist
+ * item is complete and each required category has a document; on success
+ * the DB stamps projects.handover_completed_at and notifies the lead tech.
+ */
+export async function recordHandoverSignoff(
+  input: RecordHandoverSignoffInput,
+  userId: string | null,
+): Promise<HandoverSignoffResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const customer = (input.customerName ?? "").trim();
+  if (!customer) return { ok: false, error: "Customer name is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa
+    .from("handover_signoff")
+    .insert({
+      project_id: input.projectId,
+      customer_name: customer,
+      customer_email: (input.customerEmail ?? null)?.toString().trim() || null,
+      notes: (input.notes ?? null)?.toString().trim() || null,
+      signature_method: "typed",
+      signed_by_user_id: userId,
+    })
+    .select(HANDOVER_SIGNOFF_COLUMNS)
+    .single();
+  if (error || !data) {
+    return { ok: false, error: error?.message ?? "Couldn't record the sign-off." };
+  }
+  const signoff = mapHandoverSignoffRow(data as unknown as Record<string, unknown>);
+  db.HANDOVER_SIGNOFF[signoff.id] = signoff;
+  // Reflect the handover stamp the DB trigger just wrote.
+  const proj = db.PROJECTS[input.projectId];
+  if (proj) db.PROJECTS[input.projectId] = { ...proj, handoverCompletedAt: signoff.signedAt };
+  await refreshHandoverHistoryFor(input.projectId);
+  return { ok: true, signoff };
+}
+
+// ============================================================
+// Phase 6 — DLP mutators (migration 0205).
+//
+// Warranty tickets reported during the Defects Liability Period, their
+// status workflow, assignment and photos. After each mutation we refresh
+// the project's dlp_history mirror.
+// ============================================================
+
+const DLP_BUCKET = "project-dlp-photos";
+
+async function refreshDlpHistoryFor(projectId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa.from("dlp_history").select(DLP_HISTORY_COLUMNS).eq("project_id", projectId);
+    if (!data) return;
+    for (const id of Object.keys(db.DLP_HISTORY)) {
+      if (db.DLP_HISTORY[id]?.projectId === projectId) delete db.DLP_HISTORY[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapDlpHistoryRow(row);
+      db.DLP_HISTORY[h.id] = h;
+    }
+  } catch { /* best-effort */ }
+}
+
+async function refreshDlpPhotosFor(ticketId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa.from("dlp_ticket_photos").select(DLP_TICKET_PHOTO_COLUMNS).eq("ticket_id", ticketId);
+    if (!data) return;
+    for (const id of Object.keys(db.DLP_TICKET_PHOTOS)) {
+      if (db.DLP_TICKET_PHOTOS[id]?.ticketId === ticketId) delete db.DLP_TICKET_PHOTOS[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const p = mapDlpTicketPhotoRow(row);
+      db.DLP_TICKET_PHOTOS[p.id] = p;
+    }
+  } catch { /* best-effort */ }
+}
+
+export type DlpTicketResult = { ok: true; ticket: DlpTicket } | { ok: false; error: string };
+
+export interface CreateDlpTicketInput {
+  projectId: string;
+  description: string;
+  severity?: DlpSeverity;
+  assignedTo?: string | null;
+}
+
+/** Report a warranty defect during the DLP. Any field role may report. */
+export async function createDlpTicket(input: CreateDlpTicketInput, userId: string | null): Promise<DlpTicketResult> {
+  if (!input.projectId) return { ok: false, error: "Project id is required." };
+  const desc = (input.description ?? "").trim();
+  if (!desc) return { ok: false, error: "Description is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("dlp_tickets").insert({
+    project_id: input.projectId,
+    description: desc,
+    severity: input.severity ?? "medium",
+    assigned_to: input.assignedTo ?? null,
+    reported_by: userId,
+    created_by: userId,
+    last_action_by: userId,
+  }).select(DLP_TICKET_COLUMNS).single();
+  if (error || !data) return { ok: false, error: error?.message ?? "Couldn't raise the ticket." };
+  const ticket = mapDlpTicketRow(data as unknown as Record<string, unknown>);
+  db.DLP_TICKETS[ticket.id] = ticket;
+  await refreshDlpHistoryFor(ticket.projectId);
+  return { ok: true, ticket };
+}
+
+/** Move a ticket through its workflow; resolution_notes optional. */
+export async function updateDlpTicketStatus(
+  id: string, newStatus: DlpTicketStatus, userId: string | null, resolutionNotes?: string | null,
+): Promise<DlpTicketResult> {
+  if (!id) return { ok: false, error: "Ticket id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const patch: Record<string, unknown> = { status: newStatus, last_action_by: userId };
+  if (resolutionNotes !== undefined) patch.resolution_notes = (resolutionNotes ?? null)?.toString().trim() || null;
+
+  const { data, error } = await supa.from("dlp_tickets").update(patch).eq("id", id).select(DLP_TICKET_COLUMNS).single();
+  if (error || !data) return { ok: false, error: error?.message ?? "Couldn't update the ticket." };
+  const ticket = mapDlpTicketRow(data as unknown as Record<string, unknown>);
+  db.DLP_TICKETS[ticket.id] = ticket;
+  await refreshDlpHistoryFor(ticket.projectId);
+  return { ok: true, ticket };
+}
+
+/** Assign (or unassign) a ticket to a worker. */
+export async function assignDlpTicket(id: string, assignedTo: string | null, userId: string | null): Promise<DlpTicketResult> {
+  if (!id) return { ok: false, error: "Ticket id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const { data, error } = await supa.from("dlp_tickets").update({ assigned_to: assignedTo, last_action_by: userId }).eq("id", id).select(DLP_TICKET_COLUMNS).single();
+  if (error || !data) return { ok: false, error: error?.message ?? "Couldn't update the assignment." };
+  const ticket = mapDlpTicketRow(data as unknown as Record<string, unknown>);
+  db.DLP_TICKETS[ticket.id] = ticket;
+  await refreshDlpHistoryFor(ticket.projectId);
+  return { ok: true, ticket };
+}
+
+/** Adjust the DLP duration (months) for a project. */
+export async function updateDlpDuration(projectId: string, months: number, _userId: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  void _userId;
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const m = Math.floor(Number(months));
+  if (!Number.isFinite(m) || m < 1) return { ok: false, error: "Duration must be at least 1 month." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const { error } = await supabaseBrowser().from("projects").update({ dlp_duration_months: m }).eq("id", projectId);
+  if (error) return { ok: false, error: error.message };
+  const proj = db.PROJECTS[projectId];
+  if (proj) db.PROJECTS[projectId] = { ...proj, dlpDurationMonths: m };
+  return { ok: true };
+}
+
+export type DlpPhotoResult = { ok: true; photo: DlpTicketPhoto } | { ok: false; error: string };
+
+/** Upload a photo for a DLP ticket. */
+export async function addDlpTicketPhoto(ticketId: string, projectId: string, file: File, caption: string | null, uploaderId: string | null): Promise<DlpPhotoResult> {
+  if (!ticketId) return { ok: false, error: "Ticket id is required." };
+  if (!file) return { ok: false, error: "Choose a photo to upload." };
+  if (file.size > REPLACEMENT_DOC_MAX_BYTES) {
+    return { ok: false, error: `Photo is over the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` };
+  }
+  if (!IMG_EXTS.includes(fileExt(file.name))) return { ok: false, error: "Photo must be a JPG or PNG." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const safe = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "photo";
+  const rand = Math.random().toString(36).slice(2, 10);
+  const storagePath = `dlp/${projectId || "unknown"}/${ticketId}/${rand}-${safe}`;
+  const { error: upErr } = await supa.storage.from(DLP_BUCKET).upload(storagePath, file, { contentType: file.type || undefined, upsert: false });
+  if (upErr) return { ok: false, error: `Photo upload failed: ${upErr.message}` };
+
+  const { data, error } = await supa.from("dlp_ticket_photos").insert({
+    ticket_id: ticketId, storage_path: storagePath, caption: (caption ?? null)?.toString().trim() || null, uploaded_by: uploaderId,
+  }).select(DLP_TICKET_PHOTO_COLUMNS).single();
+  if (error || !data) {
+    await supa.storage.from(DLP_BUCKET).remove([storagePath]);
+    return { ok: false, error: error?.message ?? "Couldn't save the photo." };
+  }
+  const photo = mapDlpTicketPhotoRow(data as unknown as Record<string, unknown>);
+  db.DLP_TICKET_PHOTOS[photo.id] = photo;
+  await refreshDlpPhotosFor(ticketId);
+  if (projectId) await refreshDlpHistoryFor(projectId);
+  return { ok: true, photo };
+}
+
+export async function deleteDlpTicketPhoto(photoId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!photoId) return { ok: false, error: "Photo id is required." };
+  const existing = db.DLP_TICKET_PHOTOS[photoId];
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+  if (existing?.storagePath) await supa.storage.from(DLP_BUCKET).remove([existing.storagePath]);
+  const { error } = await supa.from("dlp_ticket_photos").delete().eq("id", photoId);
+  if (error) return { ok: false, error: error.message };
+  delete db.DLP_TICKET_PHOTOS[photoId];
+  return { ok: true };
+}
+
+export async function getDlpPhotoUrl(storagePath: string, expiresInSeconds = 120): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!storagePath) return { ok: false, error: "storagePath required" };
+  const guard = ensureSupabase();
+  if (guard) return { ok: false, error: guard.error };
+  const { data, error } = await supabaseBrowser().storage.from(DLP_BUCKET).createSignedUrl(storagePath, expiresInSeconds);
+  if (error || !data?.signedUrl) return { ok: false, error: error?.message || "Could not create signed URL." };
+  return { ok: true, url: data.signedUrl };
+}
+
+// ============================================================
+// Phase 7 — Closed mutators (migration 0206).
+// ============================================================
+
+async function refreshClosureHistoryFor(projectId: string): Promise<void> {
+  try {
+    const supa = supabaseBrowser();
+    const { data } = await supa.from("closure_history").select(CLOSURE_HISTORY_COLUMNS).eq("project_id", projectId);
+    if (!data) return;
+    for (const id of Object.keys(db.CLOSURE_HISTORY)) {
+      if (db.CLOSURE_HISTORY[id]?.projectId === projectId) delete db.CLOSURE_HISTORY[id];
+    }
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const h = mapClosureHistoryRow(row);
+      db.CLOSURE_HISTORY[h.id] = h;
+    }
+  } catch { /* best-effort */ }
+}
+
+export type ClosureChecklistResult = { ok: true; item: ClosureChecklistItem } | { ok: false; error: string };
+
+/** Toggle a closure checklist item complete/incomplete. */
+export async function setClosureChecklistItem(id: string, isCompleted: boolean, userId: string | null): Promise<ClosureChecklistResult> {
+  if (!id) return { ok: false, error: "Item id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+  const { data, error } = await supa.from("closure_checklist")
+    .update({ is_completed: isCompleted, completed_by: isCompleted ? userId : null, last_action_by: userId })
+    .eq("id", id).select(CLOSURE_CHECKLIST_COLUMNS).single();
+  if (error || !data) return { ok: false, error: error?.message ?? "Couldn't update the checklist item." };
+  const item = mapClosureChecklistRow(data as unknown as Record<string, unknown>);
+  db.CLOSURE_CHECKLIST_ITEMS[item.id] = item;
+  await refreshClosureHistoryFor(item.projectId);
+  return { ok: true, item };
+}
+
+export type ClosureSummaryResult = { ok: true; summary: ClosureSummary } | { ok: false; error: string };
+
+export interface SaveClosureSummaryInput {
+  finalTotalCost?: number;
+  totalInvoiced?: number;
+  totalReceived?: number;
+  totalPaidOut?: number;
+  notes?: string | null;
+}
+
+/** Update the closure financial snapshot (upsert on project). */
+export async function saveClosureSummary(projectId: string, input: SaveClosureSummaryInput, userId: string | null): Promise<ClosureSummaryResult> {
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const supa = supabaseBrowser();
+
+  const num = (v: number | undefined) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const { data, error } = await supa.from("closure_summary").upsert({
+    project_id: projectId,
+    final_total_cost: num(input.finalTotalCost),
+    total_invoiced: num(input.totalInvoiced),
+    total_received: num(input.totalReceived),
+    total_paid_out: num(input.totalPaidOut),
+    notes: (input.notes ?? null)?.toString().trim() || null,
+    closed_by: userId,
+  }, { onConflict: "project_id" }).select(CLOSURE_SUMMARY_COLUMNS).single();
+  if (error || !data) return { ok: false, error: error?.message ?? "Couldn't save the closure summary." };
+  const summary = mapClosureSummaryRow(data as unknown as Record<string, unknown>);
+  db.CLOSURE_SUMMARY[summary.id] = summary;
+  await refreshClosureHistoryFor(projectId);
+  return { ok: true, summary };
+}
+
+/** Reopen a closed project — moves current_phase back to 'dlp' (admin/md). */
+export async function reopenProject(projectId: string, _userId: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  void _userId;
+  if (!projectId) return { ok: false, error: "Project id is required." };
+  const guard = ensureSupabase();
+  if (guard) return guard;
+  const { error } = await supabaseBrowser().from("projects").update({ current_phase: "dlp" }).eq("id", projectId);
+  if (error) return { ok: false, error: error.message };
+  const proj = db.PROJECTS[projectId];
+  if (proj) db.PROJECTS[projectId] = { ...proj, currentPhase: "dlp" };
+  return { ok: true };
 }
 
 export async function createMaterialRequest(input: MaterialRequestInput): Promise<MrResult> {

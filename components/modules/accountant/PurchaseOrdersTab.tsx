@@ -30,6 +30,7 @@ import { fetchAccountingSettings, SETTINGS_FALLBACK } from "@/lib/accounting/set
 import { fetchVendors, type Vendor } from "@/lib/accounting/vendors";
 import { poStatusBadge, RecordReceiptDialog } from "./poBits";
 import { RejectDialog } from "./invoiceBits";   // shared reject dialog
+import { ApprovalInbox, type ApprovalInboxItem } from "./ApprovalInbox";
 
 type StatusFilter = "all" | POStatus;
 
@@ -60,6 +61,17 @@ export function PurchaseOrdersTab({ canManage, canApprove }: { canManage: boolea
     [pos, filter],
   );
 
+  // POs awaiting this approver's action (only used when canApprove).
+  const pendingApproval = useMemo<ApprovalInboxItem[]>(
+    () => pos.filter(p => p.status === "pending_approval").map(p => ({
+      id: p.id, code: p.poNumber, party: vendorName(p.vendorId),
+      amount: p.total, waitingSince: p.updatedAt,
+    })),
+    // vendorName closes over `vendors`; recompute when either changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pos, vendors],
+  );
+
   if (selectedId) {
     return (
       <PODetailView id={selectedId} canManage={canManage} canApprove={canApprove} vendorName={vendorName}
@@ -85,6 +97,11 @@ export function PurchaseOrdersTab({ canManage, canApprove }: { canManage: boolea
 
   return (
     <>
+      {canApprove && (
+        <ApprovalInbox title="Awaiting your approval" items={pendingApproval}
+          storageKey="acct.approvalInbox.pos" onOpen={(id) => setSelectedId(id)} />
+      )}
+
       <div className="row between" style={{ alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <FilterBar<StatusFilter> value={filter} onChange={setFilter} options={tabs} />

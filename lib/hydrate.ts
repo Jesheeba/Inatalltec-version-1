@@ -15,12 +15,44 @@ import type {
   MaterialSubmittal, MaterialSubmittalRevision, MaterialSubmittalStatus, MaterialItem,
   ShopDrawing, ShopDrawingRevision, ShopDrawingStatus, ShopDrawingFile,
   ProjectJca, ProjectJcaHistory,
+  ProjectMaterial, ProjectMaterialHistory,
+  InstallationTask, InstallationTaskHistory, InstallationTaskPhoto,
+  SnaggingItem, SnaggingPhoto, ZoneAcceptance, AcceptanceCertificate, TcHistory,
+  HandoverDocument, HandoverChecklistItem, HandoverSignoff, HandoverHistory,
+  DlpTicket, DlpTicketPhoto, DlpHistory,
+  ClosureChecklistItem, ClosureSummary, ClosureHistory,
   Milestone, Project, ProjectPhase, Quotation, QuotationStatus, RepairTicket, ReplacementContext,
   ReplacementRequest, ReplacementDocument, ReplacementStatus, Site, SubContractor, Team, WorkOrder,
   WorkOrderSubContractor, WorkOrderSubContractorHours, WorkOrderTimeEntry, WoStatus, WoType, WoTask,
 } from "./types";
 import { formatShortDate } from "./dates";
 import { mapNotificationRow, NOTIFICATION_COLUMNS } from "./notifications";
+import {
+  PROJECT_MATERIAL_COLUMNS, PROJECT_MATERIAL_HISTORY_COLUMNS,
+  mapProjectMaterialRow, mapProjectMaterialHistoryRow,
+} from "./projects/materialSupply";
+import {
+  INSTALLATION_TASK_COLUMNS, INSTALLATION_TASK_HISTORY_COLUMNS, INSTALLATION_TASK_PHOTO_COLUMNS,
+  mapInstallationTaskRow, mapInstallationTaskHistoryRow, mapInstallationTaskPhotoRow,
+} from "./projects/installation";
+import {
+  SNAGGING_ITEM_COLUMNS, SNAGGING_PHOTO_COLUMNS, ZONE_ACCEPTANCE_COLUMNS,
+  ACCEPTANCE_CERTIFICATE_COLUMNS, TC_HISTORY_COLUMNS,
+  mapSnaggingItemRow, mapSnaggingPhotoRow, mapZoneAcceptanceRow,
+  mapAcceptanceCertificateRow, mapTcHistoryRow,
+} from "./projects/tc";
+import {
+  HANDOVER_DOCUMENT_COLUMNS, HANDOVER_CHECKLIST_COLUMNS, HANDOVER_SIGNOFF_COLUMNS, HANDOVER_HISTORY_COLUMNS,
+  mapHandoverDocumentRow, mapHandoverChecklistRow, mapHandoverSignoffRow, mapHandoverHistoryRow,
+} from "./projects/handover";
+import {
+  DLP_TICKET_COLUMNS, DLP_TICKET_PHOTO_COLUMNS, DLP_HISTORY_COLUMNS,
+  mapDlpTicketRow, mapDlpTicketPhotoRow, mapDlpHistoryRow,
+} from "./projects/dlp";
+import {
+  CLOSURE_CHECKLIST_COLUMNS, CLOSURE_SUMMARY_COLUMNS, CLOSURE_HISTORY_COLUMNS,
+  mapClosureChecklistRow, mapClosureSummaryRow, mapClosureHistoryRow,
+} from "./projects/closed";
 import type { Notification } from "./types";
 
 export interface HydrationBundle {
@@ -87,6 +119,37 @@ export interface HydrationBundle {
   // Migration 0043 — JCA. RLS restricts to admin/md/manager/accounts.
   projectJca: ProjectJca[];
   projectJcaHistory: ProjectJcaHistory[];
+  // Migration 0201 — Phase 2 Material Supply. Auto-seeded from the
+  // approved submittal at phase advance; updated by lead tech / accountant.
+  projectMaterials: ProjectMaterial[];
+  projectMaterialHistory: ProjectMaterialHistory[];
+  // Migration 0202 — Phase 3 Installation. Manually-built task checklist
+  // + append-only history + proof-of-install photos. RLS restricts to
+  // admin/md/manager/lead_worker/worker/sales.
+  installationTasks: InstallationTask[];
+  installationTaskHistory: InstallationTaskHistory[];
+  installationTaskPhotos: InstallationTaskPhoto[];
+  // Migration 0203 — Phase 4 Testing & Commissioning. RLS restricts to
+  // admin/md/manager/lead_worker/accounts/sales.
+  snaggingItems: SnaggingItem[];
+  snaggingPhotos: SnaggingPhoto[];
+  zoneAcceptances: ZoneAcceptance[];
+  acceptanceCertificates: AcceptanceCertificate[];
+  tcHistory: TcHistory[];
+  // Migration 0204 — Phase 5 Handover. RLS restricts to
+  // admin/md/manager/lead_worker/accounts/sales.
+  handoverDocuments: HandoverDocument[];
+  handoverChecklistItems: HandoverChecklistItem[];
+  handoverSignoffs: HandoverSignoff[];
+  handoverHistory: HandoverHistory[];
+  // Migration 0205 — Phase 6 DLP.
+  dlpTickets: DlpTicket[];
+  dlpTicketPhotos: DlpTicketPhoto[];
+  dlpHistory: DlpHistory[];
+  // Migration 0206 — Phase 7 Closed.
+  closureChecklistItems: ClosureChecklistItem[];
+  closureSummaries: ClosureSummary[];
+  closureHistory: ClosureHistory[];
 }
 
 type Row = Record<string, unknown>;
@@ -181,6 +244,8 @@ function mapProject(r: Row, milestones: Milestone[]): Project {
     // and rows created after but never advanced have NULL — both
     // hydrate as null and trigger the "Set Phase" UI.
     currentPhase: (r.current_phase as ProjectPhase | null) ?? null,
+    handoverCompletedAt: (r.handover_completed_at as string | null) ?? null,
+    dlpDurationMonths: asNumber(r.dlp_duration_months) || 12,
     progress: asNumber(r.progress),
     value: asNumber(r.value_aed),
     startedAt: asString(r.started_at),
@@ -668,6 +733,12 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     materialSubmittalsRaw, materialSubmittalRevisionsRaw, materialItemsRaw,
     shopDrawingsRaw, shopDrawingRevisionsRaw, shopDrawingFilesRaw,
     projectJcaRaw, projectJcaHistoryRaw,
+    projectMaterialsRaw, projectMaterialHistoryRaw,
+    installationTasksRaw, installationTaskHistoryRaw, installationTaskPhotosRaw,
+    snaggingItemsRaw, snaggingPhotosRaw, zoneAcceptancesRaw, acceptanceCertificatesRaw, tcHistoryRaw,
+    handoverDocumentsRaw, handoverChecklistItemsRaw, handoverSignoffsRaw, handoverHistoryRaw,
+    dlpTicketsRaw, dlpTicketPhotosRaw, dlpHistoryRaw,
+    closureChecklistItemsRaw, closureSummariesRaw, closureHistoryRaw,
   ] = await Promise.all([
     fetchAll(admin, "customers"),
     fetchAll(admin, "sites"),
@@ -701,6 +772,26 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     fetchAll(admin, "shop_drawing_files"),
     fetchAll(admin, "project_jca"),
     fetchAll(admin, "project_jca_history"),
+    fetchAll(admin, "project_materials", PROJECT_MATERIAL_COLUMNS),
+    fetchAll(admin, "project_material_history", PROJECT_MATERIAL_HISTORY_COLUMNS),
+    fetchAll(admin, "installation_tasks", INSTALLATION_TASK_COLUMNS),
+    fetchAll(admin, "installation_task_history", INSTALLATION_TASK_HISTORY_COLUMNS),
+    fetchAll(admin, "installation_task_photos", INSTALLATION_TASK_PHOTO_COLUMNS),
+    fetchAll(admin, "snagging_items", SNAGGING_ITEM_COLUMNS),
+    fetchAll(admin, "snagging_photos", SNAGGING_PHOTO_COLUMNS),
+    fetchAll(admin, "zone_acceptances", ZONE_ACCEPTANCE_COLUMNS),
+    fetchAll(admin, "acceptance_certificates", ACCEPTANCE_CERTIFICATE_COLUMNS),
+    fetchAll(admin, "tc_history", TC_HISTORY_COLUMNS),
+    fetchAll(admin, "handover_documents", HANDOVER_DOCUMENT_COLUMNS),
+    fetchAll(admin, "handover_checklist_items", HANDOVER_CHECKLIST_COLUMNS),
+    fetchAll(admin, "handover_signoff", HANDOVER_SIGNOFF_COLUMNS),
+    fetchAll(admin, "handover_history", HANDOVER_HISTORY_COLUMNS),
+    fetchAll(admin, "dlp_tickets", DLP_TICKET_COLUMNS),
+    fetchAll(admin, "dlp_ticket_photos", DLP_TICKET_PHOTO_COLUMNS),
+    fetchAll(admin, "dlp_history", DLP_HISTORY_COLUMNS),
+    fetchAll(admin, "closure_checklist", CLOSURE_CHECKLIST_COLUMNS),
+    fetchAll(admin, "closure_summary", CLOSURE_SUMMARY_COLUMNS),
+    fetchAll(admin, "closure_history", CLOSURE_HISTORY_COLUMNS),
   ]);
 
   // Group milestones by project_id.
@@ -779,5 +870,25 @@ export async function hydrateAll(admin: SupabaseClient): Promise<HydrationBundle
     shopDrawingFiles: shopDrawingFilesRaw.map(mapShopDrawingFile),
     projectJca: projectJcaRaw.map(mapProjectJca),
     projectJcaHistory: projectJcaHistoryRaw.map(mapProjectJcaHistory),
+    projectMaterials: projectMaterialsRaw.map(mapProjectMaterialRow),
+    projectMaterialHistory: projectMaterialHistoryRaw.map(mapProjectMaterialHistoryRow),
+    installationTasks: installationTasksRaw.map(mapInstallationTaskRow),
+    installationTaskHistory: installationTaskHistoryRaw.map(mapInstallationTaskHistoryRow),
+    installationTaskPhotos: installationTaskPhotosRaw.map(mapInstallationTaskPhotoRow),
+    snaggingItems: snaggingItemsRaw.map(mapSnaggingItemRow),
+    snaggingPhotos: snaggingPhotosRaw.map(mapSnaggingPhotoRow),
+    zoneAcceptances: zoneAcceptancesRaw.map(mapZoneAcceptanceRow),
+    acceptanceCertificates: acceptanceCertificatesRaw.map(mapAcceptanceCertificateRow),
+    tcHistory: tcHistoryRaw.map(mapTcHistoryRow),
+    handoverDocuments: handoverDocumentsRaw.map(mapHandoverDocumentRow),
+    handoverChecklistItems: handoverChecklistItemsRaw.map(mapHandoverChecklistRow),
+    handoverSignoffs: handoverSignoffsRaw.map(mapHandoverSignoffRow),
+    handoverHistory: handoverHistoryRaw.map(mapHandoverHistoryRow),
+    dlpTickets: dlpTicketsRaw.map(mapDlpTicketRow),
+    dlpTicketPhotos: dlpTicketPhotosRaw.map(mapDlpTicketPhotoRow),
+    dlpHistory: dlpHistoryRaw.map(mapDlpHistoryRow),
+    closureChecklistItems: closureChecklistItemsRaw.map(mapClosureChecklistRow),
+    closureSummaries: closureSummariesRaw.map(mapClosureSummaryRow),
+    closureHistory: closureHistoryRaw.map(mapClosureHistoryRow),
   };
 }

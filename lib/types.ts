@@ -175,6 +175,13 @@ export interface Project {
   // the migration — Operations Manager backfills via "Set Phase" UI.
   // New projects default to 'design' server-side.
   currentPhase: ProjectPhase | null;
+  // Formal handover moment (migration 0204). Set when a customer
+  // handover sign-off is recorded during the DLP phase; the DLP warranty
+  // period is counted from here. NULL until handover is signed off.
+  handoverCompletedAt: string | null;
+  // DLP (Defects Liability Period) length in months (migration 0205).
+  // The DLP window runs handoverCompletedAt → +dlpDurationMonths.
+  dlpDurationMonths: number;
   progress: number;
   value: number;
   startedAt: string;
@@ -696,6 +703,364 @@ export interface ProjectJcaHistory {
   note: string | null;
   editedBy: string | null;
   editedAt: string;
+}
+
+// Phase 2 — Material Supply (migration 0201). One row per material per
+// project, auto-seeded from the approved material submittal revision when
+// the project advances from Design → Material Supply. Snapshot of the
+// planned scope at seed time; status workflow tracks procurement +
+// delivery progress; optional FK to po_line_items connects to the
+// Accountant module's PO row when known.
+export type ProjectMaterialStatus =
+  | "not_ordered"
+  | "ordered"
+  | "received_at_warehouse"
+  | "delivered_to_site"
+  | "cancelled"
+  | "issue";
+
+export interface ProjectMaterial {
+  id: string;
+  projectId: string;
+  // Source row in material_items (the approved BOM line). NULL when
+  // added mid-phase (not part of the original approved scope).
+  sourceMaterialItemId: string | null;
+  // Snapshot at seed time.
+  description: string;
+  modelNumber: string | null;
+  quantityPlanned: number;
+  // Status workflow.
+  status: ProjectMaterialStatus;
+  // Procurement linkage to the Accountant module's PO line. NULL until
+  // matched by lead tech / accountant in MS-B UI.
+  poLineItemId: string | null;
+  // Delivery progress (running totals).
+  quantityReceivedWarehouse: number;
+  quantityDeliveredSite: number;
+  notes: string | null;
+  lastActionBy: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectMaterialHistory {
+  id: string;
+  materialId: string;
+  // 'created' | <status enum value> | 'qty_warehouse' | 'qty_site'
+  action: string;
+  detail: string | null;
+  fromStatus: ProjectMaterialStatus | null;
+  toStatus: ProjectMaterialStatus | null;
+  // Positive for received/delivered increases; NULL for status-only events.
+  qtyDelta: number | null;
+  changedBy: string | null;
+  changedAt: string;
+}
+
+// Phase 3 — Installation (migration 0202). One row per discrete on-site
+// activity (mount a camera, terminate a rack, configure an NVR), MANUALLY
+// built by the lead tech and grouped by site zone. Progress % is derived
+// in the data layer (lib/projects/installation.ts), never stored. Defects
+// during installation = a task set to 'blocked' + a note; snagging and
+// customer sign-off belong to the T&C phase. Photos (proof-of-install)
+// live in a sibling table backed by the private project-install-photos
+// storage bucket.
+export type InstallationTaskStatus =
+  | "pending"
+  | "in_progress"
+  | "blocked"
+  | "completed"
+  | "not_applicable";
+
+export type InstallationTaskCategory =
+  | "cabling"
+  | "device_mounting"
+  | "termination"
+  | "configuration"
+  | "testing"
+  | "other";
+
+export interface InstallationTask {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string | null;
+  // Free-text site grouping ("Ground Floor", "Parking B1").
+  zone: string | null;
+  category: InstallationTaskCategory;
+  status: InstallationTaskStatus;
+  // The technician responsible; null until assigned.
+  assignedTo: string | null;
+  // Provenance to the Phase 2 delivered material this task installs;
+  // null for cabling / configuration / ad-hoc tasks.
+  sourceMaterialId: string | null;
+  sortOrder: number;
+  // Auto-stamped by the DB when status enters 'completed', cleared when
+  // it leaves. Not caller-managed.
+  completedAt: string | null;
+  completedBy: string | null;
+  notes: string | null;
+  lastActionBy: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InstallationTaskHistory {
+  id: string;
+  taskId: string;
+  // 'created' | <status enum value> | 'assigned' | 'photo_added'
+  action: string;
+  detail: string | null;
+  fromStatus: InstallationTaskStatus | null;
+  toStatus: InstallationTaskStatus | null;
+  changedBy: string | null;
+  changedAt: string;
+}
+
+export interface InstallationTaskPhoto {
+  id: string;
+  taskId: string;
+  // Path within the private 'project-install-photos' bucket.
+  storagePath: string;
+  caption: string | null;
+  uploadedBy: string | null;
+  uploadedAt: string;
+}
+
+// Phase 4 — Testing & Commissioning (migration 0203). Customer walks the
+// completed work, signs off per zone, and walkthrough defects are tracked
+// as a snagging list. A final Acceptance Certificate (auto-numbered
+// AC-YYYY-NNNN) is produced once every installation zone is signed and no
+// snag is still open/in-progress. tc_history is the append-only audit
+// across snagging, zone acceptances, and certificates.
+export type SnaggingStatus = "open" | "in_progress" | "fixed" | "verified";
+export type SnaggingSeverity = "low" | "medium" | "high" | "critical";
+
+export interface SnaggingItem {
+  id: string;
+  projectId: string;
+  zone: string | null;
+  description: string;
+  severity: SnaggingSeverity;
+  status: SnaggingStatus;
+  // Worker who fixes; null until assigned.
+  assignedTo: string | null;
+  reportedBy: string | null;
+  // Auto-stamped by the DB when status enters fixed/verified.
+  completedBy: string | null;
+  completedAt: string | null;
+  notes: string | null;
+  lastActionBy: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SnaggingPhoto {
+  id: string;
+  snaggingItemId: string;
+  // Path within the private 'project-snagging-photos' bucket.
+  storagePath: string;
+  caption: string | null;
+  uploadedBy: string | null;
+  uploadedAt: string;
+}
+
+export interface ZoneAcceptance {
+  id: string;
+  projectId: string;
+  zone: string;
+  customerName: string;
+  customerEmail: string | null;
+  notes: string | null;
+  // Typed sign-off (no digital signature in this slice).
+  signedAt: string;
+  // Staff member who recorded the customer's sign-off.
+  signedByUserId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AcceptanceCertificate {
+  id: string;
+  projectId: string;
+  // AC-YYYY-NNNN, assigned by trigger.
+  certificateNumber: string | null;
+  issuedTo: string | null;
+  scopeSummary: string | null;
+  generatedBy: string | null;
+  generatedAt: string;
+  createdAt: string;
+}
+
+export interface TcHistory {
+  id: string;
+  projectId: string;
+  // 'snagging' | 'zone' | 'certificate'
+  entityKind: string;
+  entityId: string | null;
+  // 'created' | <snag status> | 'assigned' | 'photo_added' |
+  // 'zone_signed' | 'zone_resigned' | 'certificate_generated'
+  action: string;
+  detail: string | null;
+  fromStatus: SnaggingStatus | null;
+  toStatus: SnaggingStatus | null;
+  changedBy: string | null;
+  changedAt: string;
+}
+
+// Phase 5 — Handover (migration 0204). Formal delivery of deliverables
+// to the client during the DLP phase: documents by category, a
+// mandatory checklist (auto-seeded on entry to DLP), and a one-time
+// customer sign-off that stamps projects.handoverCompletedAt. Option B:
+// handover is a sub-state of the dlp phase, not its own phase value.
+export type HandoverDocCategory = "drawings" | "manuals" | "certificates" | "warranty" | "other";
+
+export interface HandoverDocument {
+  id: string;
+  projectId: string;
+  category: HandoverDocCategory;
+  // Path within the private 'project-handover-docs' bucket.
+  filePath: string;
+  fileName: string;
+  fileSize: number | null;
+  mimeType: string | null;
+  description: string | null;
+  isRequired: boolean;
+  uploadedBy: string | null;
+  uploadedAt: string;
+  createdAt: string;
+}
+
+export interface HandoverChecklistItem {
+  id: string;
+  projectId: string;
+  category: HandoverDocCategory | null;
+  itemDescription: string;
+  isRequired: boolean;
+  isCompleted: boolean;
+  completedAt: string | null;
+  completedBy: string | null;
+  sortOrder: number;
+  lastActionBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HandoverSignoff {
+  id: string;
+  projectId: string;
+  customerName: string;
+  customerEmail: string | null;
+  notes: string | null;
+  // 'typed' | 'digital' (digital is a future enhancement)
+  signatureMethod: string;
+  signedAt: string;
+  signedByUserId: string | null;
+  createdAt: string;
+}
+
+export interface HandoverHistory {
+  id: string;
+  projectId: string;
+  // 'document' | 'checklist' | 'signoff'
+  entityKind: string;
+  entityId: string | null;
+  // 'document_uploaded' | 'created' | 'completed' | 'reopened' | 'handover_signed'
+  action: string;
+  detail: string | null;
+  changedBy: string | null;
+  changedAt: string;
+}
+
+// Phase 6 — DLP / Defects Liability Period (migration 0205). The warranty
+// window after handover; clients report warranty defects as dlp_tickets.
+// The window runs projects.handoverCompletedAt → +dlpDurationMonths.
+export type DlpTicketStatus = "open" | "in_progress" | "fixed" | "verified" | "closed";
+
+export interface DlpTicket {
+  id: string;
+  projectId: string;
+  description: string;
+  severity: SnaggingSeverity;
+  status: DlpTicketStatus;
+  assignedTo: string | null;
+  reportedBy: string | null;
+  reportedAt: string;
+  resolutionNotes: string | null;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  lastActionBy: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DlpTicketPhoto {
+  id: string;
+  ticketId: string;
+  // Path within the private 'project-dlp-photos' bucket.
+  storagePath: string;
+  caption: string | null;
+  uploadedBy: string | null;
+  uploadedAt: string;
+}
+
+export interface DlpHistory {
+  id: string;
+  projectId: string;
+  ticketId: string | null;
+  action: string;
+  detail: string | null;
+  fromStatus: DlpTicketStatus | null;
+  toStatus: DlpTicketStatus | null;
+  changedBy: string | null;
+  changedAt: string;
+}
+
+// Phase 7 — Closed (migration 0206). Terminal phase: a close-out
+// checklist (auto-seeded), a financial closure snapshot, and an audit
+// trail. Admin/MD can reopen (moves the phase back to 'dlp').
+export interface ClosureChecklistItem {
+  id: string;
+  projectId: string;
+  item: string;
+  isCompleted: boolean;
+  completedAt: string | null;
+  completedBy: string | null;
+  sortOrder: number;
+  lastActionBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClosureSummary {
+  id: string;
+  projectId: string;
+  finalTotalCost: number;
+  totalInvoiced: number;
+  totalReceived: number;
+  totalPaidOut: number;
+  notes: string | null;
+  closedBy: string | null;
+  closedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClosureHistory {
+  id: string;
+  projectId: string;
+  // 'checklist' | 'summary' | 'project'
+  entityKind: string;
+  entityId: string | null;
+  // 'created' | 'completed' | 'reopened' | 'closed' | 'summary_updated'
+  action: string;
+  detail: string | null;
+  changedBy: string | null;
+  changedAt: string;
 }
 
 // Material Requests — on-site material/parts procurement flow

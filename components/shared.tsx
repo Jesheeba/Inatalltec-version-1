@@ -595,9 +595,10 @@ export function Modal({ open, onClose, children, lg }:
 export function FilterBar<T extends string>({ value, onChange, options }:
   { value: T; onChange: (v: T) => void; options: { value: T; label: string; count?: number }[] }) {
   return (
-    <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
+    <div style={{ display: "flex", gap: 8, overflowX: "auto", WebkitOverflowScrolling: "touch", paddingBottom: 4 }}>
       {options.map(opt => (
-        <button key={opt.value} className="chip" data-on={String(value === opt.value)} onClick={() => onChange(opt.value)}>
+        <button key={opt.value} className="chip" data-on={String(value === opt.value)} onClick={() => onChange(opt.value)}
+          style={{ flex: "0 0 auto", whiteSpace: "nowrap" }}>
           {opt.label}
           {opt.count != null && (
             <span style={{ color: value === opt.value ? "rgba(255,255,255,0.7)" : "var(--ink-quiet)" }}>· {opt.count}</span>

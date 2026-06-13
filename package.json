@@ -9,7 +9,10 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "db:reset": "supabase db reset",
-    "db:diff": "supabase db diff -f"
+    "db:diff": "supabase db diff -f",
+    "screenshots:lifecycle": "playwright test scripts/screenshots/lifecycle.spec.ts --headed",
+    "screenshots:accountant": "playwright test scripts/screenshots/accountant.spec.ts --headed",
+    "screenshots:mobile": "playwright test scripts/screenshots/ --project=mobile"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
@@ -19,6 +22,7 @@
     "react-dom": "18.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@types/node": "^20.16.10",
     "@types/react": "18.3.11",
     "@types/react-dom": "18.3.0",

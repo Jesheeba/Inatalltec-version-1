@@ -14,6 +14,12 @@ import type {
   MaterialSubmittal, MaterialSubmittalRevision, MaterialItem,
   ShopDrawing, ShopDrawingRevision, ShopDrawingFile,
   ProjectJca, ProjectJcaHistory,
+  ProjectMaterial, ProjectMaterialHistory,
+  InstallationTask, InstallationTaskHistory, InstallationTaskPhoto,
+  SnaggingItem, SnaggingPhoto, ZoneAcceptance, AcceptanceCertificate, TcHistory,
+  HandoverDocument, HandoverChecklistItem, HandoverSignoff, HandoverHistory,
+  DlpTicket, DlpTicketPhoto, DlpHistory,
+  ClosureChecklistItem, ClosureSummary, ClosureHistory,
   ReplacementRequest, ReplacementDocument, Risk, Role,
   Site, SubContractor, Team, User, WorkOrder, WorkOrderSubContractor,
   WorkOrderSubContractorHours, WorkOrderTimeEntry, WoTask,
@@ -214,6 +220,40 @@ export const SHOP_DRAWING_FILES: Record<string, ShopDrawingFile> = {};
 // per project + an append-only edit-history audit trail.
 export const PROJECT_JCA: Record<string, ProjectJca> = {};
 export const PROJECT_JCA_HISTORY: Record<string, ProjectJcaHistory> = {};
+// Migration 0201 — Phase 2 Material Supply: one row per material per
+// project (auto-seeded from the approved submittal at phase advance)
+// + append-only audit history.
+export const PROJECT_MATERIALS: Record<string, ProjectMaterial> = {};
+export const PROJECT_MATERIAL_HISTORY: Record<string, ProjectMaterialHistory> = {};
+// Migration 0202 — Phase 3 Installation: manually-built checklist of
+// located tasks per project + append-only audit history + proof-of-
+// install photos (binaries in the 'project-install-photos' bucket).
+export const INSTALLATION_TASKS: Record<string, InstallationTask> = {};
+export const INSTALLATION_TASK_HISTORY: Record<string, InstallationTaskHistory> = {};
+export const INSTALLATION_TASK_PHOTOS: Record<string, InstallationTaskPhoto> = {};
+// Migration 0203 — Phase 4 Testing & Commissioning: per-zone customer
+// sign-offs, a walkthrough snagging list (+ photos), final acceptance
+// certificates, and an append-only audit feed across all three.
+export const SNAGGING_ITEMS: Record<string, SnaggingItem> = {};
+export const SNAGGING_PHOTOS: Record<string, SnaggingPhoto> = {};
+export const ZONE_ACCEPTANCES: Record<string, ZoneAcceptance> = {};
+export const ACCEPTANCE_CERTIFICATES: Record<string, AcceptanceCertificate> = {};
+export const TC_HISTORY: Record<string, TcHistory> = {};
+// Migration 0204 — Phase 5 Handover: deliverable documents by category,
+// a mandatory checklist (auto-seeded on entry to DLP), a one-time
+// customer sign-off, and an append-only audit feed.
+export const HANDOVER_DOCUMENTS: Record<string, HandoverDocument> = {};
+export const HANDOVER_CHECKLIST_ITEMS: Record<string, HandoverChecklistItem> = {};
+export const HANDOVER_SIGNOFF: Record<string, HandoverSignoff> = {};
+export const HANDOVER_HISTORY: Record<string, HandoverHistory> = {};
+// Migration 0205 — Phase 6 DLP: warranty tickets + photos + audit.
+export const DLP_TICKETS: Record<string, DlpTicket> = {};
+export const DLP_TICKET_PHOTOS: Record<string, DlpTicketPhoto> = {};
+export const DLP_HISTORY: Record<string, DlpHistory> = {};
+// Migration 0206 — Phase 7 Closed: close-out checklist + summary + audit.
+export const CLOSURE_CHECKLIST_ITEMS: Record<string, ClosureChecklistItem> = {};
+export const CLOSURE_SUMMARY: Record<string, ClosureSummary> = {};
+export const CLOSURE_HISTORY: Record<string, ClosureHistory> = {};
 export const FEED: FeedItem[] = [];
 export const NOTIFICATIONS: Notification[] = [];
 export const RISKS: Risk[] = [];
@@ -250,6 +290,12 @@ export const db = {
   MATERIAL_SUBMITTALS, MATERIAL_SUBMITTAL_REVISIONS, MATERIAL_ITEMS,
   SHOP_DRAWINGS, SHOP_DRAWING_REVISIONS, SHOP_DRAWING_FILES,
   PROJECT_JCA, PROJECT_JCA_HISTORY,
+  PROJECT_MATERIALS, PROJECT_MATERIAL_HISTORY,
+  INSTALLATION_TASKS, INSTALLATION_TASK_HISTORY, INSTALLATION_TASK_PHOTOS,
+  SNAGGING_ITEMS, SNAGGING_PHOTOS, ZONE_ACCEPTANCES, ACCEPTANCE_CERTIFICATES, TC_HISTORY,
+  HANDOVER_DOCUMENTS, HANDOVER_CHECKLIST_ITEMS, HANDOVER_SIGNOFF, HANDOVER_HISTORY,
+  DLP_TICKETS, DLP_TICKET_PHOTOS, DLP_HISTORY,
+  CLOSURE_CHECKLIST_ITEMS, CLOSURE_SUMMARY, CLOSURE_HISTORY,
   FEED, NOTIFICATIONS, RISKS, COMMS, INVENTORY, ASSETS,
   KPI_OPS,
   org: (id?: string | null): Organization | null => (id && ORGANIZATIONS[id]) || null,
@@ -392,6 +438,124 @@ export const db = {
     Object.values(PROJECT_JCA_HISTORY)
       .filter(h => h.jcaId === jcaId)
       .sort((a, b) => a.editedAt.localeCompare(b.editedAt)),
+
+  // Migration 0201 — Phase 2 Material Supply selectors.
+  // Materials for a project, sorted by description for stable rendering
+  // (the seed trigger doesn't preserve material_items.sort_order — we
+  // could add that later if a UI sort key is needed).
+  materialsForProject: (projectId: string): ProjectMaterial[] =>
+    Object.values(PROJECT_MATERIALS)
+      .filter(m => m.projectId === projectId)
+      .sort((a, b) => a.description.localeCompare(b.description)),
+  // History for one material item, oldest first (timeline order).
+  materialHistoryForMaterial: (materialId: string): ProjectMaterialHistory[] =>
+    Object.values(PROJECT_MATERIAL_HISTORY)
+      .filter(h => h.materialId === materialId)
+      .sort((a, b) => a.changedAt.localeCompare(b.changedAt)),
+
+  // Migration 0202 — Phase 3 Installation selectors.
+  // Tasks for a project, ordered by sort_order then creation (stable
+  // grouping in the zone-grouped checklist UI).
+  tasksForProject: (projectId: string): InstallationTask[] =>
+    Object.values(INSTALLATION_TASKS)
+      .filter(t => t.projectId === projectId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
+  // History for one task, oldest first (timeline order).
+  installationHistoryForTask: (taskId: string): InstallationTaskHistory[] =>
+    Object.values(INSTALLATION_TASK_HISTORY)
+      .filter(h => h.taskId === taskId)
+      .sort((a, b) => a.changedAt.localeCompare(b.changedAt)),
+  // Photos for one task, newest first.
+  photosForTask: (taskId: string): InstallationTaskPhoto[] =>
+    Object.values(INSTALLATION_TASK_PHOTOS)
+      .filter(p => p.taskId === taskId)
+      .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
+
+  // Migration 0203 — Phase 4 Testing & Commissioning selectors.
+  // Snags for a project: most severe first, then newest.
+  snaggingForProject: (projectId: string): SnaggingItem[] => {
+    const sev: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+    return Object.values(SNAGGING_ITEMS)
+      .filter(s => s.projectId === projectId)
+      .sort((a, b) =>
+        (sev[a.severity] ?? 9) - (sev[b.severity] ?? 9) ||
+        b.createdAt.localeCompare(a.createdAt));
+  },
+  // Photos for one snag, newest first.
+  snaggingPhotosForItem: (itemId: string): SnaggingPhoto[] =>
+    Object.values(SNAGGING_PHOTOS)
+      .filter(p => p.snaggingItemId === itemId)
+      .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
+  // Zone acceptances for a project, by zone name.
+  zoneAcceptancesForProject: (projectId: string): ZoneAcceptance[] =>
+    Object.values(ZONE_ACCEPTANCES)
+      .filter(z => z.projectId === projectId)
+      .sort((a, b) => a.zone.localeCompare(b.zone)),
+  // One zone's acceptance, if signed (case-insensitive match).
+  zoneAcceptance: (projectId: string, zone: string): ZoneAcceptance | null => {
+    const key = zone.trim().toLowerCase();
+    return Object.values(ZONE_ACCEPTANCES)
+      .find(z => z.projectId === projectId && z.zone.trim().toLowerCase() === key) ?? null;
+  },
+  // Acceptance certificates for a project, newest first.
+  certificatesForProject: (projectId: string): AcceptanceCertificate[] =>
+    Object.values(ACCEPTANCE_CERTIFICATES)
+      .filter(c => c.projectId === projectId)
+      .sort((a, b) => b.generatedAt.localeCompare(a.generatedAt)),
+  // T&C audit feed for a project, newest first.
+  tcHistoryForProject: (projectId: string): TcHistory[] =>
+    Object.values(TC_HISTORY)
+      .filter(h => h.projectId === projectId)
+      .sort((a, b) => b.changedAt.localeCompare(a.changedAt)),
+
+  // Migration 0204 — Phase 5 Handover selectors.
+  // Documents for a project, by category then newest first.
+  handoverDocsForProject: (projectId: string): HandoverDocument[] =>
+    Object.values(HANDOVER_DOCUMENTS)
+      .filter(d => d.projectId === projectId)
+      .sort((a, b) => a.category.localeCompare(b.category) || b.uploadedAt.localeCompare(a.uploadedAt)),
+  // Checklist items for a project, in template order.
+  handoverChecklistForProject: (projectId: string): HandoverChecklistItem[] =>
+    Object.values(HANDOVER_CHECKLIST_ITEMS)
+      .filter(c => c.projectId === projectId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
+  // The single handover sign-off for a project, if recorded.
+  handoverSignoffForProject: (projectId: string): HandoverSignoff | null =>
+    Object.values(HANDOVER_SIGNOFF).find(s => s.projectId === projectId) ?? null,
+  // Handover audit feed for a project, newest first.
+  handoverHistoryForProject: (projectId: string): HandoverHistory[] =>
+    Object.values(HANDOVER_HISTORY)
+      .filter(h => h.projectId === projectId)
+      .sort((a, b) => b.changedAt.localeCompare(a.changedAt)),
+
+  // Migration 0205 — Phase 6 DLP selectors.
+  // Tickets for a project: most severe first, then newest.
+  dlpTicketsForProject: (projectId: string): DlpTicket[] => {
+    const sev: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+    return Object.values(DLP_TICKETS)
+      .filter(t => t.projectId === projectId)
+      .sort((a, b) => (sev[a.severity] ?? 9) - (sev[b.severity] ?? 9) || b.reportedAt.localeCompare(a.reportedAt));
+  },
+  dlpPhotosForTicket: (ticketId: string): DlpTicketPhoto[] =>
+    Object.values(DLP_TICKET_PHOTOS)
+      .filter(p => p.ticketId === ticketId)
+      .sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt)),
+  dlpHistoryForProject: (projectId: string): DlpHistory[] =>
+    Object.values(DLP_HISTORY)
+      .filter(h => h.projectId === projectId)
+      .sort((a, b) => b.changedAt.localeCompare(a.changedAt)),
+
+  // Migration 0206 — Phase 7 Closed selectors.
+  closureChecklistForProject: (projectId: string): ClosureChecklistItem[] =>
+    Object.values(CLOSURE_CHECKLIST_ITEMS)
+      .filter(c => c.projectId === projectId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)),
+  closureSummaryForProject: (projectId: string): ClosureSummary | null =>
+    Object.values(CLOSURE_SUMMARY).find(s => s.projectId === projectId) ?? null,
+  closureHistoryForProject: (projectId: string): ClosureHistory[] =>
+    Object.values(CLOSURE_HISTORY)
+      .filter(h => h.projectId === projectId)
+      .sort((a, b) => b.changedAt.localeCompare(a.changedAt)),
 
   // Slice D — Design-phase readiness check.
   //

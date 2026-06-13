@@ -24,6 +24,7 @@ import {
 } from "@/lib/accounting/invoices";
 import { fetchAccountingSettings } from "@/lib/accounting/settings";
 import { invoiceStatusBadge, RecordPaymentDialog, RejectDialog } from "./invoiceBits";
+import { ApprovalInbox, type ApprovalInboxItem } from "./ApprovalInbox";
 
 type StatusFilter = "all" | InvoiceStatus;
 
@@ -50,6 +51,15 @@ export function InvoicesTab({ canManage, canApprove }: { canManage: boolean; can
     [invoices, filter],
   );
 
+  // Items awaiting this approver's action (only used when canApprove).
+  const pendingApproval = useMemo<ApprovalInboxItem[]>(
+    () => invoices.filter(i => i.status === "pending_approval").map(i => ({
+      id: i.id, code: i.invoiceNumber, party: db.cust(i.customerId)?.name ?? "—",
+      amount: i.total, waitingSince: i.updatedAt,
+    })),
+    [invoices],
+  );
+
   if (selectedId) {
     return (
       <InvoiceDetail id={selectedId} canManage={canManage} canApprove={canApprove}
@@ -72,6 +82,11 @@ export function InvoicesTab({ canManage, canApprove }: { canManage: boolean; can
 
   return (
     <>
+      {canApprove && (
+        <ApprovalInbox title="Awaiting your approval" items={pendingApproval}
+          storageKey="acct.approvalInbox.invoices" onOpen={(id) => setSelectedId(id)} />
+      )}
+
       <div className="row between" style={{ alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <FilterBar<StatusFilter> value={filter} onChange={setFilter} options={tabs} />

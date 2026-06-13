@@ -210,6 +210,26 @@ export function AppProvider({
       for (const f of initialBundle.shopDrawingFiles) db.SHOP_DRAWING_FILES[f.id] = f;
       for (const j of initialBundle.projectJca) db.PROJECT_JCA[j.id] = j;
       for (const h of initialBundle.projectJcaHistory) db.PROJECT_JCA_HISTORY[h.id] = h;
+      for (const m of initialBundle.projectMaterials) db.PROJECT_MATERIALS[m.id] = m;
+      for (const h of initialBundle.projectMaterialHistory) db.PROJECT_MATERIAL_HISTORY[h.id] = h;
+      for (const t of initialBundle.installationTasks) db.INSTALLATION_TASKS[t.id] = t;
+      for (const h of initialBundle.installationTaskHistory) db.INSTALLATION_TASK_HISTORY[h.id] = h;
+      for (const p of initialBundle.installationTaskPhotos) db.INSTALLATION_TASK_PHOTOS[p.id] = p;
+      for (const s of initialBundle.snaggingItems) db.SNAGGING_ITEMS[s.id] = s;
+      for (const p of initialBundle.snaggingPhotos) db.SNAGGING_PHOTOS[p.id] = p;
+      for (const z of initialBundle.zoneAcceptances) db.ZONE_ACCEPTANCES[z.id] = z;
+      for (const c of initialBundle.acceptanceCertificates) db.ACCEPTANCE_CERTIFICATES[c.id] = c;
+      for (const h of initialBundle.tcHistory) db.TC_HISTORY[h.id] = h;
+      for (const d of initialBundle.handoverDocuments) db.HANDOVER_DOCUMENTS[d.id] = d;
+      for (const c of initialBundle.handoverChecklistItems) db.HANDOVER_CHECKLIST_ITEMS[c.id] = c;
+      for (const s of initialBundle.handoverSignoffs) db.HANDOVER_SIGNOFF[s.id] = s;
+      for (const h of initialBundle.handoverHistory) db.HANDOVER_HISTORY[h.id] = h;
+      for (const t of initialBundle.dlpTickets) db.DLP_TICKETS[t.id] = t;
+      for (const p of initialBundle.dlpTicketPhotos) db.DLP_TICKET_PHOTOS[p.id] = p;
+      for (const h of initialBundle.dlpHistory) db.DLP_HISTORY[h.id] = h;
+      for (const c of initialBundle.closureChecklistItems) db.CLOSURE_CHECKLIST_ITEMS[c.id] = c;
+      for (const s of initialBundle.closureSummaries) db.CLOSURE_SUMMARY[s.id] = s;
+      for (const h of initialBundle.closureHistory) db.CLOSURE_HISTORY[h.id] = h;
     }
     return true;
   });
@@ -434,29 +454,100 @@ export function AppProvider({
   //
   // Channel name keys on me.id so account switches tear down + recreate
   // cleanly. The cleanup runs on unmount and on me.id change.
+  //
+  // JWT-BEFORE-SUBSCRIBE: we explicitly await the session and call
+  // realtime.setAuth(access_token) BEFORE joining the channel. Without
+  // this, the channel can join anonymously (status reports SUBSCRIBED
+  // but auth.uid() is NULL server-side) and every RLS check silently
+  // denies every event. This was the Slice N1 failure mode confirmed by
+  // the earlier diagnostic logs. The singleton client in supabase/client.ts
+  // is the second half of the same fix — both together make sure the
+  // realtime socket is JWT-authenticated by the time the channel joins.
+  //
+  // DIAGNOSTIC LOGS retained: the `[notif-realtime]` console lines proved
+  // invaluable in tracing the failure path. They're cheap and only fire
+  // once per mount; leaving them in place keeps future regressions easy
+  // to diagnose. Trim if console noise becomes a concern.
   useEffect(() => {
-    if (!hasRealAuth || !me.id) return;
+    if (!hasRealAuth || !me.id) {
+      console.log("[notif-realtime] skipped (hasRealAuth=%s, me.id=%s)", hasRealAuth, me.id);
+      return;
+    }
+    const channelName = `notif-${me.id}`;
+    console.log("[notif-realtime] mounting effect — user=%s, channel=%s", me.id, channelName);
     const supabase = supabaseBrowser();
-    const channel = supabase
-      .channel(`notif-${me.id}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
-        (payload: { new: Record<string, unknown> }) => {
-          const mapped = mapNotificationRow(payload.new);
-          setNotifications(ns => (ns.some(n => n.id === mapped.id) ? ns : [mapped, ...ns]));
-        },
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
-        (payload: { new: Record<string, unknown> }) => {
-          const mapped = mapNotificationRow(payload.new);
-          setNotifications(ns => ns.map(n => (n.id === mapped.id ? mapped : n)));
-        },
-      )
-      .subscribe();
-    return () => { void supabase.removeChannel(channel); };
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      // 1) Pull the session and hand the JWT to the realtime subclient
+      //    BEFORE the channel join. The realtime socket's accessToken is
+      //    what the server uses to evaluate auth.uid() for RLS.
+      const { data, error } = await supabase.auth.getSession();
+      if (error) {
+        console.warn("[notif-realtime] auth.getSession error", error);
+      } else {
+        console.log(
+          "[notif-realtime] auth.getSession — has session? %s, user id from JWT = %s",
+          !!data.session,
+          data.session?.user?.id ?? "<none>",
+        );
+        if (data.session?.access_token) {
+          supabase.realtime.setAuth(data.session.access_token);
+          console.log("[notif-realtime] realtime.setAuth applied");
+        }
+      }
+
+      // 2) Cleanup may have fired while we awaited (StrictMode double-mount,
+      //    or me.id changed mid-flight). Bail before opening a leaked channel.
+      if (cancelled) {
+        console.log("[notif-realtime] cancelled before channel join");
+        return;
+      }
+
+      // 3) Now safe to join — the realtime socket is JWT-authenticated.
+      channel = supabase
+        .channel(channelName)
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
+          (payload: { new: Record<string, unknown> }) => {
+            console.log("[notif-realtime] INSERT received", payload.new);
+            const mapped = mapNotificationRow(payload.new);
+            setNotifications(ns => (ns.some(n => n.id === mapped.id) ? ns : [mapped, ...ns]));
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "notifications", filter: `user_id=eq.${me.id}` },
+          (payload: { new: Record<string, unknown> }) => {
+            console.log("[notif-realtime] UPDATE received", payload.new);
+            const mapped = mapNotificationRow(payload.new);
+            setNotifications(ns => ns.map(n => (n.id === mapped.id ? mapped : n)));
+          },
+        )
+        .subscribe((status, err) => {
+          // Status values per supabase-js: SUBSCRIBED, CHANNEL_ERROR, TIMED_OUT, CLOSED.
+          if (err) {
+            console.warn("[notif-realtime] subscribe status=%s err=", status, err);
+          } else {
+            console.log("[notif-realtime] subscribe status=%s", status);
+          }
+        });
+
+      // 4) Edge case — cleanup ran during the synchronous subscribe call.
+      //    Tear down the channel we just opened.
+      if (cancelled && channel) {
+        void supabase.removeChannel(channel);
+        channel = null;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      console.log("[notif-realtime] cleanup — removing channel %s", channelName);
+      if (channel) void supabase.removeChannel(channel);
+    };
   }, [hasRealAuth, me.id]);
 
   // v1.2 — Surface every pending-confirmation item as a live notification.

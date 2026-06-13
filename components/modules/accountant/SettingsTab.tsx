@@ -16,9 +16,9 @@ import { useApp } from "@/lib/app-context";
 import { CardHead, EmptyState } from "../../shared";
 import {
   fetchAccountingSettings, updateAccountingSettings,
-  fetchPaymentMethods, createLookup, updateLookup,
+  fetchPaymentMethods, fetchExpenseCategories, createLookup, updateLookup,
   type AccountingSettings, type AccountingLookup, type AccountingSettingsPatch,
-  LOOKUP_PAYMENT_METHOD,
+  LOOKUP_PAYMENT_METHOD, LOOKUP_EXPENSE_CATEGORY,
 } from "@/lib/accounting/settings";
 
 type Form = {
@@ -26,6 +26,7 @@ type Form = {
   taxLabel: string;
   invoicePrefix: string;
   poPrefix: string;
+  billPrefix: string;
   invoiceDueDays: string;
   agingBucket1Days: string;
   agingBucket2Days: string;
@@ -33,6 +34,10 @@ type Form = {
   poApprovalThreshold1: string;
   poApprovalThreshold2: string;
   poApprovalThreshold3: string;
+  wpsEstablishmentId: string;
+  wpsAgentId: string;
+  wpsBankName: string;
+  expenseApprovalThreshold: string;
 };
 
 function toForm(s: AccountingSettings): Form {
@@ -41,6 +46,7 @@ function toForm(s: AccountingSettings): Form {
     taxLabel: s.taxLabel,
     invoicePrefix: s.invoicePrefix,
     poPrefix: s.poPrefix,
+    billPrefix: s.billPrefix,
     invoiceDueDays: String(s.invoiceDueDays),
     agingBucket1Days: String(s.agingBucket1Days),
     agingBucket2Days: String(s.agingBucket2Days),
@@ -48,6 +54,10 @@ function toForm(s: AccountingSettings): Form {
     poApprovalThreshold1: String(s.poApprovalThreshold1),
     poApprovalThreshold2: String(s.poApprovalThreshold2),
     poApprovalThreshold3: String(s.poApprovalThreshold3),
+    wpsEstablishmentId: s.wpsEstablishmentId,
+    wpsAgentId: s.wpsAgentId,
+    wpsBankName: s.wpsBankName,
+    expenseApprovalThreshold: String(s.expenseApprovalThreshold),
   };
 }
 
@@ -60,18 +70,21 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
   const { fireToast } = useApp();
   const [settings, setSettings] = useState<AccountingSettings | null>(null);
   const [methods, setMethods] = useState<AccountingLookup[]>([]);
+  const [categories, setCategories] = useState<AccountingLookup[]>([]);
   const [form, setForm] = useState<Form | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [newMethod, setNewMethod] = useState("");
+  const [newCategory, setNewCategory] = useState("");
 
   const load = async () => {
     setLoading(true); setErr(null);
-    const [s, m] = await Promise.all([fetchAccountingSettings(), fetchPaymentMethods()]);
+    const [s, m, c] = await Promise.all([fetchAccountingSettings(), fetchPaymentMethods(), fetchExpenseCategories()]);
     if (!s.ok) { setErr(s.error); setLoading(false); return; }
     setSettings(s.data); setForm(toForm(s.data));
     if (m.ok) setMethods(m.data);
+    if (c.ok) setCategories(c.data);
     setLoading(false);
   };
 
@@ -84,6 +97,7 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
     || form.taxLabel.trim() !== settings.taxLabel
     || form.invoicePrefix.trim() !== settings.invoicePrefix
     || form.poPrefix.trim() !== settings.poPrefix
+    || form.billPrefix.trim() !== settings.billPrefix
     || numOr(form.invoiceDueDays, -1) !== settings.invoiceDueDays
     || numOr(form.agingBucket1Days, -1) !== settings.agingBucket1Days
     || numOr(form.agingBucket2Days, -1) !== settings.agingBucket2Days
@@ -91,6 +105,10 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
     || numOr(form.poApprovalThreshold1, -1) !== settings.poApprovalThreshold1
     || numOr(form.poApprovalThreshold2, -1) !== settings.poApprovalThreshold2
     || numOr(form.poApprovalThreshold3, -1) !== settings.poApprovalThreshold3
+    || form.wpsEstablishmentId.trim() !== settings.wpsEstablishmentId
+    || form.wpsAgentId.trim() !== settings.wpsAgentId
+    || form.wpsBankName.trim() !== settings.wpsBankName
+    || numOr(form.expenseApprovalThreshold, -1) !== settings.expenseApprovalThreshold
   );
 
   const save = async () => {
@@ -101,6 +119,7 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
       taxLabel: form.taxLabel,
       invoicePrefix: form.invoicePrefix,
       poPrefix: form.poPrefix,
+      billPrefix: form.billPrefix,
       invoiceDueDays: numOr(form.invoiceDueDays, settings.invoiceDueDays),
       agingBucket1Days: numOr(form.agingBucket1Days, settings.agingBucket1Days),
       agingBucket2Days: numOr(form.agingBucket2Days, settings.agingBucket2Days),
@@ -108,6 +127,10 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
       poApprovalThreshold1: numOr(form.poApprovalThreshold1, settings.poApprovalThreshold1),
       poApprovalThreshold2: numOr(form.poApprovalThreshold2, settings.poApprovalThreshold2),
       poApprovalThreshold3: numOr(form.poApprovalThreshold3, settings.poApprovalThreshold3),
+      wpsEstablishmentId: form.wpsEstablishmentId,
+      wpsAgentId: form.wpsAgentId,
+      wpsBankName: form.wpsBankName,
+      expenseApprovalThreshold: numOr(form.expenseApprovalThreshold, settings.expenseApprovalThreshold),
     };
     const res = await updateAccountingSettings(patch);
     setBusy(false);
@@ -134,6 +157,26 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
     setBusy(false);
     if (!res.ok) { setErr(res.error); return; }
     setMethods(prev => prev.map(x => (x.id === m.id ? res.data : x)));
+  };
+
+  const addCategory = async () => {
+    const label = newCategory.trim();
+    if (!label) return;
+    setBusy(true); setErr(null);
+    const res = await createLookup(LOOKUP_EXPENSE_CATEGORY, label, { sortOrder: categories.length + 1 });
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    setCategories(prev => [...prev, res.data]);
+    setNewCategory("");
+    fireToast(`Expense category "${label}" added`);
+  };
+
+  const toggleCategory = async (c: AccountingLookup) => {
+    setBusy(true); setErr(null);
+    const res = await updateLookup(c.id, { isActive: !c.isActive });
+    setBusy(false);
+    if (!res.ok) { setErr(res.error); return; }
+    setCategories(prev => prev.map(x => (x.id === c.id ? res.data : x)));
   };
 
   if (loading) {
@@ -200,6 +243,12 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
               value={form.poPrefix} onChange={e => setF("poPrefix", e.target.value)} />
             <div style={hintStyle}>e.g. {form.poPrefix || "PO"}-2026-0001</div>
           </div>
+          <div className="col" style={fieldStyle}>
+            <label style={labelStyle}>Vendor-bill prefix</label>
+            <input className="input" disabled={!canEdit}
+              value={form.billPrefix} onChange={e => setF("billPrefix", e.target.value)} />
+            <div style={hintStyle}>e.g. {form.billPrefix || "BILL"}-2026-0001</div>
+          </div>
         </div>
       </section>
 
@@ -256,6 +305,53 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
         </div>
       </section>
 
+      {/* WPS (Wage Protection System) */}
+      <section className="card card-pad" style={{ marginBottom: 16 }}>
+        <CardHead title="WPS (Wage Protection System)"
+          sub="Employer identifiers used to generate the UAE salary file for bank submission" />
+        <div className="alert-banner tone-warning" style={{ marginBottom: 12 }}>
+          <div className="ic"><Icon name="alertTriangle" size={16} /></div>
+          <div className="text"><div className="h">Confirm with your bank / MOHRE</div>
+            <div className="d">These are issued to your establishment by MOHRE and your bank. The exact SIF
+              file layout differs between banks — validate a generated file with your WPS agent before
+              submitting. The payroll WPS export stays disabled until both IDs below are filled.</div></div>
+        </div>
+        <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+          <div className="col" style={fieldStyle}>
+            <label style={labelStyle}>MOL establishment ID</label>
+            <input className="input" disabled={!canEdit}
+              value={form.wpsEstablishmentId} onChange={e => setF("wpsEstablishmentId", e.target.value)} />
+            <div style={hintStyle}>Employer unique ID from MOHRE.</div>
+          </div>
+          <div className="col" style={fieldStyle}>
+            <label style={labelStyle}>Employer bank routing / Agent ID</label>
+            <input className="input" disabled={!canEdit}
+              value={form.wpsAgentId} onChange={e => setF("wpsAgentId", e.target.value)} />
+            <div style={hintStyle}>Your bank's WPS Agent / routing code.</div>
+          </div>
+          <div className="col" style={fieldStyle}>
+            <label style={labelStyle}>Bank short name <span style={{ color: "var(--ink-quiet)" }}>(optional)</span></label>
+            <input className="input" disabled={!canEdit}
+              value={form.wpsBankName} onChange={e => setF("wpsBankName", e.target.value)} />
+            <div style={hintStyle}>For the file name / display only.</div>
+          </div>
+        </div>
+      </section>
+
+      {/* Expense management */}
+      <section className="card card-pad" style={{ marginBottom: 16 }}>
+        <CardHead title="Expense approval"
+          sub="Expenses at or below the threshold auto-approve; above it they need Manager/MD approval" />
+        <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+          <div className="col" style={fieldStyle}>
+            <label style={labelStyle}>Auto-approve threshold (AED)</label>
+            <input className="input numeric" type="number" min={0} step="any" disabled={!canEdit}
+              value={form.expenseApprovalThreshold} onChange={e => setF("expenseApprovalThreshold", e.target.value)} />
+            <div style={hintStyle}>Default AED 5,000 — confirm with the client.</div>
+          </div>
+        </div>
+      </section>
+
       {canEdit && (
         <div className="row gap-2" style={{ marginBottom: 20, flexWrap: "wrap" }}>
           <button className="btn btn-primary" disabled={busy || !dirty} onClick={save}>
@@ -297,6 +393,41 @@ export function SettingsTab({ canEdit }: { canEdit: boolean }) {
             <input className="input" style={{ flex: 1, minWidth: 180 }} placeholder="New payment method (e.g. Online Gateway)"
               value={newMethod} onChange={e => setNewMethod(e.target.value)} />
             <button className="btn btn-ghost" disabled={busy || !newMethod.trim()} onClick={addMethod}>
+              <Icon name="plus" size={14} /> Add
+            </button>
+          </div>
+        )}
+      </section>
+
+      {/* Expense categories */}
+      <section className="card card-pad" style={{ marginTop: 16 }}>
+        <CardHead title={`Expense categories · ${categories.length}`} sub="Configurable list used when recording expenses" />
+        {categories.length === 0 ? (
+          <EmptyState icon="receipt" title="No categories" />
+        ) : (
+          <div className="col gap-2">
+            {categories.map(c => (
+              <div key={c.id} className="row between" style={{ alignItems: "center", padding: "8px 10px",
+                border: "1px solid var(--border)", borderRadius: "var(--r-md)", gap: 10, flexWrap: "wrap" }}>
+                <div className="row gap-2" style={{ alignItems: "center", minWidth: 0 }}>
+                  <span style={{ font: "var(--t-body-md)", fontWeight: 600 }}>{c.label}</span>
+                  <span style={{ font: "var(--t-micro)", color: "var(--ink-quiet)" }}>{c.code}</span>
+                  {!c.isActive && <span className="badge badge-outline">Inactive</span>}
+                </div>
+                {canEdit && (
+                  <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => toggleCategory(c)}>
+                    {c.isActive ? "Deactivate" : "Activate"}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {canEdit && (
+          <div className="row gap-2" style={{ marginTop: 12, flexWrap: "wrap" }}>
+            <input className="input" style={{ flex: 1, minWidth: 180 }} placeholder="New expense category (e.g. Insurance)"
+              value={newCategory} onChange={e => setNewCategory(e.target.value)} />
+            <button className="btn btn-ghost" disabled={busy || !newCategory.trim()} onClick={addCategory}>
               <Icon name="plus" size={14} /> Add
             </button>
           </div>
